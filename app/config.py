@@ -64,11 +64,59 @@ class Settings(BaseSettings):
         description="Número máximo de vehículos en simulación",
     )
 
-    # Base de datos (para futuros sprints)
-    DATABASE_URL: str | None = Field(
-        default=None,
-        description="URL de conexión a base de datos",
+    # Database Configuration
+    POSTGRES_HOST: str = Field(
+        default="localhost",
+        description="PostgreSQL server host",
     )
+    POSTGRES_PORT: int = Field(
+        default=5432,
+        ge=1,
+        le=65535,
+        description="PostgreSQL server port",
+    )
+    POSTGRES_USER: str = Field(
+        default="dt_user",
+        description="PostgreSQL username",
+    )
+    POSTGRES_PASSWORD: str = Field(
+        default="dt_password",
+        description="PostgreSQL password",
+    )
+    POSTGRES_DB: str = Field(
+        default="digital_twin",
+        description="PostgreSQL database name",
+    )
+
+    # Connection Pool Settings
+    DB_POOL_SIZE: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Database connection pool size",
+    )
+    DB_MAX_OVERFLOW: int = Field(
+        default=10,
+        ge=0,
+        le=30,
+        description="Maximum overflow connections beyond pool size",
+    )
+
+    @property
+    def database_url(self) -> str:
+        """Build async PostgreSQL connection URL from components."""
+        return (
+            f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
+            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        )
+
+    @property
+    def database_url_sync(self) -> str:
+        """Build sync PostgreSQL connection URL for Alembic."""
+        return (
+            f"postgresql+psycopg2://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
+            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        )
 
     @field_validator("LOG_LEVEL")
     @classmethod

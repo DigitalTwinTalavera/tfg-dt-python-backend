@@ -16,6 +16,8 @@ from app.core.constants import (
     CORS_ALLOW_HEADERS,
     CORS_ALLOW_METHODS,
     DOCS_URL,
+    MSG_DB_CONNECTED,
+    MSG_DB_DISCONNECTED,
     MSG_DOCS_URL,
     MSG_SERVER_URL,
     MSG_SHUTDOWN,
@@ -30,6 +32,7 @@ from app.core.constants import (
     WS_SIMULATION_PATH,
 )
 from app.core.responses import RootResponse
+from app.db.database import close_db, init_db
 
 
 @asynccontextmanager
@@ -62,8 +65,15 @@ async def lifespan(app: FastAPI):
             ws_path=WS_SIMULATION_PATH,
         )
     )
+
+    await init_db()
+    print(MSG_DB_CONNECTED)
+
     yield
+
     # Shutdown
+    await close_db()
+    print(MSG_DB_DISCONNECTED)
     print(MSG_SHUTDOWN)
 
 
