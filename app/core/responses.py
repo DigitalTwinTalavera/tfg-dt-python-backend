@@ -28,6 +28,15 @@ class ConfigInfoResponse(BaseModel):
     tick_rate: float = Field(..., description="Tasa de actualización de simulación (segundos)")
 
 
+class DatabaseHealthResponse(BaseModel):
+    """Database health status"""
+    connected: bool = Field(..., description="Database connection status")
+    postgis_version: str | None = Field(
+        default=None,
+        description="PostGIS extension version",
+    )
+
+
 class RootResponse(BaseModel):
     """Respuesta del endpoint raíz"""
     app: str = Field(..., description="Nombre de la aplicación")
@@ -52,3 +61,4 @@ class DetailedHealthCheckResponse(BaseModel):
     timestamp: str = Field(..., description="Timestamp ISO 8601 UTC")
     system: SystemInfoResponse = Field(..., description="Información del sistema")
     config: ConfigInfoResponse = Field(..., description="Configuración actual")
+    database: DatabaseHealthResponse = Field(..., description="Estado de la base de datos")

@@ -1,6 +1,26 @@
-version: '3.8'
-
 services:
+  postgres:
+    image: postgis/postgis:15-3.3
+    container_name: dt-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-dt_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dt_password}
+      POSTGRES_DB: ${POSTGRES_DB:-digital_twin}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql:ro,z
+    ports:
+      - "5432:5432"
+    networks:
+      - dt-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dt_user} -d ${POSTGRES_DB:-digital_twin}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
   backend:
     build:
       context: .
@@ -10,19 +30,28 @@ services:
       - "${PORT:-8000}:${PORT:-8000}"
     env_file:
       - .env
+    environment:
+      POSTGRES_HOST: postgres
     volumes:
-      - ./app:/app/app
-      - ./.env:/app/.env
+      - ./app:/app/app:z
+      - ./.env:/app/.env:z
     restart: unless-stopped
     networks:
       - dt-network
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${PORT:-8000}/api/health"]
       interval: 30s
       timeout: 3s
       retries: 3
-      start_period: 5s
+      start_period: 10s
 
 networks:
   dt-network:
     driver: bridge
+
+volumes:
+  postgres_data:
+    name: dt-postgres-data

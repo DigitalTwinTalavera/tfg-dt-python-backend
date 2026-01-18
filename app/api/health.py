@@ -3,7 +3,8 @@ Router de Health Check.
 Proporciona endpoints para verificar el estado del sistema.
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.constants import STATUS_OK
@@ -15,6 +16,8 @@ from app.core.utils import (
     get_environment,
     get_system_info,
 )
+from app.db.database import get_db_session
+from app.db.utils import check_database_health
 
 router = APIRouter()
 
@@ -35,14 +38,19 @@ async def health_check() -> HealthCheckResponse:
 
 
 @router.get("/health/detailed", response_model=DetailedHealthCheckResponse)
-async def detailed_health_check() -> DetailedHealthCheckResponse:
+async def detailed_health_check(
+    db: AsyncSession = Depends(get_db_session),
+) -> DetailedHealthCheckResponse:
     """
-    Health check detallado con información del sistema.
+    Health check detallado con información del sistema y base de datos.
     """
+    db_health = await check_database_health(db)
+
     return DetailedHealthCheckResponse(
         status=STATUS_OK,
         app=get_app_info(),
         timestamp=get_current_timestamp(),
         system=get_system_info(),
         config=get_config_info(),
+        database=db_health,
     )

@@ -12,6 +12,15 @@ python-dotenv==1.0.1
 # WebSocket Support
 websockets==14.1
 
+# Database
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+psycopg2-binary==2.9.10
+geoalchemy2==0.15.2
+
+# Migrations
+alembic==1.14.0
+
 # Testing
 pytest==8.3.4
 pytest-asyncio==0.25.2

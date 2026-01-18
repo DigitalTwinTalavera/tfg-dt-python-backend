@@ -63,3 +63,15 @@ KEY_SYSTEM = "system"
 KEY_CONFIG = "config"
 KEY_DESCRIPTION = "description"
 KEY_NAME = "name"
+KEY_DATABASE = "database"
+
+# Database Status Messages
+MSG_DB_CONNECTED = "Database connection initialized"
+MSG_DB_DISCONNECTED = "Database connection closed"
+
+# Database Queries
+SQL_HEALTH_CHECK = "SELECT 1"
+SQL_POSTGIS_VERSION = "SELECT PostGIS_Version()"
+
+# Database Connection Pool
+DB_POOL_RECYCLE_SECONDS = 3600
