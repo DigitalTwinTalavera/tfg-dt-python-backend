@@ -9,7 +9,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import health
+from app.api import health, routes
 from app.config import settings
 from app.core.constants import (
     API_PREFIX,
@@ -20,12 +20,14 @@ from app.core.constants import (
     MSG_SERVER_URL,
     MSG_SHUTDOWN,
     MSG_STARTUP_SERVER,
+    MSG_WS_URL,
     OPENAPI_URL,
     REDOC_URL,
     ROOT_PATH,
     STATUS_RUNNING,
     TAG_HEALTH,
     TAG_ROOT,
+    WS_SIMULATION_PATH,
 )
 from app.core.responses import RootResponse
 
@@ -51,6 +53,13 @@ async def lifespan(app: FastAPI):
             host=settings.HOST,
             port=settings.PORT,
             docs_url=DOCS_URL,
+        )
+    )
+    print(
+        MSG_WS_URL.format(
+            host=settings.HOST,
+            port=settings.PORT,
+            ws_path=WS_SIMULATION_PATH,
         )
     )
     yield
@@ -80,6 +89,7 @@ app.add_middleware(
 
 # Incluir routers
 app.include_router(health.router, prefix=API_PREFIX, tags=[TAG_HEALTH])
+app.include_router(routes.router)
 
 
 @app.get(ROOT_PATH, response_model=RootResponse, tags=[TAG_ROOT])

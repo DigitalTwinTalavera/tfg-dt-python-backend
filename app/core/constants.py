@@ -15,6 +15,10 @@ OPENAPI_URL = "/openapi.json"
 # API Tags
 TAG_ROOT = "Root"
 TAG_HEALTH = "Health Check"
+TAG_WEBSOCKET = "WebSocket"
+
+# WebSocket Routes
+WS_SIMULATION_PATH = "/ws/simulation"
 
 # Status Messages
 STATUS_OK = "ok"
@@ -38,7 +42,15 @@ HEALTHCHECK_START_PERIOD_SECONDS = 5
 MSG_STARTUP_SERVER = "🚀 {app_name} v{version}"
 MSG_SERVER_URL = "📡 Servidor iniciado en http://{host}:{port}"
 MSG_DOCS_URL = "📚 Documentación disponible en http://{host}:{port}{docs_url}"
+MSG_WS_URL = "🔌 WebSocket disponible en ws://{host}:{port}{ws_path}"
 MSG_SHUTDOWN = "👋 Servidor detenido"
+
+# WebSocket Message Types
+WS_TYPE_ECHO = "echo"
+WS_TYPE_BROADCAST = "broadcast"
+WS_TYPE_STATE_UPDATE = "state_update"
+WS_TYPE_CLIENT_CONNECTED = "client_connected"
+WS_TYPE_CLIENT_DISCONNECTED = "client_disconnected"
 
 # Response Keys
 KEY_STATUS = "status"
