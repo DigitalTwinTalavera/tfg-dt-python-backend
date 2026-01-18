@@ -37,6 +37,8 @@ docker-compose up --build
 
 ## Endpoints Disponibles
 
+### HTTP
+
 | Endpoint | Método | Descripción |
 |----------|--------|-------------|
 | `/` | GET | Información básica de la API |
@@ -44,6 +46,12 @@ docker-compose up --build
 | `/api/health/detailed` | GET | Health check con info del sistema |
 | `/docs` | GET | Documentación Swagger UI |
 | `/redoc` | GET | Documentación ReDoc |
+
+### WebSocket
+
+| Endpoint | Descripción |
+|----------|-------------|
+| `ws://localhost:8000/ws/simulation` | Comunicación en tiempo real con Godot |
 
 ## Tests
 
@@ -55,12 +63,15 @@ pytest tests/ -v
 
 ```
 app/
-├── api/           # Endpoints HTTP
-├── core/          # Módulos compartidos (constantes, schemas, utils)
-├── models/        # Modelos de datos
-├── services/      # Lógica de negocio
-├── config.py      # Configuración centralizada
-└── main.py        # Punto de entrada
+├── api/
+│   ├── websocket/    # WebSocket manager y conexiones
+│   ├── health.py     # Health check endpoints
+│   └── routes.py     # WebSocket routes
+├── core/             # Módulos compartidos (constantes, schemas, utils)
+├── models/           # Modelos de datos
+├── services/         # Lógica de negocio
+├── config.py         # Configuración centralizada
+└── main.py           # Punto de entrada
 ```
 
 ## Documentación
@@ -68,6 +79,7 @@ app/
 Consultar la carpeta `doc/` para documentación detallada:
 
 - [Issue 1.1 - Project Initialization](doc/sprint1/issue-1.1-project-initialization.md)
+- [Issue 1.2 - WebSocket Connection Manager](doc/sprint1/issue-1.2-websocket-connection-manager.md)
 - [Arquitectura](doc/sprint1/arquitectura.md)
 - [API Reference](doc/sprint1/api-reference.md)
 - [Guía de Desarrollo](doc/sprint1/guia-desarrollo.md)

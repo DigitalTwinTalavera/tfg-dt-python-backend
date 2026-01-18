@@ -9,9 +9,13 @@ El backend está diseñado siguiendo una arquitectura modular y limpia, preparad
 ```
 TFG-DT-PYTHON-BACKEND/
 ├── app/                          # Código fuente principal
-│   ├── api/                      # Endpoints HTTP
+│   ├── api/                      # Endpoints HTTP y WebSocket
+│   │   ├── websocket/           # Módulo WebSocket
+│   │   │   ├── __init__.py
+│   │   │   └── manager.py       # ConnectionManager
 │   │   ├── __init__.py
-│   │   └── health.py            # Health check endpoints
+│   │   ├── health.py            # Health check endpoints
+│   │   └── routes.py            # WebSocket routes
 │   ├── core/                     # Módulos compartidos
 │   │   ├── __init__.py
 │   │   ├── constants.py         # Constantes globales
@@ -26,7 +30,8 @@ TFG-DT-PYTHON-BACKEND/
 │   └── main.py                  # Punto de entrada
 ├── tests/                        # Tests automatizados
 │   ├── __init__.py
-│   └── test_health.py
+│   ├── test_health.py           # Tests HTTP
+│   └── test_websocket.py        # Tests WebSocket
 ├── doc/                          # Documentación
 │   └── sprint1/
 ├── .env                          # Variables de entorno
@@ -99,12 +104,30 @@ Funciones helper reutilizables:
 ### 3. Capa API (`app/api/`)
 
 #### health.py
-Endpoints de monitorización:
+Endpoints HTTP de monitorización:
 
 | Endpoint | Método | Descripción |
 |----------|--------|-------------|
 | `/api/health` | GET | Health check básico |
 | `/api/health/detailed` | GET | Health check con info del sistema |
+
+#### websocket/manager.py
+Gestor de conexiones WebSocket (Singleton):
+
+```python
+class ConnectionManager:
+    async def connect(websocket: WebSocket) -> None
+    def disconnect(websocket: WebSocket) -> None
+    async def broadcast(message: dict) -> None
+    async def send_personal_message(message: dict, websocket: WebSocket) -> None
+```
+
+#### routes.py
+Endpoints WebSocket:
+
+| Endpoint | Protocolo | Descripción |
+|----------|-----------|-------------|
+| `/ws/simulation` | WebSocket | Comunicación tiempo real con Godot |
 
 ### 4. Punto de Entrada (`app/main.py`)
 
@@ -231,9 +254,36 @@ async def lifespan(app: FastAPI):
 - Sin bloqueos en endpoints
 - Healthcheck para monitorización
 
+## Flujo WebSocket
+
+```
+Cliente Godot
+     │
+     ▼ ws://host:port/ws/simulation
+┌─────────────────────┐
+│   WebSocket Router  │
+│    (routes.py)      │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ ConnectionManager   │
+│   (manager.py)      │
+│  - connect()        │
+│  - disconnect()     │
+│  - broadcast()      │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  Active Connections │
+│    [ws1, ws2, ...]  │
+└─────────────────────┘
+```
+
 ## Próximos Pasos (Sprints Futuros)
 
-1. **WebSocket** para comunicación en tiempo real
+1. ~~**WebSocket** para comunicación en tiempo real~~ ✅ Completado
 2. **Simulación** de tráfico urbano
 3. **Base de datos** para persistencia
 4. **Autenticación** (si se requiere)

@@ -157,6 +157,99 @@ Host: localhost:8000
 
 ---
 
+## WebSocket
+
+### WS /ws/simulation
+
+Endpoint WebSocket para comunicación en tiempo real con el cliente Godot.
+
+**URL:**
+```
+ws://localhost:8000/ws/simulation
+```
+
+**Conexión:**
+```javascript
+const ws = new WebSocket("ws://localhost:8000/ws/simulation");
+```
+
+**Mensaje Cliente → Servidor:**
+```json
+{
+    "type": "vehicle_update",
+    "vehicle_id": 1,
+    "position": {"x": 100.5, "y": 200.3, "z": 0.0}
+}
+```
+
+**Respuesta Servidor → Cliente (Echo):**
+```json
+{
+    "type": "echo",
+    "received": {
+        "type": "vehicle_update",
+        "vehicle_id": 1,
+        "position": {"x": 100.5, "y": 200.3, "z": 0.0}
+    },
+    "status": "ok"
+}
+```
+
+### Ejemplo con websocat
+
+```bash
+# Conectar
+websocat ws://localhost:8000/ws/simulation
+
+# Enviar mensaje (escribir y Enter)
+{"type": "test", "data": "hello"}
+```
+
+### Ejemplo con Python
+
+```python
+import asyncio
+import websockets
+import json
+
+async def websocket_client():
+    uri = "ws://localhost:8000/ws/simulation"
+    async with websockets.connect(uri) as ws:
+        # Enviar mensaje
+        await ws.send(json.dumps({"type": "ping"}))
+
+        # Recibir respuesta
+        response = await ws.recv()
+        print(json.loads(response))
+
+asyncio.run(websocket_client())
+```
+
+### Ejemplo con GDScript (Godot)
+
+```gdscript
+extends Node
+
+var socket = WebSocketPeer.new()
+
+func _ready():
+    socket.connect_to_url("ws://localhost:8000/ws/simulation")
+
+func _process(_delta):
+    socket.poll()
+    if socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
+        while socket.get_available_packet_count():
+            var data = JSON.parse_string(
+                socket.get_packet().get_string_from_utf8()
+            )
+            print("Received: ", data)
+
+func send_data(data: Dictionary):
+    socket.send_text(JSON.stringify(data))
+```
+
+---
+
 ## Códigos de Estado HTTP
 
 | Código | Descripción |
