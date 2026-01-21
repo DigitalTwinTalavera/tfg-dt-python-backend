@@ -35,8 +35,12 @@ httpx==0.28.1
 ```
 tests/
 ├── __init__.py
-├── test_health.py       # Tests de endpoints de health check
-└── test_websocket.py    # Tests de WebSocket y ConnectionManager
+├── fixtures/
+│   ├── __init__.py
+│   └── road_network_fixtures.py  # Sample data for road network testing
+├── test_health.py                # Tests de endpoints de health check
+├── test_road_network_models.py   # Tests de modelos de red vial
+└── test_websocket.py             # Tests de WebSocket y ConnectionManager
 ```
 
 ## Catalogo de Tests
@@ -69,6 +73,40 @@ Tests para el WebSocket Connection Manager y endpoints de comunicacion en tiempo
 | `TestWebSocketEndpoint::test_websocket_json_message_structure` | unit | Valida estructura JSON de respuestas |
 | `TestWebSocketEndpoint::test_websocket_simulation_data` | integration | Simula datos de vehiculos con posicion y velocidad |
 
+### test_road_network_models.py
+
+Tests para modelos de red vial (nodos y aristas), enums y schemas Pydantic.
+
+| Test | Marker | Descripcion |
+|------|--------|-------------|
+| `TestNodeTypeEnum::test_node_type_values` | unit | Verifica valores del enum NodeType |
+| `TestNodeTypeEnum::test_node_type_is_string_enum` | unit | Verifica que NodeType es string enum |
+| `TestRoadTypeEnum::test_road_type_values` | unit | Verifica valores del enum RoadType |
+| `TestRoadTypeEnum::test_road_type_is_string_enum` | unit | Verifica que RoadType es string enum |
+| `TestCoordinateSchema::test_valid_coordinate` | unit | Verifica creacion de coordenadas validas |
+| `TestCoordinateSchema::test_coordinate_bounds_longitude` | unit | Valida limites de longitud (-180 a 180) |
+| `TestCoordinateSchema::test_coordinate_bounds_latitude` | unit | Valida limites de latitud (-90 a 90) |
+| `TestNodeSchemas::test_node_create_valid` | unit | Verifica schema NodeCreate completo |
+| `TestNodeSchemas::test_node_create_minimal` | unit | Verifica NodeCreate con campos minimos |
+| `TestNodeSchemas::test_node_create_invalid_longitude` | unit | Rechaza longitud invalida |
+| `TestNodeSchemas::test_node_create_invalid_latitude` | unit | Rechaza latitud invalida |
+| `TestNodeSchemas::test_node_update_all_optional` | unit | Verifica NodeUpdate con campos opcionales |
+| `TestNodeSchemas::test_node_update_partial` | unit | Verifica actualizacion parcial de nodo |
+| `TestNodeSchemas::test_node_response_from_dict` | unit | Verifica NodeResponse desde diccionario |
+| `TestEdgeSchemas::test_edge_create_valid` | unit | Verifica schema EdgeCreate completo |
+| `TestEdgeSchemas::test_edge_create_minimal` | unit | Verifica EdgeCreate con campos minimos |
+| `TestEdgeSchemas::test_edge_create_invalid_geometry_too_few_points` | unit | Rechaza geometria con menos de 2 puntos |
+| `TestEdgeSchemas::test_edge_create_invalid_length` | unit | Rechaza longitud <= 0 |
+| `TestEdgeSchemas::test_edge_create_invalid_speed` | unit | Rechaza velocidad maxima < 1 |
+| `TestEdgeSchemas::test_edge_update_all_optional` | unit | Verifica EdgeUpdate con campos opcionales |
+| `TestEdgeSchemas::test_edge_response_from_dict` | unit | Verifica EdgeResponse desde diccionario |
+| `TestSampleFixtures::test_sample_nodes_count` | unit | Verifica cantidad de nodos de ejemplo (6) |
+| `TestSampleFixtures::test_sample_nodes_valid_schema` | unit | Valida schemas de nodos de ejemplo |
+| `TestSampleFixtures::test_sample_edges_count` | unit | Verifica cantidad de aristas de ejemplo (4) |
+| `TestSampleFixtures::test_sample_edges_valid_references` | unit | Valida referencias a nodos en aristas |
+| `TestSampleFixtures::test_create_sample_node_data_helper` | unit | Verifica helper create_sample_node_data |
+| `TestSampleFixtures::test_create_sample_edge_data_helper` | unit | Verifica helper create_sample_edge_data |
+
 ## Cobertura por Modulo
 
 | Modulo | Tests | Cobertura |
@@ -78,6 +116,9 @@ Tests para el WebSocket Connection Manager y endpoints de comunicacion en tiempo
 | `app/api/websocket/manager.py` | 2 | Clase `ConnectionManager` |
 | `app/api/routes.py` | 6 | Endpoint WebSocket `/ws/simulation` |
 | `app/core/responses.py` | 1 | Modelo `DatabaseHealthResponse` |
+| `app/models/enums.py` | 4 | Enums `NodeType` y `RoadType` |
+| `app/core/schemas/network_schema.py` | 14 | Schemas de red vial (Node*, Edge*, Coordinate) |
+| `tests/fixtures/road_network_fixtures.py` | 6 | Helpers y datos de ejemplo |
 | `app/db/` | - | Mockeado en tests unitarios |
 
 ## Estrategia de Mocking
@@ -212,36 +253,36 @@ configfile: pytest.ini
 testpaths: tests
 plugins: anyio-4.12.1, asyncio-0.25.2
 asyncio: mode=Mode.STRICT
-collected 14 items
+collected 41 items
 
-tests/test_health.py::test_root_endpoint PASSED                  [  7%]
-tests/test_health.py::test_health_check PASSED                   [ 14%]
-tests/test_health.py::test_detailed_health_check PASSED          [ 21%]
-tests/test_health.py::test_health_check_returns_correct_structure PASSED [ 28%]
-tests/test_health.py::test_detailed_health_check_returns_correct_structure PASSED [ 35%]
-tests/test_health.py::test_database_health_response_model PASSED [ 42%]
-tests/test_websocket.py::TestConnectionManager::test_connection_manager_initialization PASSED [ 50%]
-tests/test_websocket.py::TestConnectionManager::test_connection_count_property PASSED [ 57%]
-tests/test_websocket.py::TestWebSocketEndpoint::test_websocket_connection PASSED [ 64%]
-tests/test_websocket.py::TestWebSocketEndpoint::test_websocket_echo_message PASSED [ 71%]
-tests/test_websocket.py::TestWebSocketEndpoint::test_websocket_multiple_messages PASSED [ 78%]
-tests/test_websocket.py::TestWebSocketEndpoint::test_websocket_connection_lifecycle PASSED [ 85%]
-tests/test_websocket.py::TestWebSocketEndpoint::test_websocket_json_message_structure PASSED [ 92%]
-tests/test_websocket.py::TestWebSocketEndpoint::test_websocket_simulation_data PASSED [100%]
+tests/test_health.py::test_root_endpoint PASSED                    [  2%]
+tests/test_health.py::test_health_check PASSED                     [  4%]
+tests/test_health.py::test_detailed_health_check PASSED            [  7%]
+tests/test_health.py::test_health_check_returns_correct_structure PASSED [  9%]
+tests/test_health.py::test_detailed_health_check_returns_correct_structure PASSED [ 12%]
+tests/test_health.py::test_database_health_response_model PASSED   [ 14%]
+tests/test_road_network_models.py::TestNodeTypeEnum::* PASSED      [ 19%]
+tests/test_road_network_models.py::TestRoadTypeEnum::* PASSED      [ 24%]
+tests/test_road_network_models.py::TestCoordinateSchema::* PASSED  [ 31%]
+tests/test_road_network_models.py::TestNodeSchemas::* PASSED       [ 48%]
+tests/test_road_network_models.py::TestEdgeSchemas::* PASSED       [ 65%]
+tests/test_road_network_models.py::TestSampleFixtures::* PASSED    [ 80%]
+tests/test_websocket.py::TestConnectionManager::* PASSED           [ 85%]
+tests/test_websocket.py::TestWebSocketEndpoint::* PASSED           [100%]
 
-========================= 14 passed in 0.29s =========================
+========================= 41 passed in 0.36s =========================
 ```
 
 ### Resumen
 
 | Metrica | Valor |
 |---------|-------|
-| Total tests | 14 |
-| Passed | 14 |
+| Total tests | 41 |
+| Passed | 41 |
 | Failed | 0 |
 | Skipped | 0 |
-| Tiempo | 0.29s |
-| Cobertura | ~85% (estimado) |
+| Tiempo | 0.36s |
+| Cobertura | ~90% (estimado) |
 
 ## Tests por Endpoint
 
