@@ -75,3 +75,53 @@ SQL_POSTGIS_VERSION = "SELECT PostGIS_Version()"
 
 # Database Connection Pool
 DB_POOL_RECYCLE_SECONDS = 3600
+
+# =============================================================================
+# Road Network Constants
+# =============================================================================
+
+# Spatial Reference System (EPSG:4326 - WGS84)
+SRID_WGS84 = 4326
+
+# Coordinate Bounds (WGS84)
+LONGITUDE_MIN = -180.0
+LONGITUDE_MAX = 180.0
+LATITUDE_MIN = -90.0
+LATITUDE_MAX = 90.0
+
+# Road Network Table Names (prefixed with dt_ to avoid PostGIS Tiger conflicts)
+TABLE_NODES = "dt_nodes"
+TABLE_EDGES = "dt_edges"
+
+# Road Network Field Constraints
+NODE_NAME_MAX_LENGTH = 255
+EDGE_NAME_MAX_LENGTH = 255
+TYPE_FIELD_MAX_LENGTH = 50
+
+# Edge Default Values
+DEFAULT_MAX_SPEED_KMH = 50
+DEFAULT_LANES = 1
+DEFAULT_ONE_WAY = False
+DEFAULT_IS_ACTIVE = True
+
+# Edge Validation Constraints
+MIN_SPEED_KMH = 1
+MAX_SPEED_KMH = 300
+MIN_LANES = 1
+MAX_LANES = 10
+MIN_GEOMETRY_POINTS = 2
+
+# Index Names (dt_ prefix to avoid PostGIS Tiger conflicts)
+IDX_NODES_POSITION = "idx_dt_nodes_position_gist"
+IDX_NODES_TYPE = "idx_dt_nodes_node_type"
+IDX_NODES_ACTIVE = "idx_dt_nodes_is_active"
+IDX_EDGES_GEOMETRY = "idx_dt_edges_geometry_gist"
+IDX_EDGES_ROAD_TYPE = "idx_dt_edges_road_type"
+IDX_EDGES_START_NODE = "idx_dt_edges_start_node_id"
+IDX_EDGES_END_NODE = "idx_dt_edges_end_node_id"
+IDX_EDGES_ACTIVE = "idx_dt_edges_is_active"
+
+# API Tags for Road Network
+TAG_NODES = "Nodes"
+TAG_EDGES = "Edges"
+TAG_ROAD_NETWORK = "Road Network"
