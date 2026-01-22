@@ -125,3 +125,35 @@ IDX_EDGES_ACTIVE = "idx_dt_edges_is_active"
 TAG_NODES = "Nodes"
 TAG_EDGES = "Edges"
 TAG_ROAD_NETWORK = "Road Network"
+
+# =============================================================================
+# Vehicle Constants
+# =============================================================================
+
+# Vehicle Table Name
+TABLE_VEHICLES = "dt_vehicles"
+
+# Vehicle Field Constraints
+VEHICLE_STATUS_MAX_LENGTH = 50
+
+# Vehicle Physics Default Values
+DEFAULT_VELOCITY = 0.0
+DEFAULT_ACCELERATION = 0.0
+DEFAULT_HEADING = 0.0
+
+# Vehicle Physics Validation Constraints
+MIN_VELOCITY = 0.0
+MAX_VELOCITY = 200.0  # m/s (~720 km/h, reasonable max for simulation)
+MIN_ACCELERATION = -50.0  # m/s² (hard braking)
+MAX_ACCELERATION = 20.0  # m/s² (sports car acceleration)
+MIN_HEADING = 0.0
+MAX_HEADING = 360.0  # degrees
+
+# Vehicle Index Names
+IDX_VEHICLES_POSITION = "idx_dt_vehicles_position_gist"
+IDX_VEHICLES_STATUS = "idx_dt_vehicles_status"
+IDX_VEHICLES_CURRENT_EDGE = "idx_dt_vehicles_current_edge_id"
+IDX_VEHICLES_UPDATED_AT = "idx_dt_vehicles_updated_at"
+
+# API Tags for Vehicles
+TAG_VEHICLES = "Vehicles"

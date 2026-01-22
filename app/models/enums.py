@@ -1,6 +1,6 @@
 """
-Enums for road network models.
-Defines node and road types for the traffic simulation.
+Enums for traffic simulation models.
+Defines node types, road types, and vehicle statuses.
 """
 
 from enum import Enum
@@ -29,3 +29,13 @@ class RoadType(str, Enum):
     SERVICE = "service"
     PEDESTRIAN = "pedestrian"
     CYCLEWAY = "cycleway"
+
+
+class VehicleStatus(str, Enum):
+    """Status of a vehicle in the simulation."""
+
+    IDLE = "idle"  # Vehicle is not moving, waiting to start
+    MOVING = "moving"  # Vehicle is actively moving
+    STOPPED = "stopped"  # Vehicle has stopped (e.g., at traffic light)
+    WAITING = "waiting"  # Vehicle is waiting (e.g., in queue)
+    FINISHED = "finished"  # Vehicle has completed its route
