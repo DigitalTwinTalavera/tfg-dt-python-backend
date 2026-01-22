@@ -10,6 +10,12 @@ from app.core.schemas.network_schema import (
     NodeResponse,
     NodeUpdate,
 )
+from app.core.schemas.vehicle_schema import (
+    VehicleCreate,
+    VehicleResponse,
+    VehicleStateUpdate,
+    VehicleUpdate,
+)
 
 __all__ = [
     "NodeCreate",
@@ -18,4 +24,8 @@ __all__ = [
     "EdgeCreate",
     "EdgeResponse",
     "EdgeUpdate",
+    "VehicleCreate",
+    "VehicleResponse",
+    "VehicleStateUpdate",
+    "VehicleUpdate",
 ]
