@@ -157,3 +157,11 @@ IDX_VEHICLES_UPDATED_AT = "idx_dt_vehicles_updated_at"
 
 # API Tags for Vehicles
 TAG_VEHICLES = "Vehicles"
+
+# =============================================================================
+# Repository Constants
+# =============================================================================
+
+# Pagination Defaults
+DEFAULT_PAGE_LIMIT = 100
+MAX_BULK_OPERATION_LIMIT = 100000
