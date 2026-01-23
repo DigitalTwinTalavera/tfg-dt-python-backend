@@ -34,6 +34,8 @@ services:
       POSTGRES_HOST: postgres
     volumes:
       - ./app:/app/app:z
+      - ./tests:/app/tests:z
+      - ./pytest.ini:/app/pytest.ini:z
       - ./.env:/app/.env:z
     restart: unless-stopped
     networks:
