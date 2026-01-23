@@ -165,3 +165,30 @@ TAG_VEHICLES = "Vehicles"
 # Pagination Defaults
 DEFAULT_PAGE_LIMIT = 100
 MAX_BULK_OPERATION_LIMIT = 100000
+
+# =============================================================================
+# Graph Service Constants
+# =============================================================================
+
+# Edge weight calculation (travel time in seconds)
+# weight = length_meters / (max_speed_kmh * KMH_TO_MS)
+KMH_TO_MS = 1000 / 3600  # Convert km/h to m/s (0.2778)
+
+# Default values for graph edges
+DEFAULT_EDGE_WEIGHT = 1.0
+DEFAULT_MAX_SPEED_MS = 13.89  # 50 km/h in m/s
+
+# Graph node/edge attribute keys
+ATTR_NODE_ID = "node_id"
+ATTR_LATITUDE = "lat"
+ATTR_LONGITUDE = "lon"
+ATTR_NODE_TYPE = "node_type"
+ATTR_EDGE_ID = "edge_id"
+ATTR_LENGTH = "length"
+ATTR_MAX_SPEED = "max_speed"
+ATTR_WEIGHT = "weight"
+ATTR_ROAD_TYPE = "road_type"
+ATTR_ONE_WAY = "one_way"
+
+# Cache settings
+GRAPH_CACHE_TTL_SECONDS = 300  # 5 minutes
