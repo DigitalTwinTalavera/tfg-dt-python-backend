@@ -279,3 +279,15 @@ OSM_DEFAULT_ONEWAY_TYPES: set[str] = {"motorway", "motorway_link"}
 
 # Roundabouts are always one-way
 OSM_JUNCTION_ROUNDABOUT = "roundabout"
+
+# Node type detection values
+OSM_NODE_TRAFFIC_SIGNALS = "traffic_signals"
+OSM_TAG_NOEXIT = "noexit"
+OSM_VALUE_YES = "yes"
+
+# Earth radius for Haversine distance calculation
+EARTH_RADIUS_METERS = 6371000
+
+# Data directory for OSM file imports
+OSM_DATA_DIRECTORY = "data"
+OSM_SUPPORTED_FORMATS = [".osm"]

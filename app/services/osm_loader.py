@@ -16,11 +16,14 @@ from geoalchemy2.functions import ST_MakePoint, ST_SetSRID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import (
+    DEFAULT_MAX_SPEED_KMH,
+    EARTH_RADIUS_METERS,
     OSM_ALLOWED_HIGHWAY_TYPES,
     OSM_BATCH_SIZE,
     OSM_DEFAULT_ONEWAY_TYPES,
     OSM_DEFAULT_SPEED_LIMITS,
     OSM_JUNCTION_ROUNDABOUT,
+    OSM_NODE_TRAFFIC_SIGNALS,
     OSM_ONEWAY_REVERSE,
     OSM_ONEWAY_YES,
     OSM_PBF_EXTENSION,
@@ -30,7 +33,9 @@ from app.core.constants import (
     OSM_TAG_LANES,
     OSM_TAG_MAXSPEED,
     OSM_TAG_NAME,
+    OSM_TAG_NOEXIT,
     OSM_TAG_ONEWAY,
+    OSM_VALUE_YES,
     OSM_XML_EXTENSIONS,
     SRID_WGS84,
 )
@@ -342,11 +347,11 @@ class OSMLoader:
         """Determine the node type from OSM tags."""
         tags = osm_node.tags
 
-        if tags.get("highway") == "traffic_signals":
+        if tags.get(OSM_TAG_HIGHWAY) == OSM_NODE_TRAFFIC_SIGNALS:
             return NodeType.TRAFFIC_LIGHT
-        if tags.get("junction") == "roundabout":
+        if tags.get(OSM_TAG_JUNCTION) == OSM_JUNCTION_ROUNDABOUT:
             return NodeType.ROUNDABOUT
-        if tags.get("noexit") == "yes":
+        if tags.get(OSM_TAG_NOEXIT) == OSM_VALUE_YES:
             return NodeType.DEAD_END
 
         return NodeType.INTERSECTION
@@ -466,7 +471,6 @@ class OSMLoader:
             Total length in meters
         """
         total_length = 0.0
-        earth_radius = 6371000  # meters
 
         for i in range(len(coords) - 1):
             lon1, lat1 = coords[i]
@@ -486,7 +490,7 @@ class OSMLoader:
                 * math.sin(delta_lon / 2) ** 2
             )
             c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-            total_length += earth_radius * c
+            total_length += EARTH_RADIUS_METERS * c
 
         return total_length
 
@@ -506,7 +510,7 @@ class OSMLoader:
             Speed limit in km/h
         """
         if not maxspeed:
-            return OSM_DEFAULT_SPEED_LIMITS.get(highway, 50)
+            return OSM_DEFAULT_SPEED_LIMITS.get(highway, DEFAULT_MAX_SPEED_KMH)
 
         # Remove whitespace
         maxspeed = maxspeed.strip()
@@ -522,7 +526,7 @@ class OSMLoader:
             return int(value)
 
         # Fallback to default
-        return OSM_DEFAULT_SPEED_LIMITS.get(highway, 50)
+        return OSM_DEFAULT_SPEED_LIMITS.get(highway, DEFAULT_MAX_SPEED_KMH)
 
     def _parse_lanes(self, lanes: Optional[str]) -> int:
         """Parse OSM lanes tag to integer."""

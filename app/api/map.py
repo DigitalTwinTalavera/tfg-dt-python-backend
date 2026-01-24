@@ -9,7 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.constants import API_PREFIX, TAG_MAP
+from app.core.constants import (
+    OSM_DATA_DIRECTORY,
+    OSM_SUPPORTED_FORMATS,
+    TAG_MAP,
+)
 from app.db.database import get_db_session
 from app.services.osm_loader import OSMLoader, OSMLoadStats
 
@@ -66,8 +70,8 @@ async def get_import_status() -> ImportStatusResponse:
     """
     return ImportStatusResponse(
         available=True,
-        supported_formats=[".osm"],
-        data_directory="data/",
+        supported_formats=OSM_SUPPORTED_FORMATS,
+        data_directory=f"{OSM_DATA_DIRECTORY}/",
     )
 
 
@@ -106,7 +110,7 @@ async def import_osm_data(
         HTTPException: If file not found or import fails
     """
     # Construct full path (relative to data directory)
-    data_dir = Path("data")
+    data_dir = Path(OSM_DATA_DIRECTORY)
     filepath = data_dir / request.filepath
 
     # Security check: prevent path traversal
