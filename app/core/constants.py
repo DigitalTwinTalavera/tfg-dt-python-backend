@@ -192,3 +192,90 @@ ATTR_ONE_WAY = "one_way"
 
 # Cache settings
 GRAPH_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+# =============================================================================
+# OSM Loader Constants
+# =============================================================================
+
+# API Tags for Map Import
+TAG_MAP = "Map"
+
+# Allowed highway types for road network (relevant for vehicle traffic)
+OSM_ALLOWED_HIGHWAY_TYPES: set[str] = {
+    "motorway",
+    "motorway_link",
+    "trunk",
+    "trunk_link",
+    "primary",
+    "primary_link",
+    "secondary",
+    "secondary_link",
+    "tertiary",
+    "tertiary_link",
+    "residential",
+    "service",
+    "unclassified",
+    "living_street",
+}
+
+# Highway types to exclude (pedestrian, cycling paths)
+OSM_EXCLUDED_HIGHWAY_TYPES: set[str] = {
+    "footway",
+    "cycleway",
+    "path",
+    "pedestrian",
+    "steps",
+    "track",
+    "bridleway",
+    "corridor",
+    "elevator",
+    "escalator",
+    "proposed",
+    "construction",
+    "raceway",
+}
+
+# Default speed limits by road type (km/h) when OSM data is missing
+OSM_DEFAULT_SPEED_LIMITS: dict[str, int] = {
+    "motorway": 120,
+    "motorway_link": 80,
+    "trunk": 100,
+    "trunk_link": 60,
+    "primary": 90,
+    "primary_link": 50,
+    "secondary": 70,
+    "secondary_link": 50,
+    "tertiary": 50,
+    "tertiary_link": 30,
+    "residential": 30,
+    "service": 20,
+    "unclassified": 50,
+    "living_street": 20,
+}
+
+# OSM batch processing settings
+OSM_BATCH_SIZE = 1000  # Nodes/edges per batch insert
+OSM_PROGRESS_INTERVAL = 1000  # Report progress every N items
+
+# OSM file extensions
+OSM_XML_EXTENSIONS = {".osm", ".xml"}
+OSM_PBF_EXTENSION = ".pbf"
+
+# OSM tag keys
+OSM_TAG_HIGHWAY = "highway"
+OSM_TAG_MAXSPEED = "maxspeed"
+OSM_TAG_ONEWAY = "oneway"
+OSM_TAG_NAME = "name"
+OSM_TAG_LANES = "lanes"
+OSM_TAG_JUNCTION = "junction"
+
+# One-way indicator values
+OSM_ONEWAY_YES = {"yes", "true", "1"}
+OSM_ONEWAY_REVERSE = {"-1", "reverse"}
+OSM_ONEWAY_NO = {"no", "false", "0"}
+
+# Highway types that are one-way by default
+OSM_DEFAULT_ONEWAY_TYPES: set[str] = {"motorway", "motorway_link"}
+
+# Roundabouts are always one-way
+OSM_JUNCTION_ROUNDABOUT = "roundabout"
