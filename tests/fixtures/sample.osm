@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="test">
+  <!-- Sample OSM data for testing the OSMLoader -->
+  <!-- Location: Talavera de la Reina area (approximate) -->
+
+  <!-- Nodes for a simple road network -->
+  <node id="1001" lat="39.9567" lon="-4.8301">
+    <tag k="name" v="Plaza Mayor"/>
+  </node>
+  <node id="1002" lat="39.9570" lon="-4.8290">
+    <tag k="highway" v="traffic_signals"/>
+  </node>
+  <node id="1003" lat="39.9575" lon="-4.8280"/>
+  <node id="1004" lat="39.9580" lon="-4.8275"/>
+  <node id="1005" lat="39.9560" lon="-4.8295">
+    <tag k="junction" v="roundabout"/>
+  </node>
+  <node id="1006" lat="39.9555" lon="-4.8285"/>
+  <node id="1007" lat="39.9550" lon="-4.8270"/>
+  <node id="1008" lat="39.9565" lon="-4.8260"/>
+
+  <!-- Primary road: Calle Mayor -->
+  <way id="2001">
+    <nd ref="1001"/>
+    <nd ref="1002"/>
+    <nd ref="1003"/>
+    <nd ref="1004"/>
+    <tag k="highway" v="primary"/>
+    <tag k="name" v="Calle Mayor"/>
+    <tag k="maxspeed" v="50"/>
+    <tag k="lanes" v="2"/>
+    <tag k="oneway" v="no"/>
+  </way>
+
+  <!-- Secondary road: Avenida del Sol -->
+  <way id="2002">
+    <nd ref="1005"/>
+    <nd ref="1006"/>
+    <nd ref="1007"/>
+    <tag k="highway" v="secondary"/>
+    <tag k="name" v="Avenida del Sol"/>
+    <tag k="maxspeed" v="40"/>
+  </way>
+
+  <!-- Residential road: Calle Luna -->
+  <way id="2003">
+    <nd ref="1002"/>
+    <nd ref="1005"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Calle Luna"/>
+  </way>
+
+  <!-- Service road (one-way) -->
+  <way id="2004">
+    <nd ref="1007"/>
+    <nd ref="1008"/>
+    <tag k="highway" v="service"/>
+    <tag k="oneway" v="yes"/>
+  </way>
+
+  <!-- Tertiary road connecting to primary -->
+  <way id="2005">
+    <nd ref="1004"/>
+    <nd ref="1008"/>
+    <tag k="highway" v="tertiary"/>
+    <tag k="name" v="Calle Estrella"/>
+    <tag k="maxspeed" v="30"/>
+  </way>
+
+  <!-- Footway (should be excluded) -->
+  <way id="3001">
+    <nd ref="1001"/>
+    <nd ref="1005"/>
+    <tag k="highway" v="footway"/>
+    <tag k="name" v="Paseo peatonal"/>
+  </way>
+
+  <!-- Cycleway (should be excluded) -->
+  <way id="3002">
+    <nd ref="1003"/>
+    <nd ref="1006"/>
+    <tag k="highway" v="cycleway"/>
+    <tag k="name" v="Carril bici"/>
+  </way>
+
+  <!-- Road with mph speed limit -->
+  <way id="2006">
+    <nd ref="1006"/>
+    <nd ref="1008"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Calle Test MPH"/>
+    <tag k="maxspeed" v="30 mph"/>
+  </way>
+
+</osm>

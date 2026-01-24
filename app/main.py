@@ -9,7 +9,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import health, routes
+from app.api import health, map, routes
 from app.config import settings
 from app.core.constants import (
     API_PREFIX,
@@ -28,6 +28,7 @@ from app.core.constants import (
     ROOT_PATH,
     STATUS_RUNNING,
     TAG_HEALTH,
+    TAG_MAP,
     TAG_ROOT,
     WS_SIMULATION_PATH,
 )
@@ -99,6 +100,7 @@ app.add_middleware(
 
 # Incluir routers
 app.include_router(health.router, prefix=API_PREFIX, tags=[TAG_HEALTH])
+app.include_router(map.router, prefix=API_PREFIX, tags=[TAG_MAP])
 app.include_router(routes.router)
 
 

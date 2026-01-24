@@ -35,6 +35,8 @@ services:
     volumes:
       - ./app:/app/app:z
       - ./tests:/app/tests:z
+      - ./scripts:/app/scripts:z
+      - ./data:/app/data:z
       - ./pytest.ini:/app/pytest.ini:z
       - ./.env:/app/.env:z
     restart: unless-stopped

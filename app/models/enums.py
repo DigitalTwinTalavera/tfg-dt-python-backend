@@ -19,16 +19,45 @@ class NodeType(str, Enum):
 
 
 class RoadType(str, Enum):
-    """Types of roads/edges in the network."""
+    """Types of roads/edges in the network (based on OSM highway tags)."""
 
+    # Major roads
     MOTORWAY = "motorway"
+    MOTORWAY_LINK = "motorway_link"
+    TRUNK = "trunk"
+    TRUNK_LINK = "trunk_link"
     PRIMARY = "primary"
+    PRIMARY_LINK = "primary_link"
     SECONDARY = "secondary"
+    SECONDARY_LINK = "secondary_link"
     TERTIARY = "tertiary"
+    TERTIARY_LINK = "tertiary_link"
+
+    # Minor roads
     RESIDENTIAL = "residential"
     SERVICE = "service"
+    UNCLASSIFIED = "unclassified"
+    LIVING_STREET = "living_street"
+
+    # Non-vehicle roads (may be excluded from vehicle simulation)
     PEDESTRIAN = "pedestrian"
     CYCLEWAY = "cycleway"
+
+    @classmethod
+    def from_osm_highway(cls, highway: str) -> "RoadType":
+        """
+        Convert OSM highway tag to RoadType enum.
+
+        Args:
+            highway: OSM highway tag value
+
+        Returns:
+            Matching RoadType, defaults to UNCLASSIFIED if unknown
+        """
+        try:
+            return cls(highway)
+        except ValueError:
+            return cls.UNCLASSIFIED
 
 
 class VehicleStatus(str, Enum):
