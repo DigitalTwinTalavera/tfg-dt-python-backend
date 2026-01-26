@@ -5,13 +5,14 @@ Provides spatial queries and node-specific operations.
 
 from typing import Optional
 
-from geoalchemy2.functions import ST_DWithin, ST_Distance, ST_MakePoint, ST_SetSRID
+from geoalchemy2.functions import ST_DWithin, ST_Distance
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.constants import DEFAULT_PAGE_LIMIT, SRID_WGS84
+from app.core.constants import DEFAULT_PAGE_LIMIT
 from app.db.repositories.base import BaseRepository
+from app.db.utils import make_point_geometry
 from app.models.enums import NodeType
 from app.models.road_network import NodeModel
 
@@ -57,7 +58,7 @@ class NodeRepository(BaseRepository[NodeModel]):
         Returns:
             List of nodes within the radius
         """
-        point = ST_SetSRID(ST_MakePoint(longitude, latitude), SRID_WGS84)
+        point = make_point_geometry(longitude, latitude)
         stmt = select(NodeModel).where(
             ST_DWithin(
                 NodeModel.position,
@@ -100,7 +101,7 @@ class NodeRepository(BaseRepository[NodeModel]):
         Returns:
             List of nearest nodes, ordered by distance
         """
-        point = ST_SetSRID(ST_MakePoint(longitude, latitude), SRID_WGS84)
+        point = make_point_geometry(longitude, latitude)
         distance = ST_Distance(NodeModel.position, point, use_spheroid=True)
 
         stmt = select(NodeModel).order_by(distance)

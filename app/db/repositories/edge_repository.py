@@ -5,23 +5,14 @@ Provides node-based queries and edge-specific operations.
 
 from typing import Optional
 
-from geoalchemy2.functions import (
-    ST_DWithin,
-    ST_Intersects,
-    ST_MakeEnvelope,
-    ST_MakePoint,
-    ST_SetSRID,
-)
+from geoalchemy2.functions import ST_DWithin, ST_Intersects, ST_MakeEnvelope
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.constants import (
-    DEFAULT_PAGE_LIMIT,
-    MAX_BULK_OPERATION_LIMIT,
-    SRID_WGS84,
-)
+from app.core.constants import DEFAULT_PAGE_LIMIT, MAX_BULK_OPERATION_LIMIT, SRID_WGS84
 from app.db.repositories.base import BaseRepository
+from app.db.utils import make_point_geometry
 from app.models.enums import RoadType
 from app.models.road_network import EdgeModel
 
@@ -229,7 +220,7 @@ class EdgeRepository(BaseRepository[EdgeModel]):
         Returns:
             List of edges within the radius
         """
-        point = ST_SetSRID(ST_MakePoint(longitude, latitude), SRID_WGS84)
+        point = make_point_geometry(longitude, latitude)
         stmt = select(EdgeModel).where(
             ST_DWithin(
                 EdgeModel.geometry,

@@ -1,20 +1,34 @@
 """
-API endpoints for map operations, including OSM data import.
+API endpoints for map operations, including OSM data import and data retrieval.
 """
 
+import json
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from geoalchemy2.functions import ST_AsGeoJSON, ST_X, ST_Y
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import (
+    DEFAULT_PAGE_LIMIT,
+    OSM_BATCH_SIZE,
     OSM_DATA_DIRECTORY,
     OSM_SUPPORTED_FORMATS,
     TAG_MAP,
 )
+from app.core.schemas.network_schema import (
+    EdgeGeoJSONResponse,
+    EdgeListResponse,
+    GeoJSONLineString,
+    GeoJSONPoint,
+    NodeGeoJSONResponse,
+    NodeListResponse,
+)
 from app.db.database import get_db_session
+from app.models.road_network import EdgeModel, NodeModel
 from app.services.osm_loader import OSMLoader, OSMLoadStats
 
 router = APIRouter(prefix="/map", tags=[TAG_MAP])
@@ -33,7 +47,7 @@ class ImportRequest(BaseModel):
         description="If true, delete all existing nodes and edges before import",
     )
     batch_size: int = Field(
-        default=1000,
+        default=OSM_BATCH_SIZE,
         ge=100,
         le=10000,
         description="Number of entities to insert per batch",
@@ -59,6 +73,152 @@ class ImportStatusResponse(BaseModel):
     available: bool = Field(..., description="Whether import endpoint is available")
     supported_formats: list[str] = Field(..., description="Supported file formats")
     data_directory: str = Field(..., description="Server data directory path")
+
+
+@router.get("/nodes", response_model=NodeListResponse)
+async def get_nodes(
+    skip: int = Query(0, ge=0, description="Number of nodes to skip"),
+    limit: int = Query(
+        DEFAULT_PAGE_LIMIT, ge=1, le=10000, description="Maximum nodes to return"
+    ),
+    session: AsyncSession = Depends(get_db_session),
+) -> NodeListResponse:
+    """
+    Get paginated list of nodes with GeoJSON-compatible positions.
+
+    Returns nodes with their positions in GeoJSON Point format for
+    compatibility with the Godot client.
+
+    Args:
+        skip: Number of records to skip (offset)
+        limit: Maximum number of records to return
+        session: Database session (injected)
+
+    Returns:
+        Paginated list of nodes with total count
+    """
+    # Get total count
+    count_stmt = select(func.count()).select_from(NodeModel)
+    count_result = await session.execute(count_stmt)
+    total = count_result.scalar() or 0
+
+    # Get nodes with coordinates extracted
+    stmt = (
+        select(
+            NodeModel.id,
+            NodeModel.name,
+            NodeModel.node_type,
+            NodeModel.is_active,
+            NodeModel.metadata_json,
+            NodeModel.created_at,
+            NodeModel.updated_at,
+            ST_X(NodeModel.position).label("longitude"),
+            ST_Y(NodeModel.position).label("latitude"),
+        )
+        .offset(skip)
+        .limit(limit)
+        .order_by(NodeModel.id)
+    )
+
+    result = await session.execute(stmt)
+    rows = result.fetchall()
+
+    items = [
+        NodeGeoJSONResponse(
+            id=row.id,
+            name=row.name,
+            node_type=row.node_type,
+            is_active=row.is_active,
+            position=GeoJSONPoint(coordinates=[row.longitude, row.latitude]),
+            metadata_json=row.metadata_json,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+        )
+        for row in rows
+    ]
+
+    return NodeListResponse(items=items, total=total)
+
+
+@router.get("/edges", response_model=EdgeListResponse)
+async def get_edges(
+    skip: int = Query(0, ge=0, description="Number of edges to skip"),
+    limit: int = Query(
+        DEFAULT_PAGE_LIMIT, ge=1, le=10000, description="Maximum edges to return"
+    ),
+    session: AsyncSession = Depends(get_db_session),
+) -> EdgeListResponse:
+    """
+    Get paginated list of edges with GeoJSON-compatible geometries.
+
+    Returns edges with their geometries in GeoJSON LineString format for
+    compatibility with the Godot client.
+
+    Args:
+        skip: Number of records to skip (offset)
+        limit: Maximum number of records to return
+        session: Database session (injected)
+
+    Returns:
+        Paginated list of edges with total count
+    """
+    # Get total count
+    count_stmt = select(func.count()).select_from(EdgeModel)
+    count_result = await session.execute(count_stmt)
+    total = count_result.scalar() or 0
+
+    # Get edges with geometry as GeoJSON
+    stmt = (
+        select(
+            EdgeModel.id,
+            EdgeModel.name,
+            EdgeModel.start_node_id,
+            EdgeModel.end_node_id,
+            EdgeModel.road_type,
+            EdgeModel.length,
+            EdgeModel.max_speed,
+            EdgeModel.lanes,
+            EdgeModel.one_way,
+            EdgeModel.is_active,
+            EdgeModel.metadata_json,
+            EdgeModel.created_at,
+            EdgeModel.updated_at,
+            ST_AsGeoJSON(EdgeModel.geometry).label("geometry_json"),
+        )
+        .offset(skip)
+        .limit(limit)
+        .order_by(EdgeModel.id)
+    )
+
+    result = await session.execute(stmt)
+    rows = result.fetchall()
+
+    items = []
+    for row in rows:
+        # Parse GeoJSON geometry
+        geom_data = json.loads(row.geometry_json)
+        coordinates = geom_data.get("coordinates", [])
+
+        items.append(
+            EdgeGeoJSONResponse(
+                id=row.id,
+                name=row.name,
+                start_node_id=row.start_node_id,
+                end_node_id=row.end_node_id,
+                road_type=row.road_type,
+                geometry=GeoJSONLineString(coordinates=coordinates),
+                length=row.length,
+                max_speed=row.max_speed,
+                lanes=row.lanes,
+                one_way=row.one_way,
+                is_active=row.is_active,
+                metadata_json=row.metadata_json,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+            )
+        )
+
+    return EdgeListResponse(items=items, total=total)
 
 
 @router.get("/import/status", response_model=ImportStatusResponse)
@@ -121,10 +281,12 @@ async def import_osm_data(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid file path: path traversal not allowed",
             )
-    except Exception:
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid file path",
+            detail=f"Invalid file path: {e}",
         )
 
     # Check file exists

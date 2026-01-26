@@ -104,6 +104,33 @@ class NodeResponse(NodeBase):
     updated_at: datetime = Field(..., description="Last update timestamp")
 
 
+class GeoJSONPoint(BaseModel):
+    """GeoJSON Point representation for Godot client compatibility."""
+
+    type: str = Field(default="Point", description="GeoJSON geometry type")
+    coordinates: list[float] = Field(..., description="[longitude, latitude]")
+
+
+class NodeGeoJSONResponse(BaseModel):
+    """Node response with GeoJSON position for Godot client."""
+
+    id: int = Field(..., description="Unique node identifier")
+    name: Optional[str] = Field(None, description="Node name")
+    node_type: str = Field(..., description="Type of node")
+    is_active: bool = Field(..., description="Whether the node is active")
+    position: GeoJSONPoint = Field(..., description="GeoJSON Point position")
+    metadata_json: Optional[str] = Field(None, description="Optional JSON metadata")
+    created_at: datetime = Field(..., description="Creation timestamp")
+    updated_at: datetime = Field(..., description="Last update timestamp")
+
+
+class NodeListResponse(BaseModel):
+    """Paginated list of nodes for Godot client."""
+
+    items: list[NodeGeoJSONResponse] = Field(..., description="List of nodes")
+    total: int = Field(..., description="Total number of nodes")
+
+
 # ============================================================================
 # Edge Schemas
 # ============================================================================
@@ -190,3 +217,38 @@ class EdgeResponse(EdgeBase):
     length: float = Field(..., description="Length in meters")
     created_at: datetime = Field(..., description="Creation timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")
+
+
+class GeoJSONLineString(BaseModel):
+    """GeoJSON LineString representation for Godot client compatibility."""
+
+    type: str = Field(default="LineString", description="GeoJSON geometry type")
+    coordinates: list[list[float]] = Field(
+        ..., description="List of [longitude, latitude] pairs"
+    )
+
+
+class EdgeGeoJSONResponse(BaseModel):
+    """Edge response with GeoJSON geometry for Godot client."""
+
+    id: int = Field(..., description="Unique edge identifier")
+    name: Optional[str] = Field(None, description="Edge/road name")
+    start_node_id: int = Field(..., description="ID of the start node")
+    end_node_id: int = Field(..., description="ID of the end node")
+    road_type: str = Field(..., description="Type of road")
+    geometry: GeoJSONLineString = Field(..., description="GeoJSON LineString geometry")
+    length: float = Field(..., description="Length in meters")
+    max_speed: int = Field(..., description="Maximum speed in km/h")
+    lanes: int = Field(..., description="Number of lanes")
+    one_way: bool = Field(..., description="Whether road is one-way")
+    is_active: bool = Field(..., description="Whether edge is active")
+    metadata_json: Optional[str] = Field(None, description="Optional JSON metadata")
+    created_at: datetime = Field(..., description="Creation timestamp")
+    updated_at: datetime = Field(..., description="Last update timestamp")
+
+
+class EdgeListResponse(BaseModel):
+    """Paginated list of edges for Godot client."""
+
+    items: list[EdgeGeoJSONResponse] = Field(..., description="List of edges")
+    total: int = Field(..., description="Total number of edges")

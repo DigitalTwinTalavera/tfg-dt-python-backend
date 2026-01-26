@@ -77,6 +77,32 @@ class ConnectionManager:
         """
         await websocket.send_json(message)
 
+    async def _broadcast_to_all(
+        self,
+        send_func_name: str,
+        message: dict[str, Any] | str,
+    ) -> None:
+        """
+        Internal method to broadcast a message to all connected clients.
+
+        Args:
+            send_func_name: Name of the WebSocket send method ('send_json' or 'send_text')
+            message: The message to broadcast (dict for JSON, str for text)
+        """
+        disconnected: list[WebSocket] = []
+
+        for connection in self._active_connections:
+            try:
+                send_func = getattr(connection, send_func_name)
+                await send_func(message)
+            except Exception as e:
+                logger.warning("Failed to send message to client: %s", e)
+                disconnected.append(connection)
+
+        # Clean up disconnected clients
+        for connection in disconnected:
+            self.disconnect(connection)
+
     async def broadcast(self, message: dict[str, Any]) -> None:
         """
         Broadcast a JSON message to all connected clients.
@@ -84,18 +110,7 @@ class ConnectionManager:
         Args:
             message: The message dictionary to broadcast
         """
-        disconnected: list[WebSocket] = []
-
-        for connection in self._active_connections:
-            try:
-                await connection.send_json(message)
-            except Exception as e:
-                logger.warning(f"Failed to send message to client: {e}")
-                disconnected.append(connection)
-
-        # Clean up disconnected clients
-        for connection in disconnected:
-            self.disconnect(connection)
+        await self._broadcast_to_all("send_json", message)
 
     async def broadcast_text(self, message: str) -> None:
         """
@@ -104,18 +119,7 @@ class ConnectionManager:
         Args:
             message: The text message to broadcast
         """
-        disconnected: list[WebSocket] = []
-
-        for connection in self._active_connections:
-            try:
-                await connection.send_text(message)
-            except Exception as e:
-                logger.warning(f"Failed to send text to client: {e}")
-                disconnected.append(connection)
-
-        # Clean up disconnected clients
-        for connection in disconnected:
-            self.disconnect(connection)
+        await self._broadcast_to_all("send_text", message)
 
 
 # Singleton instance for the application
