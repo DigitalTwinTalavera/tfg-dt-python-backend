@@ -9,7 +9,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import health, map, routes
+from app.api import health, map, routes, simulation
 from app.config import settings
 from app.core.constants import (
     API_PREFIX,
@@ -30,9 +30,11 @@ from app.core.constants import (
     TAG_HEALTH,
     TAG_MAP,
     TAG_ROOT,
+    TAG_SIMULATION,
     WS_SIMULATION_PATH,
 )
 from app.core.responses import RootResponse
+from app.core.simulation_engine import simulation_engine
 from app.db.database import close_db, init_db
 
 
@@ -73,6 +75,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
+    await simulation_engine.shutdown()
     await close_db()
     print(MSG_DB_DISCONNECTED)
     print(MSG_SHUTDOWN)
@@ -101,6 +104,7 @@ app.add_middleware(
 # Incluir routers
 app.include_router(health.router, prefix=API_PREFIX, tags=[TAG_HEALTH])
 app.include_router(map.router, prefix=API_PREFIX, tags=[TAG_MAP])
+app.include_router(simulation.router, prefix=API_PREFIX, tags=[TAG_SIMULATION])
 app.include_router(routes.router)
 
 

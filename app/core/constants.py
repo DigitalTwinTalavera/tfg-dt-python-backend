@@ -291,3 +291,17 @@ EARTH_RADIUS_METERS = 6371000
 # Data directory for OSM file imports
 OSM_DATA_DIRECTORY = "data"
 OSM_SUPPORTED_FORMATS = [".osm"]
+
+# =============================================================================
+# Simulation Engine Constants
+# =============================================================================
+
+# Simulation State Machine
+TAG_SIMULATION = "Simulation"
+
+# Default tick interval in milliseconds (10 ticks/s)
+DEFAULT_TICK_INTERVAL_MS = 100.0
+
+# Simulation status messages
+MSG_SIMULATION_STARTED = "Simulación iniciada"
+MSG_SIMULATION_STOPPED = "Simulación detenida por shutdown"

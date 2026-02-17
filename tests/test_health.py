@@ -2,7 +2,7 @@
 Tests para los endpoints de health check.
 """
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,7 +16,7 @@ from app.main import app
 def override_get_db_session():
     """Override dependency for testing without real DB."""
     mock_session = AsyncMock()
-    mock_result = AsyncMock()
+    mock_result = MagicMock()
     mock_result.scalar.return_value = "3.3.0 USE_GEOS=1"
     mock_session.execute.return_value = mock_result
     yield mock_session
