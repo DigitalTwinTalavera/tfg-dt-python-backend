@@ -8,11 +8,13 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.api.websocket import ConnectionManager
 from app.api.websocket.manager import connection_manager
+from app.api.websocket.messages import build_sim_state_message
 from app.core.constants import (
     STATUS_OK,
     WS_SIMULATION_PATH,
     WS_TYPE_ECHO,
 )
+from app.core.simulation_engine import simulation_engine
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,13 @@ async def websocket_simulation(websocket: WebSocket) -> None:
     All received messages are logged to the console (echo test).
     """
     await connection_manager.connect(websocket)
+
+    # Immediately inform the new client of the current simulation state
+    # so the Godot UI can enable/disable its controls without waiting for
+    # the next state-change broadcast.
+    await connection_manager.send_personal_message(
+        build_sim_state_message(simulation_engine.state.value), websocket
+    )
 
     try:
         while True:

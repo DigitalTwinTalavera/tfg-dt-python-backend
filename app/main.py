@@ -34,8 +34,9 @@ from app.core.constants import (
     WS_SIMULATION_PATH,
 )
 from app.core.responses import RootResponse
+from app.api.deps import _graph
 from app.core.simulation_engine import simulation_engine
-from app.db.database import close_db, init_db
+from app.db.database import async_session_factory, close_db, init_db
 
 
 @asynccontextmanager
@@ -71,6 +72,15 @@ async def lifespan(app: FastAPI):
 
     await init_db()
     print(MSG_DB_CONNECTED)
+
+    # Build in-memory road network graph from database
+    async with async_session_factory() as session:
+        stats = await _graph.build_from_database(session)
+        print(
+            f"Road network graph built: {stats.node_count} nodes, "
+            f"{stats.edge_count} edges "
+            f"(connected={stats.is_connected}, {stats.build_time_ms:.0f} ms)"
+        )
 
     yield
 

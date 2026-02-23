@@ -103,10 +103,22 @@ class VehicleSpawner:
         ]
 
     def get_entry_nodes(self) -> list[int]:
-        return self._get_nodes_by_type(NodeType.ENTRY_POINT.value)
+        nodes = self._get_nodes_by_type(NodeType.ENTRY_POINT.value)
+        if not nodes:
+            # Fall back to intersection nodes when no dedicated entry points exist
+            nodes = self._get_nodes_by_type(NodeType.INTERSECTION.value)
+        if not nodes:
+            nodes = list(self._graph.graph.nodes())
+        return nodes
 
     def get_exit_nodes(self) -> list[int]:
-        return self._get_nodes_by_type(NodeType.EXIT_POINT.value)
+        nodes = self._get_nodes_by_type(NodeType.EXIT_POINT.value)
+        if not nodes:
+            # Fall back to intersection nodes when no dedicated exit points exist
+            nodes = self._get_nodes_by_type(NodeType.INTERSECTION.value)
+        if not nodes:
+            nodes = list(self._graph.graph.nodes())
+        return nodes
 
     def spawn(self, count: int = 1) -> list[SimVehicle]:
         """
@@ -114,20 +126,21 @@ class VehicleSpawner:
 
         Cada vehículo se coloca en un entry_point aleatorio con destino
         a un exit_point aleatorio, calculando la ruta más corta.
+        Si no hay nodos entry_point/exit_point, usa intersecciones como fallback.
 
         Returns:
             Lista de vehículos creados.
 
         Raises:
-            ValueError: Si no hay nodos de entrada/salida disponibles.
+            ValueError: Si el grafo no tiene nodos navigables.
         """
         entry_nodes = self.get_entry_nodes()
         exit_nodes = self.get_exit_nodes()
 
         if not entry_nodes:
-            raise ValueError("No hay nodos de entrada (entry_point) en el grafo")
+            raise ValueError("El grafo no tiene nodos navegables para spawning")
         if not exit_nodes:
-            raise ValueError("No hay nodos de salida (exit_point) en el grafo")
+            raise ValueError("El grafo no tiene nodos navegables para destinos")
 
         available_slots = self._max_vehicles - self.active_count
         actual_count = min(count, available_slots)

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import networkx as nx
-from geoalchemy2.functions import ST_X, ST_Y
+from geoalchemy2.functions import ST_AsGeoJSON, ST_X, ST_Y
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,10 +25,12 @@ from app.core.constants import (
     ATTR_NODE_TYPE,
     ATTR_ONE_WAY,
     ATTR_ROAD_TYPE,
+    ATTR_WAYPOINTS,
     ATTR_WEIGHT,
     DEFAULT_EDGE_WEIGHT,
     GRAPH_CACHE_TTL_SECONDS,
     KMH_TO_MS,
+    ROAD_TYPE_WEIGHT_FACTORS,
 )
 
 
@@ -198,6 +200,7 @@ class RoadNetworkGraph:
             EdgeModel.max_speed,
             EdgeModel.road_type,
             EdgeModel.one_way,
+            ST_AsGeoJSON(EdgeModel.geometry).label("geometry_json"),
         )
 
         if active_only:
@@ -207,10 +210,18 @@ class RoadNetworkGraph:
         rows = result.fetchall()
 
         for row in rows:
-            # Calculate weight as travel time in seconds
-            # weight = length (m) / speed (m/s)
+            # Calculate weight as travel time (s) × road-type penalty factor.
+            # Minor roads get higher weights so Dijkstra prefers major roads.
             max_speed_ms = row.max_speed * KMH_TO_MS
-            weight = row.length / max_speed_ms if max_speed_ms > 0 else DEFAULT_EDGE_WEIGHT
+            travel_time = row.length / max_speed_ms if max_speed_ms > 0 else DEFAULT_EDGE_WEIGHT
+            road_factor = ROAD_TYPE_WEIGHT_FACTORS.get(row.road_type, 1.0)
+            weight = travel_time * road_factor
+
+            # Parse geometry waypoints from GeoJSON LineString
+            waypoints: list[tuple[float, float]] = []
+            if row.geometry_json:
+                geom = json.loads(row.geometry_json)
+                waypoints = [(c[0], c[1]) for c in geom.get("coordinates", [])]
 
             edge_attrs = {
                 ATTR_EDGE_ID: row.id,
@@ -219,14 +230,16 @@ class RoadNetworkGraph:
                 ATTR_WEIGHT: weight,
                 ATTR_ROAD_TYPE: row.road_type,
                 ATTR_ONE_WAY: row.one_way,
+                ATTR_WAYPOINTS: waypoints,
             }
 
             # Add forward edge
             self._graph.add_edge(row.start_node_id, row.end_node_id, **edge_attrs)
 
-            # Add reverse edge for bidirectional roads
+            # Add reverse edge for bidirectional roads (reversed waypoint order)
             if not row.one_way:
-                self._graph.add_edge(row.end_node_id, row.start_node_id, **edge_attrs)
+                reverse_attrs = {**edge_attrs, ATTR_WAYPOINTS: list(reversed(waypoints))}
+                self._graph.add_edge(row.end_node_id, row.start_node_id, **reverse_attrs)
 
     def get_shortest_path(
         self,

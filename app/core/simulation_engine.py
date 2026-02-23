@@ -268,7 +268,20 @@ class SimulationEngine:
                 except ValueError:
                     pass  # sin nodos de entrada/salida -> ignorar silenciosamente
 
-        # 2. Broadcast
+        # 2. Física de vehículos
+        if self._spawner is not None and self._spawner.graph.node_count > 0:
+            from app.core.vehicle_physics import update_vehicles
+            finished_ids = update_vehicles(self._spawner.vehicles, self._spawner.graph, dt)
+
+            # 3. Broadcast vehicle_finished + eliminar vehículos completados
+            for vid in finished_ids:
+                if self._broadcaster is not None:
+                    await self._broadcaster.broadcast_vehicle_finished(vid)
+                self._spawner.remove_vehicle(vid)
+
+        self._vehicles_active = self._spawner.active_count if self._spawner else 0
+
+        # 4. Broadcast
         if self._broadcaster is not None:
             await self._broadcaster.broadcast_tick(
                 tick=self._tick_count,

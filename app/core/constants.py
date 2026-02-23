@@ -194,9 +194,30 @@ ATTR_MAX_SPEED = "max_speed"
 ATTR_WEIGHT = "weight"
 ATTR_ROAD_TYPE = "road_type"
 ATTR_ONE_WAY = "one_way"
+ATTR_WAYPOINTS = "waypoints"  # list[tuple[float,float]] — (lon, lat) pairs from LineString
 
 # Cache settings
 GRAPH_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+# Road-type routing penalty factors (multiplied on top of travel-time weight).
+# Values > 1 discourage a road type; values < 1 encourage it.
+# Keeps major roads preferred while still allowing minor roads when necessary.
+ROAD_TYPE_WEIGHT_FACTORS: dict[str, float] = {
+    "motorway":        0.6,
+    "motorway_link":   0.7,
+    "trunk":           0.7,
+    "trunk_link":      0.8,
+    "primary":         0.8,
+    "primary_link":    0.9,
+    "secondary":       1.0,
+    "secondary_link":  1.1,
+    "tertiary":        1.2,
+    "tertiary_link":   1.3,
+    "residential":     1.8,
+    "living_street":   2.0,
+    "service":         2.5,
+    "unclassified":    1.5,
+}
 
 # =============================================================================
 # OSM Loader Constants
