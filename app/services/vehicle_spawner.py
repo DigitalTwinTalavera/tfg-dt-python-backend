@@ -74,6 +74,11 @@ class VehicleSpawner:
     def max_vehicles(self) -> int:
         return self._max_vehicles
 
+    @max_vehicles.setter
+    def max_vehicles(self, value: int) -> None:
+        """Actualiza el límite máximo de vehículos (hot-update desde config)."""
+        self._max_vehicles = value
+
     @property
     def vehicles(self) -> dict[str, SimVehicle]:
         return self._vehicles
