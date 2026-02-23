@@ -2,6 +2,8 @@
 Dependencias de inyección para los endpoints de la API.
 """
 
+from app.api.websocket.manager import connection_manager
+from app.core.broadcaster import SimulationBroadcaster
 from app.core.simulation_engine import SimulationEngine, simulation_engine
 from app.services.network_graph import RoadNetworkGraph
 from app.services.vehicle_spawner import VehicleLifecycleManager, VehicleSpawner
@@ -10,6 +12,13 @@ from app.services.vehicle_spawner import VehicleLifecycleManager, VehicleSpawner
 _graph = RoadNetworkGraph()
 _spawner = VehicleSpawner(graph=_graph)
 _lifecycle = VehicleLifecycleManager(spawner=_spawner)
+_broadcaster = SimulationBroadcaster(
+    connection_manager=connection_manager,
+    vehicle_spawner=_spawner,
+)
+
+# Inyectar broadcaster en el engine
+simulation_engine.set_broadcaster(_broadcaster)
 
 
 def get_simulation_engine() -> SimulationEngine:
@@ -30,3 +39,8 @@ def get_vehicle_spawner() -> VehicleSpawner:
 def get_vehicle_lifecycle_manager() -> VehicleLifecycleManager:
     """Devuelve la instancia singleton del gestor de ciclo de vida."""
     return _lifecycle
+
+
+def get_broadcaster() -> SimulationBroadcaster:
+    """Devuelve la instancia singleton del broadcaster."""
+    return _broadcaster

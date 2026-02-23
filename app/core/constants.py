@@ -51,6 +51,11 @@ WS_TYPE_BROADCAST = "broadcast"
 WS_TYPE_STATE_UPDATE = "state_update"
 WS_TYPE_CLIENT_CONNECTED = "client_connected"
 WS_TYPE_CLIENT_DISCONNECTED = "client_disconnected"
+WS_TYPE_TICK = "tick"
+WS_TYPE_SIM_STATE = "sim_state"
+WS_TYPE_VEHICLE_SPAWNED = "vehicle_spawned"
+WS_TYPE_VEHICLE_FINISHED = "vehicle_finished"
+WS_TYPE_VEHICLE_UPDATE = "vehicle_update"
 
 # Response Keys
 KEY_STATUS = "status"

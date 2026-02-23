@@ -34,6 +34,10 @@ class SimVehicle:
     current_edge_index: int = 0
     longitude: float = 0.0
     latitude: float = 0.0
+    velocity: float = 0.0
+    acceleration: float = 0.0
+    heading: float = 0.0
+    progress_on_edge: float = 0.0
 
     def to_dict(self) -> dict:
         return {

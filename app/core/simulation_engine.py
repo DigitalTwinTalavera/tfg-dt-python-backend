@@ -7,12 +7,16 @@ import asyncio
 import logging
 import time
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from app.core.exceptions import (
     SimulationAlreadyRunningError,
     SimulationNotPausedError,
     SimulationNotRunningError,
 )
+
+if TYPE_CHECKING:
+    from app.core.broadcaster import SimulationBroadcaster
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +47,7 @@ class SimulationEngine:
         self._start_wall_time: float = 0.0
         self._task: asyncio.Task | None = None
         self._vehicles_active: int = 0
+        self._broadcaster: SimulationBroadcaster | None = None
 
     @property
     def state(self) -> SimulationState:
@@ -74,6 +79,14 @@ class SimulationEngine:
             return 0.0
         return time.monotonic() - self._start_wall_time
 
+    @property
+    def broadcaster(self) -> "SimulationBroadcaster | None":
+        return self._broadcaster
+
+    def set_broadcaster(self, broadcaster: "SimulationBroadcaster") -> None:
+        """Inyecta el broadcaster para emitir estado en cada tick."""
+        self._broadcaster = broadcaster
+
     async def start(self) -> None:
         """Inicia la simulación. Solo válido desde IDLE o STOPPED."""
         if self._state == SimulationState.RUNNING:
@@ -85,6 +98,11 @@ class SimulationEngine:
         self._simulation_time = 0.0
         self._start_wall_time = time.monotonic()
         self._state = SimulationState.RUNNING
+
+        if self._broadcaster is not None:
+            self._broadcaster.reset()
+            await self._broadcaster.broadcast_sim_state(SimulationState.RUNNING.value)
+
         self._task = asyncio.create_task(self._run_loop())
         logger.info(
             "Simulación iniciada (tick_rate=%.1f Hz, interval=%d ms)",
@@ -99,6 +117,10 @@ class SimulationEngine:
 
         self._state = SimulationState.STOPPED
         await self._cancel_task()
+
+        if self._broadcaster is not None:
+            await self._broadcaster.broadcast_sim_state(SimulationState.STOPPED.value)
+
         logger.info(
             "Simulación detenida (ticks=%d, tiempo=%.1fs)",
             self._tick_count,
@@ -112,6 +134,10 @@ class SimulationEngine:
 
         self._state = SimulationState.PAUSED
         await self._cancel_task()
+
+        if self._broadcaster is not None:
+            await self._broadcaster.broadcast_sim_state(SimulationState.PAUSED.value)
+
         logger.info("Simulación pausada en tick %d", self._tick_count)
 
     async def resume(self) -> None:
@@ -120,18 +146,26 @@ class SimulationEngine:
             raise SimulationNotPausedError()
 
         self._state = SimulationState.RUNNING
+
+        if self._broadcaster is not None:
+            await self._broadcaster.broadcast_sim_state(SimulationState.RUNNING.value)
+
         self._task = asyncio.create_task(self._run_loop())
         logger.info("Simulación reanudada desde tick %d", self._tick_count)
 
     def get_status(self) -> dict:
         """Devuelve el estado actual de la simulación."""
-        return {
+        status = {
             "state": self._state.value,
             "tick_count": self._tick_count,
             "simulation_time_seconds": round(self._simulation_time, 3),
             "vehicles_active": self._vehicles_active,
             "uptime_seconds": round(self.uptime_seconds, 3),
         }
+        if self._broadcaster is not None:
+            status["broadcast_count"] = self._broadcaster.broadcast_count
+            status["avg_broadcast_ms"] = round(self._broadcaster.avg_broadcast_time_ms, 2)
+        return status
 
     async def shutdown(self) -> None:
         """Apagado graceful: detiene la simulación si está activa."""
@@ -164,13 +198,17 @@ class SimulationEngine:
         """
         Ejecuta un tick de simulación.
 
-        Este método será extendido en sprints futuros para actualizar
-        posiciones de vehículos, física, etc.
+        Actualiza la física de los vehículos y emite el estado
+        a los clientes WebSocket conectados.
 
         Args:
             dt: Delta time en segundos para este tick.
         """
-        pass
+        if self._broadcaster is not None:
+            await self._broadcaster.broadcast_tick(
+                tick=self._tick_count,
+                sim_time=self._simulation_time,
+            )
 
     async def _cancel_task(self) -> None:
         """Cancela la tarea de background si existe."""
