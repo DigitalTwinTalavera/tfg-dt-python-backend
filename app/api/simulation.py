@@ -7,8 +7,10 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from app.api.deps import get_simulation_engine, get_vehicle_spawner
+from app.api.deps import get_broadcaster, get_simulation_config, get_simulation_engine, get_vehicle_spawner
+from app.core.broadcaster import SimulationBroadcaster
 from app.core.exceptions import SimulationStateError
+from app.core.simulation_config import SimulationConfig
 from app.core.simulation_engine import SimulationEngine
 from app.services.vehicle_spawner import VehicleSpawner
 
@@ -89,6 +91,36 @@ async def get_simulation_status(
 ) -> dict:
     """Devuelve el estado actual de la simulación."""
     return engine.get_status()
+
+
+# =========================================================================
+# Config endpoints
+# =========================================================================
+
+
+@router.get("/config")
+async def get_config(
+    config: SimulationConfig = Depends(get_simulation_config),
+) -> dict:
+    """Devuelve la configuración activa de la simulación."""
+    return config.to_dict()
+
+
+@router.put("/config")
+async def update_config(
+    body: SimulationConfig,
+    engine: SimulationEngine = Depends(get_simulation_engine),
+) -> dict:
+    """
+    Actualiza la configuración de la simulación en caliente.
+
+    Los cambios toman efecto en el próximo tick sin necesidad de reiniciar.
+    """
+    engine.set_config(body)
+    return {
+        "status": "updated",
+        "config": body.to_dict(),
+    }
 
 
 # =========================================================================
