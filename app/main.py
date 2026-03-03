@@ -9,6 +9,8 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from pathlib import Path
+
 from app.api import health, map, routes, simulation
 from app.config import settings
 from app.core.constants import (
@@ -24,6 +26,7 @@ from app.core.constants import (
     MSG_STARTUP_SERVER,
     MSG_WS_URL,
     OPENAPI_URL,
+    OSM_DATA_DIRECTORY,
     REDOC_URL,
     ROOT_PATH,
     STATUS_RUNNING,
@@ -37,6 +40,7 @@ from app.core.responses import RootResponse
 from app.api.deps import _graph
 from app.core.simulation_engine import simulation_engine
 from app.db.database import async_session_factory, close_db, init_db
+from app.services.osm_loader import OSMLoader
 
 
 @asynccontextmanager
@@ -81,6 +85,31 @@ async def lifespan(app: FastAPI):
             f"{stats.edge_count} edges "
             f"(connected={stats.is_connected}, {stats.build_time_ms:.0f} ms)"
         )
+
+    # Auto-import MAP_FILE if DB is empty and MAP_FILE is configured
+    if stats.node_count == 0 and settings.MAP_FILE:
+        map_path = Path(OSM_DATA_DIRECTORY) / settings.MAP_FILE
+        if map_path.exists():
+            print(f"DB empty – auto-importing '{settings.MAP_FILE}'...")
+            async with async_session_factory() as session:
+                loader = OSMLoader(session)
+                import_stats = await loader.load_from_file(
+                    str(map_path), clear_existing=True
+                )
+            print(
+                f"Auto-import done: {import_stats.nodes_imported} nodes, "
+                f"{import_stats.edges_imported} edges "
+                f"({import_stats.duration_seconds:.1f}s)"
+            )
+            async with async_session_factory() as session:
+                stats = await _graph.build_from_database(session)
+            print(
+                f"Graph rebuilt: {stats.node_count} nodes, {stats.edge_count} edges"
+            )
+        else:
+            print(
+                f"Warning: MAP_FILE '{settings.MAP_FILE}' not found in '{OSM_DATA_DIRECTORY}/'"
+            )
 
     yield
 

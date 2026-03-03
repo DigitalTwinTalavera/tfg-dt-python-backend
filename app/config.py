@@ -52,6 +52,12 @@ class Settings(BaseSettings):
         description="Nivel de logging",
     )
 
+    # Mapa inicial
+    MAP_FILE: str | None = Field(
+        default=None,
+        description="Fichero OSM a auto-importar al inicio si la BD está vacía (relativo a data/)",
+    )
+
     # Simulación
     SIMULATION_TICK_RATE: float = Field(
         default=0.1,

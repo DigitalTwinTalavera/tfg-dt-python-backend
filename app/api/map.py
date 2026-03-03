@@ -12,6 +12,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.websocket.manager import connection_manager
+from app.api.websocket.messages import build_map_switched_message
 from app.core.constants import (
     DEFAULT_PAGE_LIMIT,
     OSM_BATCH_SIZE,
@@ -27,8 +29,9 @@ from app.core.schemas.network_schema import (
     NodeGeoJSONResponse,
     NodeListResponse,
 )
-from app.db.database import get_db_session
+from app.db.database import async_session_factory, get_db_session
 from app.models.road_network import EdgeModel, NodeModel
+from app.services.network_graph import RoadNetworkGraph
 from app.services.osm_loader import OSMLoader, OSMLoadStats
 
 router = APIRouter(prefix="/map", tags=[TAG_MAP])
@@ -328,3 +331,123 @@ async def import_osm_data(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Import failed: {str(e)}",
         )
+
+
+# ---------------------------------------------------------------------------
+# Map selection (available maps + switch)
+# ---------------------------------------------------------------------------
+
+
+class AvailableMapsResponse(BaseModel):
+    """Lista de mapas disponibles en el servidor."""
+
+    maps: list[str] = Field(..., description="Nombres de mapa disponibles (sin extensión)")
+    data_directory: str = Field(..., description="Directorio de datos del servidor")
+
+
+class SwitchRequest(BaseModel):
+    """Solicitud de cambio de mapa activo."""
+
+    map: str = Field(
+        ...,
+        description="Nombre del mapa a cargar (sin extensión .osm)",
+        examples=["talavera", "toledo"],
+    )
+
+
+class SwitchResponse(BaseModel):
+    """Resultado del cambio de mapa."""
+
+    status: str
+    map: str
+    nodes_imported: int
+    edges_imported: int
+    duration_seconds: float
+    graph_nodes: int
+    graph_edges: int
+
+
+@router.get("/available", response_model=AvailableMapsResponse)
+async def get_available_maps() -> AvailableMapsResponse:
+    """
+    Lista los ficheros .osm disponibles en el directorio de datos del servidor.
+
+    Devuelve los nombres sin extensión listos para usar en /api/map/switch.
+    """
+    data_dir = Path(OSM_DATA_DIRECTORY)
+    maps = sorted(p.stem for p in data_dir.glob("*.osm") if p.is_file())
+    return AvailableMapsResponse(maps=maps, data_directory=f"{OSM_DATA_DIRECTORY}/")
+
+
+@router.post(
+    "/switch",
+    response_model=SwitchResponse,
+    responses={
+        200: {"description": "Map switched successfully"},
+        404: {"description": "Map file not found"},
+        500: {"description": "Switch failed"},
+    },
+)
+async def switch_map(
+    request: SwitchRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> SwitchResponse:
+    """
+    Cambia el mapa activo de la simulación.
+
+    Detiene la simulación si está en marcha, borra los datos existentes,
+    importa el nuevo mapa y reconstruye el grafo en memoria.
+    Notifica a todos los clientes WebSocket conectados.
+
+    Args:
+        request: Nombre del mapa a cargar (sin extensión .osm)
+        session: Database session (injected)
+    """
+    from app.api.deps import _graph
+    from app.core.simulation_engine import simulation_engine
+    from app.core.simulation_engine import SimulationState
+
+    map_name = request.map.strip()
+    map_path = Path(OSM_DATA_DIRECTORY) / f"{map_name}.osm"
+
+    if not map_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Map file not found: {map_name}.osm",
+        )
+
+    # Stop simulation if running or paused
+    if simulation_engine.state in (SimulationState.RUNNING, SimulationState.PAUSED):
+        await simulation_engine.stop()
+
+    try:
+        loader = OSMLoader(session, batch_size=OSM_BATCH_SIZE)
+        import_stats = await loader.load_from_file(str(map_path), clear_existing=True)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Map import failed: {e}",
+        )
+
+    # Rebuild in-memory graph with new data
+    async with async_session_factory() as new_session:
+        graph_stats = await _graph.build_from_database(new_session)
+
+    # Notify WebSocket clients
+    await connection_manager.broadcast(
+        build_map_switched_message(
+            map_name=map_name,
+            nodes=graph_stats.node_count,
+            edges=graph_stats.edge_count,
+        )
+    )
+
+    return SwitchResponse(
+        status="switched",
+        map=map_name,
+        nodes_imported=import_stats.nodes_imported,
+        edges_imported=import_stats.edges_imported,
+        duration_seconds=round(import_stats.duration_seconds, 2),
+        graph_nodes=graph_stats.node_count,
+        graph_edges=graph_stats.edge_count,
+    )

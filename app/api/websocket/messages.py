@@ -19,6 +19,7 @@ MSG_TYPE_SIM_STATE = "sim_state"
 MSG_TYPE_VEHICLE_SPAWNED = "vehicle_spawned"
 MSG_TYPE_VEHICLE_FINISHED = "vehicle_finished"
 MSG_TYPE_VEHICLE_UPDATE = "vehicle_update"
+MSG_TYPE_MAP_SWITCHED = "map_switched"
 
 
 # =============================================================================
@@ -102,4 +103,18 @@ def build_vehicle_finished_message(vehicle_id: str) -> dict[str, Any]:
     return {
         "type": MSG_TYPE_VEHICLE_FINISHED,
         "vehicle_id": vehicle_id,
+    }
+
+
+def build_map_switched_message(
+    map_name: str,
+    nodes: int,
+    edges: int,
+) -> dict[str, Any]:
+    """Mensaje notificando que el mapa activo ha cambiado."""
+    return {
+        "type": MSG_TYPE_MAP_SWITCHED,
+        "map": map_name,
+        "nodes": nodes,
+        "edges": edges,
     }

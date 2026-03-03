@@ -36,5 +36,5 @@ COPY ./alembic.ini .
 # Exponer el puerto (se puede sobrescribir con variable de entorno)
 EXPOSE ${PORT:-8000}
 
-# Comando para ejecutar la aplicación
-CMD uvicorn app.main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8000}
+# Comando para ejecutar la aplicación (aplica migraciones primero)
+CMD alembic upgrade head && uvicorn app.main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8000}
