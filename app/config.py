@@ -1,6 +1,6 @@
 """
 Configuración de la aplicación usando Pydantic Settings.
-Las variables se cargan desde .env o variables de entorno.
+Las variables se cargan desde .env.
 """
 
 from pydantic import Field, field_validator
@@ -65,7 +65,7 @@ class Settings(BaseSettings):
         description="Segundos entre updates de simulación",
     )
     MAX_VEHICLES: int = Field(
-        default=100,
+        default=10000,
         ge=1,
         description="Número máximo de vehículos en simulación",
     )
@@ -135,7 +135,7 @@ class Settings(BaseSettings):
                 f"LOG_LEVEL debe ser uno de: {', '.join(allowed_levels)}"
             )
         return value_upper
-
+    # Configuración de Pydantic Settings
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

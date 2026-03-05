@@ -39,7 +39,7 @@ class RoadType(str, Enum):
     UNCLASSIFIED = "unclassified"
     LIVING_STREET = "living_street"
 
-    # Non-vehicle roads (may be excluded from vehicle simulation)
+    # Non-vehicle roads
     PEDESTRIAN = "pedestrian"
     CYCLEWAY = "cycleway"
 

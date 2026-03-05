@@ -111,7 +111,7 @@ async def lifespan(app: FastAPI):
                 f"Warning: MAP_FILE '{settings.MAP_FILE}' not found in '{OSM_DATA_DIRECTORY}/'"
             )
 
-    yield
+    yield # Aquí la aplicación está corriendo y puede atender peticiones
 
     # Shutdown
     await simulation_engine.shutdown()
