@@ -108,7 +108,7 @@ class SimulationConfig(BaseModel):
         description="Vehículos generados por minuto (0 = desactivado)",
     )
     max_vehicles: int = Field(
-        default=100,
+        default=10000,
         ge=1,
         le=10000,
         description="Número máximo de vehículos activos simultáneamente",

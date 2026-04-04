@@ -44,7 +44,7 @@ def compute_route(
     Returns:
         RouteInfo con la ruta calculada, o None si no existe camino.
     """
-    node_path = graph.get_shortest_path_safe(start_node_id, end_node_id)
+    node_path = graph.get_shortest_path_astar_safe(start_node_id, end_node_id)
     if node_path is None or len(node_path) < 2:
         return None
 

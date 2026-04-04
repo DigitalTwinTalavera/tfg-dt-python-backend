@@ -6,6 +6,7 @@ Provides fast pathfinding and connectivity queries for traffic simulation.
 """
 
 import json
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -32,6 +33,14 @@ from app.core.constants import (
     KMH_TO_MS,
     ROAD_TYPE_WEIGHT_FACTORS,
 )
+
+# Heurística A*: cota inferior admisible basada en distancia geográfica.
+# Velocidad máxima posible en la red (autovía ≈ 130 km/h) con el factor de
+# penalización mínimo (motorway = 0.6), que reduce el peso real.
+# weight = travel_time * road_factor  →  mínimo posible = dist/v_max * 0.6
+_ASTAR_MAX_SPEED_MS: float = 130.0 * KMH_TO_MS   # ≈ 36.1 m/s
+_ASTAR_MIN_ROAD_FACTOR: float = 0.6               # factor motorway
+_METERS_PER_DEGREE: float = 111_320.0             # aprox. metros por grado lat/lon
 
 
 @dataclass
@@ -249,9 +258,11 @@ class RoadNetworkGraph:
         weight: str = ATTR_WEIGHT,
     ) -> list[int]:
         """
-        Find the shortest path between two nodes.
+        Find the shortest path between two nodes using A*.
 
-        Uses Dijkstra's algorithm with edge weights based on travel time.
+        Uses A* with a geographic heuristic (straight-line travel-time lower
+        bound) instead of Dijkstra, which explores fewer nodes and scales
+        better as the network grows.
 
         Args:
             start: Starting node ID
@@ -265,7 +276,7 @@ class RoadNetworkGraph:
             nx.NetworkXNoPath: If no path exists between the nodes
             nx.NodeNotFound: If start or end node is not in the graph
         """
-        return nx.shortest_path(self._graph, start, end, weight=weight)
+        return self.get_shortest_path_astar(start, end)
 
     def get_shortest_path_safe(
         self,
@@ -287,6 +298,128 @@ class RoadNetworkGraph:
         """
         try:
             return self.get_shortest_path(start, end, weight=weight)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return None
+
+    def get_shortest_path_astar(
+        self,
+        start: int,
+        end: int,
+    ) -> list[int]:
+        """
+        Find the shortest path using A* with a geographic heuristic.
+
+        The heuristic is the straight-line travel-time lower bound:
+            h(u) = euclidean_distance(u, end) * MIN_ROAD_FACTOR / MAX_SPEED_MS
+
+        This is admissible because:
+        - Road distance ≥ straight-line distance.
+        - Actual edge weight = travel_time * road_factor ≥ dist * MIN_FACTOR / MAX_SPEED.
+
+        Args:
+            start: Starting node ID
+            end:   Ending node ID
+
+        Returns:
+            List of node IDs forming the shortest path
+
+        Raises:
+            nx.NetworkXNoPath: If no path exists
+            nx.NodeNotFound:   If start or end is not in the graph
+        """
+        end_attrs = self._graph.nodes[end]
+        end_lat: float = end_attrs.get(ATTR_LATITUDE, 0.0)
+        end_lon: float = end_attrs.get(ATTR_LONGITUDE, 0.0)
+
+        def _heuristic(u: int, _v: int) -> float:
+            u_attrs = self._graph.nodes[u]
+            dlat = u_attrs.get(ATTR_LATITUDE, 0.0) - end_lat
+            dlon = u_attrs.get(ATTR_LONGITUDE, 0.0) - end_lon
+            dist_m = math.sqrt(dlat * dlat + dlon * dlon) * _METERS_PER_DEGREE
+            return dist_m * _ASTAR_MIN_ROAD_FACTOR / _ASTAR_MAX_SPEED_MS
+
+        return nx.astar_path(
+            self._graph, start, end, heuristic=_heuristic, weight=ATTR_WEIGHT
+        )
+
+    def get_shortest_path_astar_safe(
+        self,
+        start: int,
+        end: int,
+    ) -> Optional[list[int]]:
+        """
+        A* shortest path (returns None if no path exists instead of raising).
+
+        Args:
+            start: Starting node ID
+            end:   Ending node ID
+
+        Returns:
+            List of node IDs or None if no path exists
+        """
+        try:
+            return self.get_shortest_path_astar(start, end)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return None
+
+    def get_astar_path(
+        self,
+        start: int,
+        end: int,
+        *,
+        weight: str = ATTR_WEIGHT,
+    ) -> list[int]:
+        """
+        Find the shortest path using A* with a geographic heuristic.
+
+        The heuristic estimates travel time from the straight-line distance
+        between nodes using their GPS coordinates. It is admissible because
+        actual travel time >= euclidean_distance / max_speed.
+
+        Args:
+            start: Starting node ID
+            end: Ending node ID
+            weight: Edge attribute to use as weight (default: travel time)
+
+        Returns:
+            List of node IDs forming the shortest path
+
+        Raises:
+            nx.NetworkXNoPath: If no path exists between the nodes
+            nx.NodeNotFound: If start or end node is not in the graph
+        """
+        def _heuristic(u: int, v: int) -> float:
+            u_d = self._graph.nodes[u]
+            v_d = self._graph.nodes[v]
+            # Approximate degrees → metres at ~40°N (Talavera de la Reina)
+            dlon = (u_d.get(ATTR_LONGITUDE, 0) - v_d.get(ATTR_LONGITUDE, 0)) * 82000
+            dlat = (u_d.get(ATTR_LATITUDE, 0)  - v_d.get(ATTR_LATITUDE, 0))  * 111320
+            dist_m = (dlon ** 2 + dlat ** 2) ** 0.5
+            # 100 km/h = 27.78 m/s as upper bound → admissible heuristic
+            return dist_m / 27.78
+
+        return nx.astar_path(self._graph, start, end, heuristic=_heuristic, weight=weight)
+
+    def get_astar_path_safe(
+        self,
+        start: int,
+        end: int,
+        *,
+        weight: str = ATTR_WEIGHT,
+    ) -> Optional[list[int]]:
+        """
+        Find the shortest path using A* (returns None if not found).
+
+        Args:
+            start: Starting node ID
+            end: Ending node ID
+            weight: Edge attribute to use as weight
+
+        Returns:
+            List of node IDs or None if no path exists
+        """
+        try:
+            return self.get_astar_path(start, end, weight=weight)
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             return None
 

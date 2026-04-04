@@ -165,4 +165,5 @@ if __name__ == "__main__":
         port=settings.PORT,
         reload=settings.DEBUG,
         log_level=settings.LOG_LEVEL.lower(),
+        ws_max_size=4 * 1024 * 1024,  # 4 MB — soporta tick messages con miles de vehículos
     )

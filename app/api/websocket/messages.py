@@ -17,9 +17,11 @@ from typing import Any
 MSG_TYPE_TICK = "tick"
 MSG_TYPE_SIM_STATE = "sim_state"
 MSG_TYPE_VEHICLE_SPAWNED = "vehicle_spawned"
+MSG_TYPE_VEHICLES_BATCH_SPAWNED = "vehicles_batch_spawned"
 MSG_TYPE_VEHICLE_FINISHED = "vehicle_finished"
 MSG_TYPE_VEHICLE_UPDATE = "vehicle_update"
 MSG_TYPE_MAP_SWITCHED = "map_switched"
+MSG_TYPE_VEHICLES_BATCH_SPAWNED = "vehicles_batch_spawned"
 
 
 # =============================================================================
@@ -103,6 +105,59 @@ def build_vehicle_finished_message(vehicle_id: str) -> dict[str, Any]:
     return {
         "type": MSG_TYPE_VEHICLE_FINISHED,
         "vehicle_id": vehicle_id,
+    }
+
+
+def build_vehicles_batch_spawned_message(vehicles: list[Any]) -> dict[str, Any]:
+    """
+    Mensaje de batch de vehículos recién generados.
+
+    Enviado por el broadcaster tras completar un spawn masivo en background.
+    El cliente lo usa para registrar y renderizar todos los vehículos de golpe,
+    sin esperar a los mensajes de tick individuales.
+
+    Args:
+        vehicles: Lista de SimVehicle con los vehículos creados.
+    """
+    return {
+        "type": MSG_TYPE_VEHICLES_BATCH_SPAWNED,
+        "count": len(vehicles),
+        "vehicles": [
+            {
+                "id": v.id,
+                "lon": round(v.longitude, 7),
+                "lat": round(v.latitude, 7),
+                "status": v.status.value,
+                "route_edges": v.route.edge_ids,
+            }
+            for v in vehicles
+        ],
+    }
+
+
+def build_vehicles_batch_spawned_message(vehicles: list) -> dict[str, Any]:
+    """
+    Mensaje de lote de vehículos recién generados, con posición inicial.
+
+    Enviado inmediatamente tras el spawn para que el cliente pueda
+    renderizar los vehículos sin esperar al próximo tick.
+
+    Args:
+        vehicles: Lista de SimVehicle recién creados.
+    """
+    return {
+        "type": MSG_TYPE_VEHICLES_BATCH_SPAWNED,
+        "vehicles": [
+            {
+                "id": v.id,
+                "lon": round(v.longitude, 7),
+                "lat": round(v.latitude, 7),
+                "h": round(v.heading, 1),
+                "status": v.status.value,
+            }
+            for v in vehicles
+        ],
+        "count": len(vehicles),
     }
 
 

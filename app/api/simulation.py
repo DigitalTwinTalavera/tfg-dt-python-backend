@@ -2,6 +2,7 @@
 Endpoints de control de la simulación y gestión de vehículos.
 """
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -25,7 +26,7 @@ router = APIRouter(prefix="/simulation")
 
 
 class SpawnRequest(BaseModel):
-    count: int = Field(default=1, ge=1, le=100, description="Número de vehículos a generar")
+    count: int = Field(default=1, ge=1, le=10000, description="Número de vehículos a generar")
 
 
 # =========================================================================
@@ -132,16 +133,26 @@ async def update_config(
 async def spawn_vehicles(
     body: SpawnRequest,
     spawner: VehicleSpawner = Depends(get_vehicle_spawner),
+    broadcaster: SimulationBroadcaster = Depends(get_broadcaster),
 ) -> dict:
-    """Genera vehículos con rutas aleatorias."""
+    """
+    Inicia el spawn de vehículos en background y devuelve inmediatamente.
+
+    Las rutas se calculan con A* + caché en un hilo de fondo. Al terminar,
+    el broadcaster envía un mensaje WS `vehicles_batch_spawned` con todos
+    los vehículos creados para que el cliente los renderice de golpe.
+    """
     try:
-        vehicles = spawner.spawn(count=body.count)
+        requested = await spawner.spawn_background(
+            count=body.count,
+            on_complete=broadcaster.broadcast_vehicles_batch_spawned,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     return {
-        "spawned": len(vehicles),
-        "vehicles": [v.to_dict() for v in vehicles],
+        "status": "spawning",
+        "requested": requested,
     }
 
 

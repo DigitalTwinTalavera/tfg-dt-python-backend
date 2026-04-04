@@ -37,4 +37,4 @@ COPY ./alembic.ini .
 EXPOSE ${PORT:-8000}
 
 # Comando para ejecutar la aplicación (aplica migraciones primero)
-CMD alembic upgrade head && uvicorn app.main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8000}
+CMD alembic upgrade head && uvicorn app.main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8000} --ws-max-size 4194304

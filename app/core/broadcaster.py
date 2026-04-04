@@ -19,6 +19,7 @@ from app.api.websocket.messages import (
     build_vehicle_finished_message,
     build_vehicle_spawned_message,
     build_vehicle_state,
+    build_vehicles_batch_spawned_message,
 )
 from app.services.vehicle_spawner import SimVehicle, VehicleSpawner
 
@@ -60,12 +61,22 @@ class SimulationBroadcaster:
         self._broadcast_count = 0
         self._total_broadcast_time_ms = 0.0
 
+    # Número máximo de vehículos por mensaje tick.
+    # Cada vehículo ocupa ~130 bytes de JSON; con 500 vehículos el mensaje
+    # ronda los 65 KB, por debajo del límite de 4 MB configurado en Godot.
+    # Dividir en chunks también reduce la latencia de renderizado: el cliente
+    # puede procesar el primer chunk antes de que llegue el siguiente.
+    _TICK_CHUNK_SIZE: int = 500
+
     async def broadcast_tick(self, tick: int, sim_time: float) -> None:
         """
         Emite el estado de todos los vehículos activos a los clientes.
 
         Solo envía vehículos cuyos campos hayan cambiado desde el último tick
         (delta update). Si no hay clientes conectados, no hace nada.
+
+        Los vehículos se envían en chunks de _TICK_CHUNK_SIZE para evitar
+        mensajes WebSocket demasiado grandes (código 1009).
 
         Args:
             tick: Número de tick actual.
@@ -80,12 +91,18 @@ class SimulationBroadcaster:
         vehicle_states = self._build_delta_states(vehicles)
 
         if vehicle_states or tick == 0:
-            message = build_tick_message(
-                tick=tick,
-                sim_time=sim_time,
-                vehicles=vehicle_states,
-            )
-            await self._manager.broadcast(message)
+            chunk_size = self._TICK_CHUNK_SIZE
+            if len(vehicle_states) <= chunk_size:
+                await self._manager.broadcast(
+                    build_tick_message(tick=tick, sim_time=sim_time, vehicles=vehicle_states)
+                )
+            else:
+                # Enviar en múltiples mensajes para no superar el límite de tamaño
+                for i in range(0, len(vehicle_states), chunk_size):
+                    chunk = vehicle_states[i : i + chunk_size]
+                    await self._manager.broadcast(
+                        build_tick_message(tick=tick, sim_time=sim_time, vehicles=chunk)
+                    )
 
         elapsed_ms = (time.monotonic() - t0) * 1000.0
         self._broadcast_count += 1
@@ -143,6 +160,18 @@ class SimulationBroadcaster:
         message = build_sim_state_message(state)
         await self._manager.broadcast(message)
 
+    async def broadcast_vehicles_batch_spawned(self, vehicles: list[SimVehicle]) -> None:
+        """
+        Emite un lote de vehículos recién generados con su posición inicial.
+
+        Enviado inmediatamente tras el spawn para que el cliente renderice
+        los vehículos sin esperar al próximo tick de simulación.
+        """
+        if self._manager.connection_count == 0 or not vehicles:
+            return
+        message = build_vehicles_batch_spawned_message(vehicles)
+        await self._manager.broadcast(message)
+
     async def broadcast_vehicle_spawned(self, vehicle: SimVehicle) -> None:
         """Emite notificación de vehículo generado."""
         if self._manager.connection_count == 0:
@@ -161,3 +190,21 @@ class SimulationBroadcaster:
             return
         message = build_vehicle_finished_message(vehicle_id)
         await self._manager.broadcast(message)
+
+    async def broadcast_vehicles_batch_spawned(self, vehicles: list[SimVehicle]) -> None:
+        """
+        Emite un único mensaje con todos los vehículos creados en un spawn masivo.
+
+        El cliente (Godot) lo usa para registrar y renderizar el batch completo
+        de golpe, sin esperar a los mensajes de tick individuales. Esto elimina
+        la latencia de hasta 100 ms que existía cuando los vehículos se
+        descubrían uno a uno a través del broadcaster de ticks.
+        """
+        if self._manager.connection_count == 0 or not vehicles:
+            return
+        message = build_vehicles_batch_spawned_message(vehicles)
+        await self._manager.broadcast(message)
+        logger.debug(
+            "Batch WS enviado: %d vehículos (vehicles_batch_spawned)",
+            len(vehicles),
+        )
