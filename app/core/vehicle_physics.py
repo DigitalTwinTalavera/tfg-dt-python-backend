@@ -17,8 +17,12 @@ Fórmula de heading (bearing de brújula):
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import logging
 import math
+import multiprocessing
+import os
 
 from app.core.constants import (
     ATTR_LATITUDE,
@@ -37,6 +41,12 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SPEED_KMH: float = 50.0   # Fallback when edge has no speed data
 _MIN_EDGE_LENGTH: float = 0.1      # Minimum edge length (metres) to avoid division by zero
 _EARTH_RADIUS_M: float = 6_371_000.0  # Mean Earth radius in metres
+
+# Cache de longitudes de segmentos por arista (start_node, end_node).
+# La geometría de las aristas no cambia durante la simulación, por lo que
+# calcular los segmentos haversine una sola vez y reutilizarlos elimina
+# ~250 000 llamadas trigonométricas/seg con 5000 vehículos a 10 Hz.
+_SEG_CACHE: dict[tuple[int, int], tuple[list[float], float]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -84,14 +94,19 @@ def _waypoint_segments(
 def _position_along_waypoints(
     waypoints: list[tuple[float, float]],
     progress: float,
+    _cache_key: tuple[int, int] | None = None,
 ) -> tuple[float, float, float]:
     """
     Compute the interpolated (lon, lat, heading) at fractional progress [0, 1]
     along a list of waypoints.
 
     Args:
-        waypoints: List of (lon, lat) pairs (at least 2).
-        progress:  Value in [0, 1] representing position along the route.
+        waypoints:   List of (lon, lat) pairs (at least 2).
+        progress:    Value in [0, 1] representing position along the route.
+        _cache_key:  Optional (start_node, end_node) key for the segment-length
+                     cache.  When provided, haversine distances are computed only
+                     on the first call for that edge and reused on all subsequent
+                     ticks (edge geometry is immutable).
 
     Returns:
         (longitude, latitude, heading_degrees)
@@ -100,7 +115,12 @@ def _position_along_waypoints(
         lon, lat = waypoints[0] if waypoints else (0.0, 0.0)
         return lon, lat, 0.0
 
-    seg_lengths, total_length = _waypoint_segments(waypoints)
+    if _cache_key is not None:
+        if _cache_key not in _SEG_CACHE:
+            _SEG_CACHE[_cache_key] = _waypoint_segments(waypoints)
+        seg_lengths, total_length = _SEG_CACHE[_cache_key]
+    else:
+        seg_lengths, total_length = _waypoint_segments(waypoints)
 
     if total_length < 1e-6:
         # Degenerate geometry — all waypoints at same spot
@@ -262,10 +282,200 @@ def _advance_vehicle(
     end_attrs   = graph.get_node_attributes(end_node)
 
     waypoints = _get_waypoints(edge_attrs, start_attrs, end_attrs)
-    lon, lat, heading = _position_along_waypoints(waypoints, vehicle.progress_on_edge)
+    lon, lat, heading = _position_along_waypoints(
+        waypoints, vehicle.progress_on_edge, _cache_key=(start_node, end_node)
+    )
 
     vehicle.longitude = lon
     vehicle.latitude  = lat
     vehicle.heading   = heading
 
     return False
+
+
+# ---------------------------------------------------------------------------
+# Multi-core parallel physics (ProcessPoolExecutor)
+# ---------------------------------------------------------------------------
+
+# Worker-process state — populated once per worker via initializer.
+_worker_graph: "RoadNetworkGraph | None" = None  # type: ignore[name-defined]
+
+# Module-level executor — created on first use, reused across ticks.
+_EXECUTOR: concurrent.futures.ProcessPoolExecutor | None = None
+_EXECUTOR_GRAPH_ID: int = 0  # id() of the graph used to create the executor
+
+# Minimum vehicle count to justify IPC overhead.
+_PARALLEL_THRESHOLD: int = 500
+
+
+def _worker_init(graph: "RoadNetworkGraph") -> None:  # type: ignore[name-defined]
+    """Initializer for each worker process: pre-loads the road graph."""
+    global _worker_graph
+    _worker_graph = graph
+
+
+def _ensure_executor(
+    graph: "RoadNetworkGraph",  # type: ignore[name-defined]
+) -> concurrent.futures.ProcessPoolExecutor:
+    """Return (creating if needed) a ProcessPoolExecutor whose workers hold *graph*."""
+    global _EXECUTOR, _EXECUTOR_GRAPH_ID
+    gid = id(graph)
+    if _EXECUTOR is None or _EXECUTOR_GRAPH_ID != gid:
+        if _EXECUTOR is not None:
+            _EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        # spawn evita conflictos con el event loop de asyncio que usa fork en Linux.
+        # Los workers importan el módulo de nuevo, lo que es seguro porque
+        # _process_chunk hace sus propios imports internos.
+        _EXECUTOR = concurrent.futures.ProcessPoolExecutor(
+            max_workers=os.cpu_count(),
+            initializer=_worker_init,
+            initargs=(graph,),
+            mp_context=multiprocessing.get_context("spawn"),
+        )
+        _EXECUTOR_GRAPH_ID = gid
+    return _EXECUTOR
+
+
+def _vehicle_to_dict(v: "SimVehicle") -> dict:  # type: ignore[name-defined]
+    """Serialize the mutable fields of a SimVehicle for inter-process transfer."""
+    return {
+        "id": v.id,
+        "status": v.status.value,
+        "node_path": v.route.node_path,
+        "edge_ids": v.route.edge_ids,
+        "current_edge_index": v.current_edge_index,
+        "progress_on_edge": v.progress_on_edge,
+        "velocity": v.velocity,
+        "longitude": v.longitude,
+        "latitude": v.latitude,
+        "heading": v.heading,
+        "acceleration": v.acceleration,
+    }
+
+
+def _process_chunk(
+    vehicle_dicts: list[dict], dt: float
+) -> tuple[list[dict], list[str]]:
+    """
+    Worker-process entry point.
+
+    Reconstructs lightweight SimVehicle objects from dicts, advances each one,
+    and returns the updated mutable fields plus the list of finished vehicle IDs.
+    """
+    from app.core.route import RouteInfo
+    from app.models.enums import VehicleStatus
+    from app.services.vehicle_spawner import SimVehicle
+
+    finished_ids: list[str] = []
+    updates: list[dict] = []
+
+    for vd in vehicle_dicts:
+        node_path = vd["node_path"]
+        route = RouteInfo(
+            start_node_id=node_path[0] if node_path else 0,
+            end_node_id=node_path[-1] if node_path else 0,
+            node_path=node_path,
+            edge_ids=vd["edge_ids"],
+            length_m=0.0,
+        )
+        v = SimVehicle(
+            id=vd["id"],
+            start_node_id=0,
+            end_node_id=0,
+            route=route,
+            status=VehicleStatus(vd["status"]),
+            current_edge_index=vd["current_edge_index"],
+            longitude=vd["longitude"],
+            latitude=vd["latitude"],
+            velocity=vd["velocity"],
+            acceleration=vd["acceleration"],
+            heading=vd["heading"],
+            progress_on_edge=vd["progress_on_edge"],
+        )
+        finished = _advance_vehicle(v, _worker_graph, dt)  # type: ignore[arg-type]
+        if finished:
+            finished_ids.append(v.id)
+        updates.append({
+            "id": v.id,
+            "status": v.status.value,
+            "current_edge_index": v.current_edge_index,
+            "progress_on_edge": v.progress_on_edge,
+            "velocity": v.velocity,
+            "longitude": v.longitude,
+            "latitude": v.latitude,
+            "heading": v.heading,
+        })
+
+    return updates, finished_ids
+
+
+async def update_vehicles_parallel(
+    vehicles: "dict[str, SimVehicle]",  # type: ignore[name-defined]
+    graph: "RoadNetworkGraph",          # type: ignore[name-defined]
+    dt: float,
+) -> list[str]:
+    """
+    Avanza todos los vehículos usando todos los cores disponibles.
+
+    - Con < _PARALLEL_THRESHOLD vehículos: corre update_vehicles en asyncio.to_thread
+      para liberar el event loop sin incurrir en el overhead de IPC.
+    - Con ≥ _PARALLEL_THRESHOLD vehículos: divide la lista en chunks (uno por core),
+      los procesa en paralelo en un ProcessPoolExecutor y reintegra los resultados.
+    - Si el ProcessPoolExecutor falla (error de pickle, imports, etc.) cae
+      automáticamente a asyncio.to_thread para no romper la simulación.
+
+    Returns:
+        Lista de vehicle_ids que terminaron su ruta en este tick.
+    """
+    from app.models.enums import VehicleStatus
+
+    n = len(vehicles)
+
+    if n < _PARALLEL_THRESHOLD:
+        return await asyncio.to_thread(update_vehicles, vehicles, graph, dt)
+
+    try:
+        executor = _ensure_executor(graph)
+        vehicle_list = list(vehicles.values())
+        n_workers = min(os.cpu_count() or 1, n)
+        chunk_size = math.ceil(n / n_workers)
+        chunks = [
+            [_vehicle_to_dict(v) for v in vehicle_list[i : i + chunk_size]]
+            for i in range(0, n, chunk_size)
+        ]
+
+        loop = asyncio.get_running_loop()
+        futures = [
+            loop.run_in_executor(executor, _process_chunk, chunk, dt)
+            for chunk in chunks
+        ]
+        results = await asyncio.gather(*futures)
+
+    except Exception:
+        # Fallback: el ProcessPoolExecutor puede fallar al arrancar (pickle del grafo,
+        # imports de app.* en workers spawn, etc.). En ese caso degradamos
+        # gracefully al path de un solo hilo para no romper la simulación.
+        logger.exception(
+            "ProcessPoolExecutor falló (n=%d vehículos); degradando a asyncio.to_thread",
+            n,
+        )
+        global _EXECUTOR
+        _EXECUTOR = None  # Forzar recreación en el próximo tick
+        return await asyncio.to_thread(update_vehicles, vehicles, graph, dt)
+
+    finished_ids: list[str] = []
+    for updates, chunk_finished in results:
+        for upd in updates:
+            vid = upd["id"]
+            if vid in vehicles:
+                v = vehicles[vid]
+                v.status = VehicleStatus(upd["status"])
+                v.current_edge_index = upd["current_edge_index"]
+                v.progress_on_edge = upd["progress_on_edge"]
+                v.velocity = upd["velocity"]
+                v.longitude = upd["longitude"]
+                v.latitude = upd["latitude"]
+                v.heading = upd["heading"]
+        finished_ids.extend(chunk_finished)
+
+    return finished_ids

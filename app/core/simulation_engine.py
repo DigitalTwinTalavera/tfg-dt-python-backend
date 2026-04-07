@@ -268,10 +268,20 @@ class SimulationEngine:
                 except ValueError:
                     pass  # sin nodos de entrada/salida -> ignorar silenciosamente
 
-        # 2. Física de vehículos
+        # 2 & 3. Física de vehículos.
+        #   - Con < 500 vehículos: asyncio.to_thread (libera el event loop).
+        #   - Con ≥ 500 vehículos: ProcessPoolExecutor con 20 workers para
+        #     aprovechar todos los cores del sistema.
+        #   update_vehicles_parallel tiene fallback interno a to_thread si el
+        #   ProcessPool falla, así que no rompe la simulación.
         if self._spawner is not None and self._spawner.graph.node_count > 0:
-            from app.core.vehicle_physics import update_vehicles
-            finished_ids = update_vehicles(self._spawner.vehicles, self._spawner.graph, dt)
+            from app.core.vehicle_physics import update_vehicles_parallel
+            try:
+                finished_ids = await update_vehicles_parallel(
+                    self._spawner.vehicles, self._spawner.graph, dt
+                )
+            except Exception:
+                logger.exception("Error inesperado en update_vehicles_parallel; tick ignorado")
 
             # 3. Broadcast vehicle_finished + eliminar vehículos completados
             for vid in finished_ids:
