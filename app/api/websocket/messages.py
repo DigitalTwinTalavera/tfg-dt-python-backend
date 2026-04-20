@@ -62,6 +62,8 @@ def build_vehicle_state(
     status: str,
     current_edge_index: int,
     progress_on_edge: float,
+    lane: int = 0,
+    vtype: str = "car",
 ) -> dict[str, Any]:
     """Estado completo de un vehículo para incluir en un mensaje tick."""
     return {
@@ -74,6 +76,8 @@ def build_vehicle_state(
         "status": status,
         "edge_idx": current_edge_index,
         "progress": round(progress_on_edge, 4),
+        "lane": lane,
+        "vtype": vtype,
     }
 
 
@@ -90,6 +94,8 @@ def build_vehicle_spawned_message(
     start_node_id: int,
     end_node_id: int,
     route_edges: list[int],
+    lane: int = 0,
+    vtype: str = "car",
 ) -> dict[str, Any]:
     """Mensaje de vehículo recién generado."""
     return {
@@ -98,6 +104,8 @@ def build_vehicle_spawned_message(
         "start_node_id": start_node_id,
         "end_node_id": end_node_id,
         "route_edges": route_edges,
+        "lane": lane,
+        "vtype": vtype,
     }
 
 
@@ -131,6 +139,8 @@ def build_vehicles_batch_spawned_message(vehicles: list[Any]) -> dict[str, Any]:
                 "h": round(v.heading, 1),
                 "status": v.status.value,
                 "route_edges": v.route.edge_ids,
+                "lane": getattr(v, "lane", 0),
+                "vtype": v.vtype.value if hasattr(v, "vtype") else "car",
             }
             for v in vehicles
         ],

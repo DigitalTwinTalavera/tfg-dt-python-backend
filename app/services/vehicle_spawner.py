@@ -1,9 +1,9 @@
 """
-Spawner de vehículos y gestor de ciclo de vida.
+Spawner de vehículos.
 
-Genera vehículos en nodos de entrada con rutas calculadas por NetworkX,
-gestiona las transiciones de estado (IDLE → MOVING → FINISHED → eliminado)
-y aplica el límite MAX_VEHICLES.
+Genera vehículos en nodos de entrada con rutas calculadas por NetworkX
+y aplica el límite MAX_VEHICLES. Las transiciones de estado
+(IDLE → MOVING → FINISHED) se manejan en el motor de simulación.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import networkx as nx
 
 from app.config import settings
 from app.core.constants import (
+    ATTR_LANES,
     ATTR_LATITUDE,
     ATTR_LENGTH,
     ATTR_LONGITUDE,
@@ -33,8 +34,13 @@ from app.core.constants import (
     SPAWN_INITIAL_VELOCITY_MIN,
     SPAWN_SPEED_VARIANCE_MAX,
     SPAWN_SPEED_VARIANCE_MIN,
-    VEHICLE_LENGTH_M,
     YELLOW_BRAKE_PROBABILITY,
+)
+from app.core.physics.vehicle_types import (
+    PROFILES,
+    VehicleType,
+    VehicleTypeProfile,
+    get_profile,
 )
 from app.core.route import RouteInfo, compute_route
 from app.models.enums import NodeType, VehicleStatus
@@ -63,6 +69,19 @@ class SimVehicle:
     yellow_runs_light: bool = False   # set at spawn: 15% True → runs yellow lights
     collision_timer: float = 0.0      # countdown to auto-remove after collision (s)
     proximity_timer: float = 0.0      # tiempo sostenido con gap < umbral (s)
+    vtype: VehicleType = VehicleType.CAR  # tipo de vehículo (car, moto, truck)
+    lane: int = 0                          # carril actual (0 = derecha)
+    length_m: float = 4.5                  # longitud bumper-to-bumper (m)
+    # Heading (grados) de la última tangente de la arista que se acaba de
+    # terminar. Se usa para mezclar con la tangente inicial de la arista
+    # entrante durante los primeros EDGE_HEADING_BLEND_DIST_M metros y evitar
+    # un snap visible al cambiar de tramo. < 0 → sin mezcla activa.
+    prev_edge_end_heading: float = -1.0
+    # Cooldown de evaluación MOBIL (ticks). Evita recalcular cambios de carril
+    # en cada tick: sólo cuando el contador llega a 0 se re-evalúa, y al hacerlo
+    # se resetea a MOBIL_EVAL_INTERVAL_TICKS. Inicializado vía hash(id) para
+    # repartir la carga computacional entre ticks.
+    mobil_cooldown_ticks: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -72,6 +91,8 @@ class SimVehicle:
             "route_edges": self.route.edge_ids,
             "route_length_m": round(self.route.length_m, 1),
             "status": self.status.value,
+            "vtype": self.vtype.value,
+            "lane": self.lane,
         }
 
 
@@ -335,6 +356,16 @@ class VehicleSpawner:
                 continue
 
             node_attrs = self._graph.get_node_attributes(start)
+            # Tipo de vehículo con probabilidad según spawn_weight del perfil
+            profile = _pick_vehicle_profile()
+            # Carril inicial: 0 (derecha) — el MOBIL decidirá si cambia
+            first_node = route.node_path[0]
+            second_node = route.node_path[1]
+            first_edge_attrs = self._graph.get_edge_attributes(first_node, second_node)
+            n_lanes = max(int(first_edge_attrs.get(ATTR_LANES, 1)), 1)
+            # Arrancar en el carril derecho; MOBIL reubicará según convenga
+            initial_lane = random.randint(0, n_lanes - 1)
+
             vehicle = SimVehicle(
                 id=self._next_id(),
                 start_node_id=start,
@@ -342,13 +373,19 @@ class VehicleSpawner:
                 route=route,
                 longitude=node_attrs.get(ATTR_LONGITUDE, 0.0),
                 latitude=node_attrs.get(ATTR_LATITUDE, 0.0),
+                vtype=profile.vtype,
+                lane=initial_lane,
+                length_m=profile.length_m,
             )
-            # Velocidad deseada individual: varianza según constante del primer tramo
+            # Velocidad deseada individual: perfil · varianza, acotada al límite del
+            # primer tramo para que los camiones no intenten ir a 130 km/h en ciudad.
             first_edge_kmh = _get_first_edge_speed_kmh(route, self._graph)
-            desired_kmh = first_edge_kmh * random.uniform(
+            edge_v_limit = first_edge_kmh * KMH_TO_MS
+            profile_target = min(profile.idm.v0, profile.max_speed_ms, edge_v_limit)
+            desired_ms = profile_target * random.uniform(
                 SPAWN_SPEED_VARIANCE_MIN, SPAWN_SPEED_VARIANCE_MAX
             )
-            vehicle.desired_speed_ms = desired_kmh * KMH_TO_MS
+            vehicle.desired_speed_ms = desired_ms
             # Velocidad y posición inicial distribuidas para evitar aglomeración
             vehicle.velocity = vehicle.desired_speed_ms * random.uniform(
                 SPAWN_INITIAL_VELOCITY_MIN, SPAWN_INITIAL_VELOCITY_MAX
@@ -358,17 +395,20 @@ class VehicleSpawner:
             )
             # Comportamiento en semáforo amarillo: 40% de vehículos lo se saltan
             vehicle.yellow_runs_light = random.random() > YELLOW_BRAKE_PROBABILITY
+            # Escalonar la primera evaluación MOBIL para repartir carga entre ticks:
+            # cada vehículo arranca con un cooldown aleatorio ∈ [0, interval-1].
+            from app.core.constants import MOBIL_EVAL_INTERVAL_TICKS
+            vehicle.mobil_cooldown_ticks = random.randint(
+                0, MOBIL_EVAL_INTERVAL_TICKS - 1
+            )
 
             # ── Spawn collision avoidance ──────────────────────────────────────
             # Verificar que la posición de spawn no choca con vehículos existentes
-            # en la misma arista (ya spawneados en este batch + vehículos activos).
-            first_node = route.node_path[0]
-            second_node = route.node_path[1]
-            first_edge_attrs = self._graph.get_edge_attributes(first_node, second_node)
+            # en la misma arista y mismo carril.
             first_edge_len = max(
                 float(first_edge_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M
             )
-            min_sep_progress = (VEHICLE_LENGTH_M * 2.0) / first_edge_len
+            min_sep_progress = (vehicle.length_m * 2.0) / first_edge_len
             conflict = False
             all_candidates = list(self._vehicles.values()) + spawned
             for existing in all_candidates:
@@ -380,6 +420,7 @@ class VehicleSpawner:
                     eei < len(enp) - 1
                     and enp[eei] == first_node
                     and enp[eei + 1] == second_node
+                    and getattr(existing, "lane", 0) == vehicle.lane
                     and abs(existing.progress_on_edge - vehicle.progress_on_edge) < min_sep_progress
                 ):
                     conflict = True
@@ -476,46 +517,6 @@ class VehicleSpawner:
         return True
 
 
-class VehicleLifecycleManager:
-    """
-    Gestiona las transiciones de estado de los vehículos:
-      IDLE → MOVING  (primer tick)
-      MOVING → FINISHED  (ruta completada)
-      FINISHED → eliminado  (cleanup)
-    """
-
-    def __init__(self, spawner: VehicleSpawner) -> None:
-        self._spawner = spawner
-
-    def activate_idle_vehicles(self) -> int:
-        """Cambia todos los vehículos IDLE a MOVING. Devuelve el nº cambiados."""
-        count = 0
-        for v in self._spawner.vehicles.values():
-            if v.status == VehicleStatus.IDLE:
-                v.status = VehicleStatus.MOVING
-                count += 1
-        return count
-
-    def mark_finished(self, vehicle_id: str) -> bool:
-        """Marca un vehículo como FINISHED."""
-        v = self._spawner.get_vehicle(vehicle_id)
-        if v is None:
-            return False
-        v.status = VehicleStatus.FINISHED
-        return True
-
-    def cleanup_finished(self) -> int:
-        """Elimina todos los vehículos FINISHED. Devuelve el nº eliminados."""
-        finished_ids = [
-            vid
-            for vid, v in self._spawner.vehicles.items()
-            if v.status == VehicleStatus.FINISHED
-        ]
-        for vid in finished_ids:
-            self._spawner.remove_vehicle(vid)
-        return len(finished_ids)
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -532,3 +533,13 @@ def _get_first_edge_speed_kmh(route: RouteInfo, graph: "RoadNetworkGraph") -> fl
     attrs = graph.get_edge_attributes(route.node_path[0], route.node_path[1])
     speed = float(attrs.get(ATTR_MAX_SPEED, 50.0))
     return speed if speed > 0 else 50.0
+
+
+# Pre-compute weight list to avoid re-summing on each spawn (called thousands of times).
+_PROFILE_LIST: list[VehicleTypeProfile] = list(PROFILES.values())
+_PROFILE_WEIGHTS: list[float] = [p.spawn_weight for p in _PROFILE_LIST]
+
+
+def _pick_vehicle_profile() -> VehicleTypeProfile:
+    """Elige un perfil de vehículo con distribución ponderada por spawn_weight."""
+    return random.choices(_PROFILE_LIST, weights=_PROFILE_WEIGHTS, k=1)[0]

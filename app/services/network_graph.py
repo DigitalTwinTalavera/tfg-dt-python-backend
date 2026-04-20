@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import (
     ATTR_EDGE_ID,
+    ATTR_LANES,
     ATTR_LATITUDE,
     ATTR_LENGTH,
     ATTR_LONGITUDE,
@@ -236,6 +237,7 @@ class RoadNetworkGraph:
             EdgeModel.max_speed,
             EdgeModel.road_type,
             EdgeModel.one_way,
+            EdgeModel.lanes,
             ST_AsGeoJSON(EdgeModel.geometry).label("geometry_json"),
         )
 
@@ -306,6 +308,7 @@ class RoadNetworkGraph:
                 ATTR_ONE_WAY: row.one_way,
                 ATTR_WAYPOINTS: waypoints,
                 ATTR_MID_TLS: mid_tls_fwd,
+                ATTR_LANES: max(int(row.lanes), 1),
             }
 
             # Add forward edge

@@ -7,13 +7,12 @@ from app.core.broadcaster import SimulationBroadcaster
 from app.core.simulation_config import SimulationConfig
 from app.core.simulation_engine import SimulationEngine, simulation_engine
 from app.services.network_graph import RoadNetworkGraph
-from app.services.vehicle_spawner import VehicleLifecycleManager, VehicleSpawner
+from app.services.vehicle_spawner import VehicleSpawner
 
 # Singletons a nivel de aplicación
 _config = SimulationConfig()
 _graph = RoadNetworkGraph()
 _spawner = VehicleSpawner(graph=_graph)
-_lifecycle = VehicleLifecycleManager(spawner=_spawner)
 _broadcaster = SimulationBroadcaster(
     connection_manager=connection_manager,
     vehicle_spawner=_spawner,
@@ -46,11 +45,6 @@ def get_road_network_graph() -> RoadNetworkGraph:
 def get_vehicle_spawner() -> VehicleSpawner:
     """Devuelve la instancia singleton del spawner de vehículos."""
     return _spawner
-
-
-def get_vehicle_lifecycle_manager() -> VehicleLifecycleManager:
-    """Devuelve la instancia singleton del gestor de ciclo de vida."""
-    return _lifecycle
 
 
 def get_broadcaster() -> SimulationBroadcaster:

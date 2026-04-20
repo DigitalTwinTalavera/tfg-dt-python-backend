@@ -46,16 +46,10 @@ MSG_WS_URL = "🔌 WebSocket disponible en ws://{host}:{port}{ws_path}"
 MSG_SHUTDOWN = "👋 Servidor detenido"
 
 # WebSocket Message Types
-WS_TYPE_ECHO = "echo"
-WS_TYPE_BROADCAST = "broadcast"
-WS_TYPE_STATE_UPDATE = "state_update"
-WS_TYPE_CLIENT_CONNECTED = "client_connected"
-WS_TYPE_CLIENT_DISCONNECTED = "client_disconnected"
 WS_TYPE_TICK = "tick"
 WS_TYPE_SIM_STATE = "sim_state"
 WS_TYPE_VEHICLE_SPAWNED = "vehicle_spawned"
 WS_TYPE_VEHICLE_FINISHED = "vehicle_finished"
-WS_TYPE_VEHICLE_UPDATE = "vehicle_update"
 
 # Response Keys
 KEY_STATUS = "status"
@@ -195,6 +189,7 @@ ATTR_WEIGHT = "weight"
 ATTR_ROAD_TYPE = "road_type"
 ATTR_ONE_WAY = "one_way"
 ATTR_WAYPOINTS = "waypoints"  # list[tuple[float,float]] — (lon, lat) pairs from LineString
+ATTR_LANES = "lanes"           # número de carriles del edge (>=1)
 # Semáforos intermedios del edge (no en endpoints). Detectados por coordenada
 # contra los waypoints al cargar el grafo. Lista ordenada por distancia creciente:
 #   list[tuple[int, float]]  →  [(tl_node_id, distance_from_start_m), ...]
@@ -363,6 +358,17 @@ MAX_EMERGENCY_DECEL_MS2: float = 8.0    # physical braking cap (m/s²)
 DEFAULT_VEHICLE_SPEED_KMH: float = 50.0 # default desired speed in km/h
 MIN_EDGE_LENGTH_M: float = 0.1          # prevent division by zero
 VEHICLE_PHYSICS_PARALLEL_THRESHOLD: int = 500
+# Distancia (m) sobre la que se mezcla la tangente final de la arista saliente
+# con la inicial de la entrante al cambiar de arista. Elimina el snap visible
+# de heading en cruces sin curvar el movimiento más de lo necesario.
+EDGE_HEADING_BLEND_DIST_M: float = 3.0
+# Cada cuántos ticks se evalúa MOBIL por vehículo. Con tick=100 ms, un valor de
+# 5 corresponde a 500 ms: suficiente para que un cambio de carril sea reactivo
+# sin saturar CPU ni producir oscilaciones por re-evaluación inmediata.
+MOBIL_EVAL_INTERVAL_TICKS: int = 5
+# No re-evaluar MOBIL en los últimos metros de una arista: la transición ya
+# reasigna el carril (min(lane, new_lanes-1)) y un cambio aquí sería inútil.
+MOBIL_MIN_DIST_TO_EDGE_END_M: float = 15.0
 
 # =============================================================================
 # Spawn Randomisation Constants

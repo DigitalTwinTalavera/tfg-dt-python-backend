@@ -1,5 +1,5 @@
 """
-Tests para VehicleSpawner, VehicleLifecycleManager y endpoints de vehículos.
+Tests para VehicleSpawner y endpoints de vehículos.
 """
 
 from unittest.mock import AsyncMock, MagicMock
@@ -22,7 +22,6 @@ from app.models.enums import NodeType, VehicleStatus
 from app.services.network_graph import RoadNetworkGraph
 from app.services.vehicle_spawner import (
     SimVehicle,
-    VehicleLifecycleManager,
     VehicleSpawner,
 )
 
@@ -93,11 +92,6 @@ def graph():
 @pytest.fixture
 def spawner(graph):
     return VehicleSpawner(graph=graph, max_vehicles=10)
-
-
-@pytest.fixture
-def lifecycle(spawner):
-    return VehicleLifecycleManager(spawner=spawner)
 
 
 def _override_db():
@@ -270,90 +264,6 @@ class TestSimVehicle:
         assert "route_edges" in d
         assert "route_length_m" in d
         assert d["status"] == "idle"
-
-
-# =============================================================================
-# VehicleLifecycleManager
-# =============================================================================
-
-
-class TestVehicleLifecycleManager:
-    @pytest.mark.unit
-    def test_activate_idle_vehicles(self, spawner, lifecycle):
-        spawner.spawn(count=3)
-        activated = lifecycle.activate_idle_vehicles()
-        assert activated == 3
-        for v in spawner.get_all_vehicles():
-            assert v.status == VehicleStatus.MOVING
-
-    @pytest.mark.unit
-    def test_activate_does_not_change_moving(self, spawner, lifecycle):
-        spawner.spawn(count=2)
-        lifecycle.activate_idle_vehicles()
-        # Segunda llamada no cambia nada
-        activated = lifecycle.activate_idle_vehicles()
-        assert activated == 0
-
-    @pytest.mark.unit
-    def test_mark_finished(self, spawner, lifecycle):
-        vehicles = spawner.spawn(count=1)
-        lifecycle.activate_idle_vehicles()
-        result = lifecycle.mark_finished(vehicles[0].id)
-        assert result is True
-        assert vehicles[0].status == VehicleStatus.FINISHED
-
-    @pytest.mark.unit
-    def test_mark_finished_not_found(self, lifecycle):
-        assert lifecycle.mark_finished("v_999") is False
-
-    @pytest.mark.unit
-    def test_cleanup_finished(self, spawner, lifecycle):
-        vehicles = spawner.spawn(count=3)
-        lifecycle.activate_idle_vehicles()
-        lifecycle.mark_finished(vehicles[0].id)
-        lifecycle.mark_finished(vehicles[1].id)
-
-        removed = lifecycle.cleanup_finished()
-        assert removed == 2
-        assert len(spawner.get_all_vehicles()) == 1
-
-    @pytest.mark.unit
-    def test_cleanup_no_finished(self, spawner, lifecycle):
-        spawner.spawn(count=2)
-        removed = lifecycle.cleanup_finished()
-        assert removed == 0
-
-    @pytest.mark.unit
-    def test_finished_vehicles_dont_count_as_active(self, spawner, lifecycle):
-        spawner.spawn(count=3)
-        lifecycle.activate_idle_vehicles()
-        lifecycle.mark_finished(spawner.get_all_vehicles()[0].id)
-        assert spawner.active_count == 2
-
-    @pytest.mark.unit
-    def test_full_lifecycle(self, spawner, lifecycle):
-        """Test del ciclo completo: spawn -> activate -> finish -> cleanup."""
-        vehicles = spawner.spawn(count=2)
-        assert spawner.active_count == 2
-
-        # IDLE -> MOVING
-        lifecycle.activate_idle_vehicles()
-        for v in vehicles:
-            assert v.status == VehicleStatus.MOVING
-
-        # MOVING -> FINISHED
-        lifecycle.mark_finished(vehicles[0].id)
-        assert vehicles[0].status == VehicleStatus.FINISHED
-        assert spawner.active_count == 1
-
-        # FINISHED -> eliminado
-        lifecycle.cleanup_finished()
-        assert len(spawner.get_all_vehicles()) == 1
-        assert spawner.active_count == 1
-
-        # Ahora se pueden spawnar más
-        new_vehicles = spawner.spawn(count=1)
-        assert len(new_vehicles) == 1
 
 
 # =============================================================================

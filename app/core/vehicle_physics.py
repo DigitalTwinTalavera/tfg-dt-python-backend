@@ -35,6 +35,7 @@ import os
 from dataclasses import dataclass
 
 from app.core.constants import (
+    ATTR_LANES,
     ATTR_LATITUDE,
     ATTR_LENGTH,
     ATTR_LONGITUDE,
@@ -45,9 +46,12 @@ from app.core.constants import (
     COLLISION_GAP_THRESHOLD_M,
     COLLISION_PROXIMITY_DURATION_S,
     DEFAULT_VEHICLE_SPEED_KMH,
+    EDGE_HEADING_BLEND_DIST_M,
     KMH_TO_MS,
     MAX_EMERGENCY_DECEL_MS2,
     MIN_EDGE_LENGTH_M,
+    MOBIL_EVAL_INTERVAL_TICKS,
+    MOBIL_MIN_DIST_TO_EDGE_END_M,
     TL_PHASE_GREEN,
     TL_PHASE_RED,
     TL_PHASE_YELLOW,
@@ -56,6 +60,12 @@ from app.core.constants import (
     YELLOW_BRAKE_DISTANCE_M,
 )
 from app.core.physics.idm import IDMModel
+from app.core.physics.mobil import (
+    LaneChangeDirection,
+    LaneContext,
+    MOBILModel,
+)
+from app.core.physics.vehicle_types import PROFILES, VehicleType
 from app.models.enums import VehicleStatus
 from app.services.network_graph import RoadNetworkGraph
 from app.services.vehicle_spawner import SimVehicle
@@ -64,8 +74,37 @@ logger = logging.getLogger(__name__)
 
 _EARTH_RADIUS_M: float = 6_371_000.0
 
-# Instancia singleton del IDM: stateless, seguro para multiprocessing
-_IDM = IDMModel()
+# Un IDMModel por tipo de vehículo. Stateless tras construcción → seguro para
+# multiprocessing. Se indexa por VehicleType para evitar la construcción
+# repetida en el hot-path del tick.
+_IDM_BY_TYPE: dict[VehicleType, IDMModel] = {
+    vtype: IDMModel(profile.idm) for vtype, profile in PROFILES.items()
+}
+# Fallback para vehículos sin vtype explícito (tests legacy, serialización vieja).
+_IDM_FALLBACK = IDMModel()
+
+# MOBILModel por tipo de vehículo (usa los mismos IDMParameters que el IDM).
+# Stateless tras construcción → seguro para multiprocessing.
+_MOBIL_BY_TYPE: dict[VehicleType, MOBILModel] = {
+    vtype: MOBILModel(idm_params=profile.idm) for vtype, profile in PROFILES.items()
+}
+_MOBIL_FALLBACK = MOBILModel()
+
+
+def _mobil_for(vehicle: SimVehicle) -> MOBILModel:
+    """Devuelve el MOBILModel correspondiente al tipo del vehículo."""
+    vtype = getattr(vehicle, "vtype", None)
+    if vtype is None:
+        return _MOBIL_FALLBACK
+    return _MOBIL_BY_TYPE.get(vtype, _MOBIL_FALLBACK)
+
+
+def _idm_for(vehicle: SimVehicle) -> IDMModel:
+    """Devuelve el IDMModel correspondiente al tipo del vehículo."""
+    vtype = getattr(vehicle, "vtype", None)
+    if vtype is None:
+        return _IDM_FALLBACK
+    return _IDM_BY_TYPE.get(vtype, _IDM_FALLBACK)
 
 # Caché de longitudes de segmentos por arista (start_node, end_node).
 _SEG_CACHE: dict[tuple[int, int], tuple[list[float], float]] = {}
@@ -130,6 +169,12 @@ def _waypoint_segments(
         lengths.append(d)
         total += d
     return lengths, total
+
+
+def _blend_heading_deg(from_deg: float, to_deg: float, t: float) -> float:
+    """Interpolación circular entre dos headings en grados (resultado en [0, 360))."""
+    diff = ((to_deg - from_deg + 540.0) % 360.0) - 180.0
+    return (from_deg + diff * t) % 360.0
 
 
 def _position_along_waypoints(
@@ -266,11 +311,16 @@ def _find_leader(
     edge_attrs = graph.get_edge_attributes(node_path[ei], node_path[ei + 1])
     edge_len = max(float(edge_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
 
+    ego_lane = getattr(vehicle, "lane", 0)
     for candidate in edge_index.get(key, []):
         if candidate.id == vehicle.id:
             continue
+        # Sólo vehículos en el mismo carril bloquean al ego.
+        if getattr(candidate, "lane", 0) != ego_lane:
+            continue
         if candidate.progress_on_edge > vehicle.progress_on_edge:
-            raw_gap = (candidate.progress_on_edge - vehicle.progress_on_edge) * edge_len - VEHICLE_LENGTH_M
+            cand_len = getattr(candidate, "length_m", VEHICLE_LENGTH_M)
+            raw_gap = (candidate.progress_on_edge - vehicle.progress_on_edge) * edge_len - cand_len
             if raw_gap <= 0.0:
                 # Overlap geométrico: parada de emergencia — forzar velocidad cero
                 return NeighborInfo(gap_m=0.01, velocity_ms=0.0, leader_id=candidate.id)
@@ -286,12 +336,15 @@ def _find_leader(
         next_edge_len = max(float(next_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
         candidates_next = edge_index.get(next_key, [])
         if candidates_next:
-            # El que tiene menor progress está más cerca del inicio → el que más molesta
+            # El que tiene menor progress está más cerca del inicio → el que más molesta.
+            # Ignoramos carril porque al cambiar de arista el lane se reasigna,
+            # y queremos una estimación conservadora para evitar overlaps en la transición.
             first_on_next = min(candidates_next, key=lambda v: v.progress_on_edge)
             if first_on_next.id != vehicle.id:
                 remaining_current = (1.0 - vehicle.progress_on_edge) * edge_len
                 dist_on_next      = first_on_next.progress_on_edge * next_edge_len
-                total_gap = remaining_current + dist_on_next - VEHICLE_LENGTH_M
+                leader_len = getattr(first_on_next, "length_m", VEHICLE_LENGTH_M)
+                total_gap = remaining_current + dist_on_next - leader_len
                 return NeighborInfo(
                     gap_m=max(total_gap, 0.01),
                     velocity_ms=first_on_next.velocity,
@@ -299,6 +352,113 @@ def _find_leader(
                 )
 
     return None
+
+
+def _build_lane_context(
+    ego: SimVehicle,
+    target_lane: int,
+    same_edge_vehicles: list[SimVehicle],
+    edge_len: float,
+) -> LaneContext:
+    """
+    Construye el LaneContext para el carril `target_lane` en la arista del ego.
+
+    Recorre sólo los vehículos en la misma arista (ya filtrados por el caller),
+    busca el más cercano por delante y el más cercano por detrás en `target_lane`
+    y devuelve sus gaps bumper-to-bumper y velocidades para evaluar MOBIL.
+    """
+    ctx = LaneContext()
+    ego_len = getattr(ego, "length_m", VEHICLE_LENGTH_M)
+    best_front_gap = float("inf")
+    best_back_gap = float("inf")
+    for cand in same_edge_vehicles:
+        if cand.id == ego.id:
+            continue
+        if getattr(cand, "lane", 0) != target_lane:
+            continue
+        cand_len = getattr(cand, "length_m", VEHICLE_LENGTH_M)
+        if cand.progress_on_edge > ego.progress_on_edge:
+            gap = (cand.progress_on_edge - ego.progress_on_edge) * edge_len - cand_len
+            gap = max(gap, 0.01)
+            if gap < best_front_gap:
+                best_front_gap = gap
+                ctx.gap_front = gap
+                ctx.v_front = cand.velocity
+        elif cand.progress_on_edge < ego.progress_on_edge:
+            gap = (ego.progress_on_edge - cand.progress_on_edge) * edge_len - ego_len
+            gap = max(gap, 0.01)
+            if gap < best_back_gap:
+                best_back_gap = gap
+                ctx.gap_back = gap
+                ctx.v_back = cand.velocity
+                ctx.v_back_current_accel = cand.acceleration
+    return ctx
+
+
+def _evaluate_lane_change(
+    vehicle: SimVehicle,
+    edge_index: dict[tuple[int, int], list[SimVehicle]],
+    graph: RoadNetworkGraph,
+    leader: NeighborInfo | None,
+) -> None:
+    """
+    Evalúa MOBIL para decidir si el vehículo debe cambiar de carril.
+
+    - No-op si la arista tiene ≤ 1 carril o el vehículo está cerca del final
+      de la arista (donde el lane ya se reasigna al entrar en la siguiente).
+    - Modifica `vehicle.lane` in-place si MOBIL decide un cambio seguro.
+    """
+    node_path = vehicle.route.node_path
+    ei = vehicle.current_edge_index
+    if ei >= len(node_path) - 1:
+        return
+
+    key = (node_path[ei], node_path[ei + 1])
+    edge_attrs = graph.get_edge_attributes(*key)
+    n_lanes = max(int(edge_attrs.get(ATTR_LANES, 1)), 1)
+    if n_lanes <= 1:
+        return
+    edge_len = max(float(edge_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
+
+    # Cerca del fin de arista: no merece la pena cambiar.
+    dist_to_end = edge_len - vehicle.progress_on_edge * edge_len
+    if dist_to_end < MOBIL_MIN_DIST_TO_EDGE_END_M:
+        return
+
+    current_lane = getattr(vehicle, "lane", 0)
+    same_edge = edge_index.get(key, [])
+
+    # Construir contextos sólo para carriles existentes. Convención: lane 0 es
+    # el carril derecho (el más cercano al bordillo); lane+1 es el izquierdo.
+    lane_left_ctx: LaneContext | None = None
+    lane_right_ctx: LaneContext | None = None
+    if current_lane + 1 < n_lanes:
+        lane_left_ctx = _build_lane_context(
+            vehicle, current_lane + 1, same_edge, edge_len
+        )
+    if current_lane - 1 >= 0:
+        lane_right_ctx = _build_lane_context(
+            vehicle, current_lane - 1, same_edge, edge_len
+        )
+    if lane_left_ctx is None and lane_right_ctx is None:
+        return
+
+    mobil = _mobil_for(vehicle)
+    decision = mobil.evaluate_lane_change(
+        v_ego=vehicle.velocity,
+        v0_ego=vehicle.desired_speed_ms,
+        current_accel=vehicle.acceleration,
+        gap_front_current=leader.gap_m if leader is not None else None,
+        v_front_current=leader.velocity_ms if leader is not None else None,
+        lane_left=lane_left_ctx,
+        lane_right=lane_right_ctx,
+    )
+    if not decision.should_change:
+        return
+    if decision.direction == LaneChangeDirection.LEFT:
+        vehicle.lane = current_lane + 1
+    elif decision.direction == LaneChangeDirection.RIGHT:
+        vehicle.lane = current_lane - 1
 
 
 def _phase_blocks(phase: str, vehicle: SimVehicle, dist_to_stop: float) -> bool:
@@ -441,17 +601,20 @@ def _advance_vehicle_idm(
     desired_v = min(getattr(vehicle, "desired_speed_ms", v_max), v_max)
 
     # ── IDM acceleration ───────────────────────────────────────────────────────
+    idm = _idm_for(vehicle)
     if leader is not None:
-        a = _IDM.calculate_acceleration(
+        a = idm.calculate_acceleration(
             v=vehicle.velocity,
             v0=desired_v,
             s=leader.gap_m,
             v_lead=leader.velocity_ms,
         )
     else:
-        a = _IDM.calculate_acceleration(v=vehicle.velocity, v0=desired_v)
+        a = idm.calculate_acceleration(v=vehicle.velocity, v0=desired_v)
 
     a = max(a, -MAX_EMERGENCY_DECEL_MS2)  # límite físico de frenado
+    # Clamp al rango físico del perfil: útil para el cliente (dead reckoning)
+    a = min(a, idm.params.a)
 
     # ── Update velocity ────────────────────────────────────────────────────────
     new_v = max(0.0, min(vehicle.velocity + a * dt, v_max))
@@ -528,8 +691,31 @@ def _advance_vehicle_idm(
                     remaining_dist           = 0.0
                     break
             remaining_dist           -= dist_to_end
+            # Guardar la tangente final de la arista saliente antes de avanzar
+            # al siguiente tramo: se usa para mezclar con la tangente inicial
+            # de la entrante durante los primeros EDGE_HEADING_BLEND_DIST_M
+            # metros y evitar un snap visible de heading en el cruce.
+            outgoing_start_attrs = graph.get_node_attributes(start_n)
+            outgoing_end_attrs   = graph.get_node_attributes(end_n)
+            outgoing_wps = _get_waypoints(
+                edge_attrs, outgoing_start_attrs, outgoing_end_attrs
+            )
+            _, _, end_heading = _position_along_waypoints(
+                outgoing_wps, 1.0, _cache_key=(start_n, end_n)
+            )
+            vehicle.prev_edge_end_heading = end_heading
             ei                       += 1
             vehicle.progress_on_edge  = 0.0
+            # Al entrar en la nueva arista, clampear el carril a su número de
+            # carriles disponible (una calle de 1 carril recibe todos los
+            # cambios → lane=0). MOBIL decidirá si conviene volver a cambiar.
+            if ei < len(node_path) - 1:
+                new_edge_attrs = graph.get_edge_attributes(
+                    node_path[ei], node_path[ei + 1]
+                )
+                new_lanes = max(int(new_edge_attrs.get(ATTR_LANES, 1)), 1)
+                cur_lane = getattr(vehicle, "lane", 0)
+                vehicle.lane = min(cur_lane, new_lanes - 1)
         else:
             vehicle.progress_on_edge += remaining_dist / edge_len
             vehicle.progress_on_edge  = min(vehicle.progress_on_edge, 1.0)
@@ -557,6 +743,22 @@ def _advance_vehicle_idm(
     lon, lat, heading = _position_along_waypoints(
         waypoints, vehicle.progress_on_edge, _cache_key=(start_n, end_n)
     )
+
+    # ── Blend de tangentes entre aristas ──────────────────────────────────────
+    # Durante los primeros EDGE_HEADING_BLEND_DIST_M metros de una arista
+    # entrante, mezclamos la tangente final de la saliente con la actual.
+    # Así el cliente ve un giro continuo en vez de un snap instantáneo.
+    if vehicle.prev_edge_end_heading >= 0.0:
+        cur_edge_len = max(float(edge_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
+        pos_on_edge_m = vehicle.progress_on_edge * cur_edge_len
+        if pos_on_edge_m < EDGE_HEADING_BLEND_DIST_M:
+            blend_t = pos_on_edge_m / EDGE_HEADING_BLEND_DIST_M
+            heading = _blend_heading_deg(
+                vehicle.prev_edge_end_heading, heading, blend_t
+            )
+        else:
+            # Ya fuera de la zona de mezcla: limpiar el estado.
+            vehicle.prev_edge_end_heading = -1.0
 
     vehicle.longitude = lon
     vehicle.latitude  = lat
@@ -646,6 +848,14 @@ def update_vehicles(
             tl_leader = _check_traffic_light(vehicle, graph, tl_controller)
             if tl_leader is not None and (leader is None or tl_leader.gap_m < leader.gap_m):
                 leader = tl_leader
+
+        # MOBIL: evaluar cambio de carril cada MOBIL_EVAL_INTERVAL_TICKS ticks
+        # (el cooldown está escalonado al spawnear para repartir carga).
+        if vehicle.mobil_cooldown_ticks <= 0:
+            _evaluate_lane_change(vehicle, edge_index, graph, leader)
+            vehicle.mobil_cooldown_ticks = MOBIL_EVAL_INTERVAL_TICKS
+        else:
+            vehicle.mobil_cooldown_ticks -= 1
 
         # Detección determinista de colisiones: gap pequeño SOSTENIDO > umbral temporal
         too_close = (
@@ -746,6 +956,7 @@ def _vehicle_to_dict(
     tl_phases: "dict[int, dict[str, str]] | None" = None,
 ) -> dict:
     """Serializa los campos mutables de un SimVehicle para IPC entre procesos."""
+    vtype = getattr(v, "vtype", None)
     return {
         "id": v.id,
         "status": v.status.value,
@@ -760,6 +971,10 @@ def _vehicle_to_dict(
         "heading": v.heading,
         "desired_speed_ms": getattr(v, "desired_speed_ms", 13.89),
         "yellow_runs_light": getattr(v, "yellow_runs_light", False),
+        "vtype": vtype.value if vtype is not None else None,
+        "lane": getattr(v, "lane", 0),
+        "length_m": getattr(v, "length_m", VEHICLE_LENGTH_M),
+        "prev_edge_end_heading": getattr(v, "prev_edge_end_heading", -1.0),
         # Líder pre-computado en el proceso principal para evitar
         # la necesidad de reconstruir el edge_index en cada worker.
         "leader_gap_m": leader.gap_m if leader is not None else None,
@@ -808,6 +1023,8 @@ def _process_chunk(
             edge_ids=vd["edge_ids"],
             length_m=0.0,
         )
+        vtype_str = vd.get("vtype")
+        vtype_val = VehicleType(vtype_str) if vtype_str else VehicleType.CAR
         v = SimVehicle(
             id=vd["id"],
             start_node_id=0,
@@ -823,6 +1040,10 @@ def _process_chunk(
             progress_on_edge=vd["progress_on_edge"],
             desired_speed_ms=vd.get("desired_speed_ms", 13.89),
             yellow_runs_light=vd.get("yellow_runs_light", False),
+            vtype=vtype_val,
+            lane=vd.get("lane", 0),
+            length_m=vd.get("length_m", VEHICLE_LENGTH_M),
+            prev_edge_end_heading=vd.get("prev_edge_end_heading", -1.0),
         )
 
         # Reconstruir líder pre-computado
@@ -846,6 +1067,8 @@ def _process_chunk(
             "longitude": v.longitude,
             "latitude": v.latitude,
             "heading": v.heading,
+            "lane": v.lane,
+            "prev_edge_end_heading": v.prev_edge_end_heading,
         })
 
     return updates, finished_ids
@@ -938,6 +1161,15 @@ async def update_vehicles_parallel(
             else:
                 v.proximity_timer = 0.0
 
+            # MOBIL en el proceso principal: los workers no tienen acceso al
+            # edge_index completo (sólo a su chunk), por lo que el cambio de
+            # carril se decide aquí y se propaga ya decidido.
+            if v.mobil_cooldown_ticks <= 0:
+                _evaluate_lane_change(v, edge_index, graph, ldr)
+                v.mobil_cooldown_ticks = MOBIL_EVAL_INTERVAL_TICKS
+            else:
+                v.mobil_cooldown_ticks -= 1
+
             leaders[v.id] = ldr
 
         # Serializar snapshot completo de fases para _FrozenTL en workers
@@ -992,6 +1224,10 @@ async def update_vehicles_parallel(
                 v.longitude          = upd["longitude"]
                 v.latitude           = upd["latitude"]
                 v.heading            = upd["heading"]
+                v.lane               = upd.get("lane", v.lane)
+                v.prev_edge_end_heading = upd.get(
+                    "prev_edge_end_heading", v.prev_edge_end_heading
+                )
         finished_ids.extend(chunk_finished)
 
     return finished_ids

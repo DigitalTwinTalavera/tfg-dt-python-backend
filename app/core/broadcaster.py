@@ -135,6 +135,7 @@ class SimulationBroadcaster:
         changed: list[dict[str, Any]] = []
 
         for v in vehicles:
+            vtype = getattr(v, "vtype", None)
             state = build_vehicle_state(
                 vehicle_id=v.id,
                 longitude=v.longitude,
@@ -145,6 +146,8 @@ class SimulationBroadcaster:
                 status=v.status.value,
                 current_edge_index=v.current_edge_index,
                 progress_on_edge=getattr(v, "progress_on_edge", 0.0),
+                lane=getattr(v, "lane", 0),
+                vtype=vtype.value if vtype is not None else "car",
             )
             new_snapshot[v.id] = state
 
@@ -166,11 +169,14 @@ class SimulationBroadcaster:
         """Emite notificación de vehículo generado."""
         if self._manager.connection_count == 0:
             return
+        vtype = getattr(vehicle, "vtype", None)
         message = build_vehicle_spawned_message(
             vehicle_id=vehicle.id,
             start_node_id=vehicle.start_node_id,
             end_node_id=vehicle.end_node_id,
             route_edges=vehicle.route.edge_ids,
+            lane=getattr(vehicle, "lane", 0),
+            vtype=vtype.value if vtype is not None else "car",
         )
         await self._manager.broadcast(message)
 
