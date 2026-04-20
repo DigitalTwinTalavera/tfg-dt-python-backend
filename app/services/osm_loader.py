@@ -15,6 +15,10 @@ from typing import Callable, Optional
 from geoalchemy2.functions import ST_MakePoint, ST_SetSRID
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from collections import defaultdict, deque
+
+from sqlalchemy import update as sa_update
+
 from app.core.constants import (
     DEFAULT_MAX_SPEED_KMH,
     EARTH_RADIUS_METERS,
@@ -23,6 +27,8 @@ from app.core.constants import (
     OSM_DEFAULT_ONEWAY_TYPES,
     OSM_DEFAULT_SPEED_LIMITS,
     OSM_JUNCTION_ROUNDABOUT,
+    OSM_NODE_GIVE_WAY,
+    OSM_NODE_STOP,
     OSM_NODE_TRAFFIC_SIGNALS,
     OSM_TAG_CROSSING,
     OSM_ONEWAY_REVERSE,
@@ -32,10 +38,14 @@ from app.core.constants import (
     OSM_TAG_HIGHWAY,
     OSM_TAG_JUNCTION,
     OSM_TAG_LANES,
+    OSM_TAG_LANES_BACKWARD,
+    OSM_TAG_LANES_FORWARD,
     OSM_TAG_MAXSPEED,
+    OSM_TAG_MAXSPEED_LANES,
     OSM_TAG_NAME,
     OSM_TAG_NOEXIT,
     OSM_TAG_ONEWAY,
+    OSM_TAG_TURN_LANES,
     OSM_VALUE_YES,
     OSM_XML_EXTENSIONS,
     SRID_WGS84,
@@ -187,6 +197,11 @@ class OSMLoader:
         # Save edges to database
         self._report_progress("Saving edges", len(filtered_ways))
         await self._save_edges(filtered_ways, stats)
+
+        # Asignar roundabout_id a todas las aristas del mismo anillo físico.
+        # Se hace tras guardar las aristas porque trabajamos con IDs de BD.
+        self._report_progress("Grouping roundabout edges", 0)
+        await self._group_roundabout_edges()
 
         # Commit transaction
         await self._session.commit()
@@ -352,6 +367,10 @@ class OSMLoader:
             return NodeType.TRAFFIC_LIGHT
         if tags.get(OSM_TAG_CROSSING) == OSM_NODE_TRAFFIC_SIGNALS:
             return NodeType.TRAFFIC_LIGHT
+        if tags.get(OSM_TAG_HIGHWAY) == OSM_NODE_STOP:
+            return NodeType.STOP_SIGN
+        if tags.get(OSM_TAG_HIGHWAY) == OSM_NODE_GIVE_WAY:
+            return NodeType.YIELD_SIGN
         if tags.get(OSM_TAG_JUNCTION) == OSM_JUNCTION_ROUNDABOUT:
             return NodeType.ROUNDABOUT
         if tags.get(OSM_TAG_NOEXIT) == OSM_VALUE_YES:
@@ -433,6 +452,20 @@ class OSMLoader:
         max_speed = self._parse_maxspeed(tags.get(OSM_TAG_MAXSPEED), highway)
         lanes = self._parse_lanes(tags.get(OSM_TAG_LANES))
         one_way = self._is_one_way(tags)
+        is_roundabout = tags.get(OSM_TAG_JUNCTION) == OSM_JUNCTION_ROUNDABOUT
+
+        meta = {"osm_id": way.osm_id}
+        # Preservar tags de granularidad por carril para fases posteriores
+        # (giros permitidos, velocidades por carril, tránsito por carriles).
+        for key, tag_name in (
+            ("turn_lanes", OSM_TAG_TURN_LANES),
+            ("maxspeed_lanes", OSM_TAG_MAXSPEED_LANES),
+            ("lanes_forward", OSM_TAG_LANES_FORWARD),
+            ("lanes_backward", OSM_TAG_LANES_BACKWARD),
+        ):
+            v = tags.get(tag_name)
+            if v:
+                meta[key] = v
 
         return EdgeModel(
             name=tags.get(OSM_TAG_NAME),
@@ -444,8 +477,9 @@ class OSMLoader:
             max_speed=max_speed,
             lanes=lanes,
             one_way=one_way,
+            is_roundabout=is_roundabout,
             is_active=True,
-            metadata_json=json.dumps({"osm_id": way.osm_id}),
+            metadata_json=json.dumps(meta),
         )
 
     def _make_linestring(self, coords: list[tuple[float, float]]) -> str:
@@ -572,6 +606,64 @@ class OSMLoader:
             return oneway != "no"
 
         return False
+
+    async def _group_roundabout_edges(self) -> None:
+        """
+        Asigna un ``roundabout_id`` único a cada anillo conexo.
+
+        Recorre las aristas con ``is_roundabout=True`` y las agrupa por
+        componentes conexas sobre el grafo no dirigido (``start_node`` y
+        ``end_node`` como nodos compartidos). Cada componente recibe un ID
+        incremental a partir de 1.
+        """
+        from sqlalchemy import select
+
+        stmt = select(
+            EdgeModel.id, EdgeModel.start_node_id, EdgeModel.end_node_id
+        ).where(EdgeModel.is_roundabout.is_(True))
+        rows = (await self._session.execute(stmt)).all()
+
+        if not rows:
+            return
+
+        # Mapa nodo -> aristas incidentes (por id).
+        incident: dict[int, list[int]] = defaultdict(list)
+        end_nodes: dict[int, tuple[int, int]] = {}
+        for row in rows:
+            incident[row.start_node_id].append(row.id)
+            incident[row.end_node_id].append(row.id)
+            end_nodes[row.id] = (row.start_node_id, row.end_node_id)
+
+        # BFS sobre aristas conectadas por nodos compartidos.
+        assigned: dict[int, int] = {}
+        next_rid = 1
+        for edge_id in end_nodes.keys():
+            if edge_id in assigned:
+                continue
+            component: list[int] = []
+            queue: deque[int] = deque([edge_id])
+            assigned[edge_id] = next_rid
+            while queue:
+                cur = queue.popleft()
+                component.append(cur)
+                u, v = end_nodes[cur]
+                for nb in incident[u] + incident[v]:
+                    if nb in assigned:
+                        continue
+                    assigned[nb] = next_rid
+                    queue.append(nb)
+            next_rid += 1
+
+        # Update en bloque por componente (pocas filas por anillo).
+        buckets: dict[int, list[int]] = defaultdict(list)
+        for eid, rid in assigned.items():
+            buckets[rid].append(eid)
+        for rid, ids in buckets.items():
+            await self._session.execute(
+                sa_update(EdgeModel)
+                .where(EdgeModel.id.in_(ids))
+                .values(roundabout_id=rid)
+            )
 
     def clear(self) -> None:
         """Clear internal state."""

@@ -194,9 +194,18 @@ ATTR_LANES = "lanes"           # número de carriles del edge (>=1)
 # contra los waypoints al cargar el grafo. Lista ordenada por distancia creciente:
 #   list[tuple[int, float]]  →  [(tl_node_id, distance_from_start_m), ...]
 ATTR_MID_TLS = "mid_tls"
+ATTR_IS_ROUNDABOUT = "is_roundabout"   # bool — the edge is part of a roundabout ring
+ATTR_ROUNDABOUT_ID = "roundabout_id"   # int|None — identifies a connected ring component
+ATTR_CURVE_VMAX = "curve_vmax"         # float m/s — cached curvature speed cap for the edge
+
+# Routing penalties
+BLOCKED_EDGE_PENALTY_FACTOR: float = 1000.0  # multiplicador de peso para aristas con choque activo
 
 # Cache settings
 GRAPH_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+# Edge index for roundabout-related column (used by migrations and models)
+IDX_EDGES_ROUNDABOUT = "idx_dt_edges_roundabout_id"
 
 # Road-type routing penalty factors (multiplied on top of travel-time weight).
 # Values > 1 discourage a road type; values < 1 encourage it.
@@ -293,6 +302,14 @@ OSM_TAG_ONEWAY = "oneway"
 OSM_TAG_NAME = "name"
 OSM_TAG_LANES = "lanes"
 OSM_TAG_JUNCTION = "junction"
+OSM_TAG_TURN_LANES = "turn:lanes"
+OSM_TAG_MAXSPEED_LANES = "maxspeed:lanes"
+OSM_TAG_LANES_FORWARD = "lanes:forward"
+OSM_TAG_LANES_BACKWARD = "lanes:backward"
+
+# Sign / control nodes
+OSM_NODE_STOP = "stop"
+OSM_NODE_GIVE_WAY = "give_way"
 
 # One-way indicator values
 OSM_ONEWAY_YES = {"yes", "true", "1"}
@@ -385,9 +402,85 @@ SPAWN_INITIAL_PROGRESS_MAX: float = 0.4
 # Collision Constants
 # =============================================================================
 
-COLLISION_GAP_THRESHOLD_M: float = 0.3           # gap below this triggers proximity timer
+# Legacy straight-road threshold (kept as alias for backward compat).
+COLLISION_GAP_THRESHOLD_M: float = 0.3
+# Umbrales por contexto: en curvas de rotonda los vehículos se rozan más por la
+# discretización de waypoints; tolerar gap mayor antes de declarar choque.
+COLLISION_GAP_THRESHOLD_STRAIGHT_M: float = 0.3
+COLLISION_GAP_THRESHOLD_ROUNDABOUT_M: float = 0.8
 COLLISION_PROXIMITY_DURATION_S: float = 0.5      # sostenido > este tiempo → choque
-COLLISION_DURATION_S: float = 300.0              # 5 minutos bloqueado tras el choque
+# Velocidad relativa mínima para disparar colisión. Evita que dos vehículos
+# parados juntos (p. ej. en cola de semáforo) se marquen como choque.
+COLLISION_RELATIVE_SPEED_MIN_MS: float = 1.0
+
+# =============================================================================
+# Roundabout Yield Constants (Fase 2)
+# =============================================================================
+
+# Distancia desde la línea de entrada a la rotonda en la que el vehículo empieza
+# a mirar hacia dentro del anillo para ceder el paso.
+YIELD_DETECTION_ZONE_M: float = 15.0
+# Time-to-conflict: si un vehículo circulando llega antes de este tiempo a la
+# entrada del ego, el ego debe ceder.
+YIELD_TTC_THRESHOLD_S: float = 3.5
+# Gap mínimo en arco (m) dentro del anillo para aceptar la entrada.
+YIELD_GAP_MIN_M: float = 10.0
+# Distancia restante (m) en la arista actual por debajo de la cual se activa
+# el look-ahead cross-edge cuando la siguiente arista es anillo de rotonda.
+# Cubre ~5 ticks a 50 km/h (13.9 m/s · 0.1 s ≈ 1.39 m), evitando que entradas
+# cortas salten el gate fraccional del 70% en un único tick.
+LOOKAHEAD_ROUNDABOUT_TRIGGER_M: float = 8.0
+# Distancia (m) antes del nodo de entrada en la que se activa la arbitración
+# entre brazos convergentes. Alineada con YIELD_DETECTION_ZONE_M.
+ENTRY_ARBITRATION_ZONE_M: float = 15.0
+
+# =============================================================================
+# Curvature Speed Cap (Fase 4)
+# =============================================================================
+
+CURVE_LATERAL_ACCEL_MAX_MS2: float = 2.5   # confort ≈ 0.25 g para coche de turismo
+MIN_ROUNDABOUT_RADIUS_M: float = 6.0       # radio mínimo asumido (rotonda muy pequeña)
+
+# =============================================================================
+# Spawn Coordination (Fase 5)
+# =============================================================================
+
+# Máx. densidad de vehículos dentro de un anillo (veh por cada 100 m de recorrido).
+ROUNDABOUT_SATURATION_VEH_PER_100M: float = 8.0
+# Nº máximo de vehículos que pueden estrenarse por rotonda dentro del mismo batch.
+SPAWN_MAX_ENTRIES_PER_ROUNDABOUT_PER_TICK: int = 1
+
+# =============================================================================
+# Dynamic Routing (Fase 6)
+# =============================================================================
+
+DYNAMIC_WEIGHTS_TICK_INTERVAL: int = 20   # recalcular pesos dinámicos cada N ticks
+DYNAMIC_WEIGHT_MAX_MULT: float = 5.0       # multiplicador máximo por saturación
+DYNAMIC_WEIGHT_CHANGE_THRESHOLD: float = 0.2  # invalidar cache si un peso cambia >20 %
+
+# =============================================================================
+# STOP/YIELD Sign Runtime (Fase 7.1)
+# =============================================================================
+
+# Zona desde la línea de stop en la que el vehículo empieza a considerar la
+# señal. Fuera de esta distancia no se genera líder virtual.
+SIGN_DETECTION_ZONE_M: float = 20.0
+# STOP: velocidad máxima considerada "parado" durante el dwell obligatorio.
+STOP_SIGN_DWELL_SPEED_MS: float = 0.5
+# STOP: tiempo mínimo (s) a baja velocidad para dar por cumplida la parada.
+STOP_SIGN_DWELL_TIME_S: float = 1.0
+# YIELD: gap mínimo (m) en la arista convergente para aceptar el cruce.
+YIELD_SIGN_GAP_MIN_M: float = 8.0
+# YIELD: TTC umbral (s) en la arista convergente.
+YIELD_SIGN_TTC_S: float = 3.0
+
+# =============================================================================
+# Heading Blend (Fase 7)
+# =============================================================================
+
+# Distancia de blending cuando la arista previa era rotonda — necesita ser
+# mayor que el blend estándar para que la salida curve suavemente.
+EDGE_HEADING_BLEND_DIST_ROUNDABOUT_EXIT_M: float = 12.0
 
 # =============================================================================
 # Traffic Light Yellow Behaviour

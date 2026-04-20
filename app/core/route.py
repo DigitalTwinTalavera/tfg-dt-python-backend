@@ -34,6 +34,8 @@ def compute_route(
     graph: RoadNetworkGraph,
     start_node_id: int,
     end_node_id: int,
+    *,
+    blocked_edges: dict[tuple[int, int], object | None] | None = None,
 ) -> RouteInfo | None:
     """
     Calcula la ruta más corta (por tiempo de viaje) entre dos nodos.
@@ -41,10 +43,17 @@ def compute_route(
     Convierte el path de nodos devuelto por NetworkX en una lista ordenada
     de edge IDs y calcula la longitud total en metros.
 
+    Args:
+        blocked_edges: Aristas con colisión activa; A* las penaliza fuertemente
+            en vez de eliminarlas del grafo (preserva conectividad cuando no
+            hay alternativa).
+
     Returns:
         RouteInfo con la ruta calculada, o None si no existe camino.
     """
-    node_path = graph.get_shortest_path_astar_safe(start_node_id, end_node_id)
+    node_path = graph.get_shortest_path_astar_safe(
+        start_node_id, end_node_id, blocked_edges=blocked_edges
+    )
     if node_path is None or len(node_path) < 2:
         return None
 

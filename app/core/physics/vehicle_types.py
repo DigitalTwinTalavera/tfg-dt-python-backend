@@ -31,6 +31,11 @@ class VehicleTypeProfile:
     idm: IDMParameters
     # Probabilidad de spawnear este tipo (se normaliza al sumarse).
     spawn_weight: float
+    # Aceleración lateral máxima tolerada en curvas (m/s²). Menor para camiones.
+    lateral_accel_max_ms2: float = 2.5
+    # Radio mínimo de giro (m). Usado para descartar rotondas demasiado cerradas
+    # en el cálculo de ruta para camiones.
+    min_turn_radius_m: float = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +56,8 @@ CAR_PROFILE = VehicleTypeProfile(
         delta=4.0,
     ),
     spawn_weight=0.75,
+    lateral_accel_max_ms2=2.5,
+    min_turn_radius_m=5.0,
 )
 
 MOTO_PROFILE = VehicleTypeProfile(
@@ -67,6 +74,8 @@ MOTO_PROFILE = VehicleTypeProfile(
         delta=4.0,
     ),
     spawn_weight=0.15,
+    lateral_accel_max_ms2=3.0,
+    min_turn_radius_m=3.0,
 )
 
 TRUCK_PROFILE = VehicleTypeProfile(
@@ -83,6 +92,8 @@ TRUCK_PROFILE = VehicleTypeProfile(
         delta=4.0,
     ),
     spawn_weight=0.10,
+    lateral_accel_max_ms2=1.8,
+    min_turn_radius_m=10.0,
 )
 
 

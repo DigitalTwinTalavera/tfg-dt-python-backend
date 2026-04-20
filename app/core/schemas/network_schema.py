@@ -241,6 +241,12 @@ class EdgeGeoJSONResponse(BaseModel):
     max_speed: int = Field(..., description="Maximum speed in km/h")
     lanes: int = Field(..., description="Number of lanes")
     one_way: bool = Field(..., description="Whether road is one-way")
+    is_roundabout: bool = Field(
+        False, description="True if the edge belongs to a roundabout ring"
+    )
+    roundabout_id: Optional[int] = Field(
+        None, description="Connected roundabout component identifier"
+    )
     is_active: bool = Field(..., description="Whether edge is active")
     metadata_json: Optional[str] = Field(None, description="Optional JSON metadata")
     created_at: datetime = Field(..., description="Creation timestamp")

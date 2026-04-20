@@ -35,29 +35,47 @@ import os
 from dataclasses import dataclass
 
 from app.core.constants import (
+    ATTR_CURVE_VMAX,
+    ATTR_IS_ROUNDABOUT,
     ATTR_LANES,
     ATTR_LATITUDE,
     ATTR_LENGTH,
     ATTR_LONGITUDE,
     ATTR_MAX_SPEED,
     ATTR_MID_TLS,
+    ATTR_NODE_TYPE,
+    ATTR_ROUNDABOUT_ID,
     ATTR_WAYPOINTS,
-    COLLISION_DURATION_S,
-    COLLISION_GAP_THRESHOLD_M,
+    COLLISION_GAP_THRESHOLD_ROUNDABOUT_M,
+    COLLISION_GAP_THRESHOLD_STRAIGHT_M,
     COLLISION_PROXIMITY_DURATION_S,
+    COLLISION_RELATIVE_SPEED_MIN_MS,
+    CURVE_LATERAL_ACCEL_MAX_MS2,
     DEFAULT_VEHICLE_SPEED_KMH,
     EDGE_HEADING_BLEND_DIST_M,
+    EDGE_HEADING_BLEND_DIST_ROUNDABOUT_EXIT_M,
+    ENTRY_ARBITRATION_ZONE_M,
     KMH_TO_MS,
+    LOOKAHEAD_ROUNDABOUT_TRIGGER_M,
     MAX_EMERGENCY_DECEL_MS2,
     MIN_EDGE_LENGTH_M,
+    MIN_ROUNDABOUT_RADIUS_M,
     MOBIL_EVAL_INTERVAL_TICKS,
     MOBIL_MIN_DIST_TO_EDGE_END_M,
+    SIGN_DETECTION_ZONE_M,
+    STOP_SIGN_DWELL_SPEED_MS,
+    STOP_SIGN_DWELL_TIME_S,
     TL_PHASE_GREEN,
     TL_PHASE_RED,
     TL_PHASE_YELLOW,
     VEHICLE_LENGTH_M,
     VEHICLE_PHYSICS_PARALLEL_THRESHOLD,
     YELLOW_BRAKE_DISTANCE_M,
+    YIELD_DETECTION_ZONE_M,
+    YIELD_GAP_MIN_M,
+    YIELD_SIGN_GAP_MIN_M,
+    YIELD_SIGN_TTC_S,
+    YIELD_TTC_THRESHOLD_S,
 )
 from app.core.physics.idm import IDMModel
 from app.core.physics.mobil import (
@@ -66,7 +84,7 @@ from app.core.physics.mobil import (
     MOBILModel,
 )
 from app.core.physics.vehicle_types import PROFILES, VehicleType
-from app.models.enums import VehicleStatus
+from app.models.enums import NodeType, VehicleStatus
 from app.services.network_graph import RoadNetworkGraph
 from app.services.vehicle_spawner import SimVehicle
 
@@ -327,31 +345,293 @@ def _find_leader(
             return NeighborInfo(gap_m=raw_gap, velocity_ms=candidate.velocity, leader_id=candidate.id)
 
     # ── Look-ahead al inicio de la siguiente arista ────────────────────────────
-    # Si el vehículo está cerca del final (>70%), busca el vehículo más retrasado
-    # en la arista siguiente para evitar que dos coches de rutas distintas entren
-    # simultáneamente y se solapen.
-    if vehicle.progress_on_edge > 0.70 and ei + 1 < len(node_path) - 1:
-        next_key   = (node_path[ei + 1], node_path[ei + 2])
+    # Gate fraccional (>70%) + gate por distancia absoluta cuando la siguiente
+    # arista es rotonda: en entradas cortas un tick puede saltar 65%→105% sin
+    # disparar el gate del 70%, dejando solapar a dos coches en la transición.
+    if ei + 1 < len(node_path) - 1:
         next_attrs = graph.get_edge_attributes(node_path[ei + 1], node_path[ei + 2])
-        next_edge_len = max(float(next_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
-        candidates_next = edge_index.get(next_key, [])
-        if candidates_next:
-            # El que tiene menor progress está más cerca del inicio → el que más molesta.
-            # Ignoramos carril porque al cambiar de arista el lane se reasigna,
-            # y queremos una estimación conservadora para evitar overlaps en la transición.
-            first_on_next = min(candidates_next, key=lambda v: v.progress_on_edge)
-            if first_on_next.id != vehicle.id:
-                remaining_current = (1.0 - vehicle.progress_on_edge) * edge_len
-                dist_on_next      = first_on_next.progress_on_edge * next_edge_len
-                leader_len = getattr(first_on_next, "length_m", VEHICLE_LENGTH_M)
-                total_gap = remaining_current + dist_on_next - leader_len
-                return NeighborInfo(
-                    gap_m=max(total_gap, 0.01),
-                    velocity_ms=first_on_next.velocity,
-                    leader_id=first_on_next.id,
-                )
+        remaining_current_m = (1.0 - vehicle.progress_on_edge) * edge_len
+        distance_gate = (
+            bool(next_attrs.get(ATTR_IS_ROUNDABOUT))
+            and remaining_current_m < LOOKAHEAD_ROUNDABOUT_TRIGGER_M
+        )
+        if vehicle.progress_on_edge > 0.70 or distance_gate:
+            next_key = (node_path[ei + 1], node_path[ei + 2])
+            next_edge_len = max(float(next_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
+            candidates_next = edge_index.get(next_key, [])
+            if candidates_next:
+                # El que tiene menor progress está más cerca del inicio → el que más molesta.
+                # Ignoramos carril porque al cambiar de arista el lane se reasigna,
+                # y queremos una estimación conservadora para evitar overlaps en la transición.
+                first_on_next = min(candidates_next, key=lambda v: v.progress_on_edge)
+                if first_on_next.id != vehicle.id:
+                    dist_on_next = first_on_next.progress_on_edge * next_edge_len
+                    leader_len = getattr(first_on_next, "length_m", VEHICLE_LENGTH_M)
+                    total_gap = remaining_current_m + dist_on_next - leader_len
+                    return NeighborInfo(
+                        gap_m=max(total_gap, 0.01),
+                        velocity_ms=first_on_next.velocity,
+                        leader_id=first_on_next.id,
+                    )
 
     return None
+
+
+def _build_ring_occupancy(
+    vehicles: dict[str, SimVehicle],
+    graph: RoadNetworkGraph,
+) -> dict[int, list[SimVehicle]]:
+    """
+    Índice {rotunda_id → vehículos que circulan actualmente en ese anillo}.
+
+    Se precomputa una vez por tick y lo reutiliza `_find_roundabout_yield_leader`
+    para evitar recorrer todas las aristas de la rotonda en cada candidato a
+    entrar.
+    """
+    occ: dict[int, list[SimVehicle]] = {}
+    for v in vehicles.values():
+        if v.status == VehicleStatus.FINISHED:
+            continue
+        np_ = v.route.node_path
+        ei = v.current_edge_index
+        if ei >= len(np_) - 1:
+            continue
+        attrs = graph.get_edge_attributes(np_[ei], np_[ei + 1])
+        if not attrs.get(ATTR_IS_ROUNDABOUT):
+            continue
+        rid = attrs.get(ATTR_ROUNDABOUT_ID)
+        if rid is None:
+            continue
+        occ.setdefault(int(rid), []).append(v)
+    return occ
+
+
+def _build_entry_arm_index(
+    vehicles: dict[str, SimVehicle],
+    graph: RoadNetworkGraph,
+) -> dict[int, list[SimVehicle]]:
+    """
+    Índice {entry_node_id → vehículos que se aproximan a esa línea de entrada
+    desde una arista exterior al anillo}.
+
+    Un vehículo se considera "aproximándose" cuando:
+      - su arista actual NO es de rotonda;
+      - su arista siguiente SÍ es de rotonda;
+      - la distancia restante hasta el nodo de entrada < ENTRY_ARBITRATION_ZONE_M.
+
+    Se precomputa una vez por tick y lo usa `_find_roundabout_yield_leader` para
+    arbitrar entre brazos convergentes (varios vehículos apuntando al mismo
+    entry_node deben entrar uno a uno).
+    """
+    arms: dict[int, list[SimVehicle]] = {}
+    for v in vehicles.values():
+        if v.status == VehicleStatus.FINISHED:
+            continue
+        np_ = v.route.node_path
+        ei = v.current_edge_index
+        if ei + 2 > len(np_) - 1:
+            continue
+        cur = graph.get_edge_attributes(np_[ei], np_[ei + 1])
+        if cur.get(ATTR_IS_ROUNDABOUT):
+            continue
+        nxt = graph.get_edge_attributes(np_[ei + 1], np_[ei + 2])
+        if not nxt.get(ATTR_IS_ROUNDABOUT):
+            continue
+        edge_len = max(float(cur.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
+        dist_to_ring = (1.0 - v.progress_on_edge) * edge_len
+        if dist_to_ring > ENTRY_ARBITRATION_ZONE_M:
+            continue
+        arms.setdefault(np_[ei + 1], []).append(v)
+    return arms
+
+
+def _arc_distance_on_ring(
+    v: SimVehicle,
+    entry_node: int,
+    graph: RoadNetworkGraph,
+) -> float:
+    """
+    Estima la distancia angular (en metros) del vehículo `v` al nodo `entry_node`
+    siguiendo el sentido de circulación de la rotonda.
+
+    Aproximación pragmática: suma `remaining_on_edge` + longitudes de aristas
+    posteriores de la ruta del vehículo hasta alcanzar `entry_node` (o tope).
+    Si la ruta del vehículo no pasa por la entrada, devuelve inf (no relevante
+    para esta entrada).
+    """
+    np_ = v.route.node_path
+    ei = v.current_edge_index
+    if ei >= len(np_) - 1:
+        return float("inf")
+
+    attrs = graph.get_edge_attributes(np_[ei], np_[ei + 1])
+    edge_len = max(float(attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
+    arc = (1.0 - v.progress_on_edge) * edge_len
+
+    # Si el vehículo ya está en la arista que termina en entry_node, estamos listos.
+    if np_[ei + 1] == entry_node:
+        return arc
+
+    # Recorrer aristas sucesivas — sólo las que siguen siendo anillo.
+    for j in range(ei + 1, len(np_) - 1):
+        a2 = graph.get_edge_attributes(np_[j], np_[j + 1])
+        if not a2.get(ATTR_IS_ROUNDABOUT):
+            break
+        arc += float(a2.get(ATTR_LENGTH, 0.0))
+        if np_[j + 1] == entry_node:
+            return arc
+    return float("inf")
+
+
+def _find_roundabout_yield_leader(
+    vehicle: SimVehicle,
+    graph: RoadNetworkGraph,
+    ring_occupancy: dict[int, list[SimVehicle]],
+    entry_arms: dict[int, list[SimVehicle]],
+) -> NeighborInfo | None:
+    """
+    Genera un "líder virtual" parado en la línea de entrada de la rotonda.
+
+    Dispara en dos casos:
+      1. Un vehículo ya circulando en el anillo llegará antes que el ego al nodo
+         de entrada (regla de ceda-el-paso clásica).
+      2. Otro vehículo se aproxima al MISMO entry_node desde otra arista
+         convergente y está más cerca — arbitración cross-arm para evitar que
+         dos coches crucen la línea a la vez y se solapen en el primer arco.
+
+    Solo se evalúa para vehículos fuera del anillo cuya siguiente arista es
+    rotonda y están dentro de YIELD_DETECTION_ZONE_M de la línea de entrada.
+
+    El líder virtual hace que el IDM frene hasta parar en la línea. Cuando el
+    conflicto se aleja, el leader desaparece y el IDM acelera de nuevo.
+    """
+    np_ = vehicle.route.node_path
+    ei = vehicle.current_edge_index
+    if ei + 2 > len(np_) - 1:  # no hay "arista siguiente"
+        return None
+
+    cur = graph.get_edge_attributes(np_[ei], np_[ei + 1])
+    if cur.get(ATTR_IS_ROUNDABOUT):
+        return None  # ya dentro del anillo
+
+    nxt = graph.get_edge_attributes(np_[ei + 1], np_[ei + 2])
+    if not nxt.get(ATTR_IS_ROUNDABOUT):
+        return None  # no va a entrar en rotonda
+
+    rid = nxt.get(ATTR_ROUNDABOUT_ID)
+    if rid is None:
+        return None
+
+    edge_len = max(float(cur.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
+    dist_to_ring = (1.0 - vehicle.progress_on_edge) * edge_len
+    if dist_to_ring > YIELD_DETECTION_ZONE_M:
+        return None
+
+    entry_node = np_[ei + 1]
+
+    # ── (1) Vehículos ya circulando: regla de ceda clásica ─────────────────────
+    must_yield = False
+    for other in ring_occupancy.get(int(rid), ()):
+        if other.id == vehicle.id:
+            continue
+        # `_arc_distance_on_ring` respeta la direccionalidad del anillo y
+        # devuelve inf si la ruta del otro no pasa por nuestro entry_node.
+        arc = _arc_distance_on_ring(other, entry_node, graph)
+        if math.isinf(arc):
+            continue
+        # Con `other.velocity` muy baja el TTC crece — tope inferior 1 m/s evita
+        # generar leaders perpetuos cuando alguien circula a paso de humano.
+        ttc = arc / max(other.velocity, 1.0)
+        if ttc < YIELD_TTC_THRESHOLD_S or arc < YIELD_GAP_MIN_M:
+            must_yield = True
+            break
+
+    # ── (2) Arbitración cross-arm: gana el más cercano al entry_node ──────────
+    # Determinista: tie-break por `vehicle.id` (UUID estable). El perdedor cede.
+    if not must_yield:
+        contenders = entry_arms.get(entry_node, ())
+        if len(contenders) > 1:
+            def _remaining(v: SimVehicle) -> tuple[float, str]:
+                v_np = v.route.node_path
+                v_ei = v.current_edge_index
+                attrs = graph.get_edge_attributes(v_np[v_ei], v_np[v_ei + 1])
+                el = max(float(attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
+                return ((1.0 - v.progress_on_edge) * el, v.id)
+            winner = min(contenders, key=_remaining)
+            if winner.id != vehicle.id:
+                must_yield = True
+
+    if not must_yield:
+        return None
+
+    # Líder virtual: parado en la línea de entrada. El IDM frenará para no
+    # cruzarlo. Gap = distancia a la línea menos un margen de seguridad.
+    gap = max(dist_to_ring - 0.5, 0.2)
+    return NeighborInfo(gap_m=gap, velocity_ms=0.0, leader_id=None)
+
+
+# ---------------------------------------------------------------------------
+# Curvature-based speed cap (Fase 4)
+# ---------------------------------------------------------------------------
+
+def _curvature_radius_m(
+    waypoints: list[tuple[float, float]],
+) -> float:
+    """
+    Estima el radio de curvatura (metros) del polyline tomando 3 waypoints
+    equidistantes (primero, medio, último). Si no hay tres puntos distinguibles,
+    devuelve inf (tratado como recta).
+    """
+    if len(waypoints) < 3:
+        return float("inf")
+    p1 = waypoints[0]
+    p2 = waypoints[len(waypoints) // 2]
+    p3 = waypoints[-1]
+
+    # Proyección local equirectangular alrededor de p1 (metros relativos).
+    cos_lat = math.cos(math.radians(p1[1]))
+    x1, y1 = 0.0, 0.0
+    x2 = (p2[0] - p1[0]) * cos_lat * 111_320.0
+    y2 = (p2[1] - p1[1]) * 111_320.0
+    x3 = (p3[0] - p1[0]) * cos_lat * 111_320.0
+    y3 = (p3[1] - p1[1]) * 111_320.0
+
+    # Fórmula del circunradio por 3 puntos.
+    a = math.hypot(x2 - x1, y2 - y1)
+    b = math.hypot(x3 - x2, y3 - y2)
+    c = math.hypot(x3 - x1, y3 - y1)
+    s = (a + b + c) * 0.5
+    area_sq = max(s * (s - a) * (s - b) * (s - c), 0.0)
+    area = math.sqrt(area_sq)
+    if area < 1e-6:
+        return float("inf")  # colineales → recta
+    R = (a * b * c) / (4.0 * area)
+    return max(R, MIN_ROUNDABOUT_RADIUS_M)
+
+
+def _edge_curvature_vmax(
+    edge_attrs: dict,
+    lateral_accel_max_ms2: float = CURVE_LATERAL_ACCEL_MAX_MS2,
+) -> float:
+    """
+    Velocidad máxima segura según la curvatura del tramo (m/s).
+
+    v_max = sqrt(a_lat_max * R).
+
+    Se cachea en `edge_attrs[ATTR_CURVE_VMAX]` porque la geometría de la arista
+    es inmutable tras cargarla al grafo. Los tramos rectos devuelven inf.
+    """
+    cached = edge_attrs.get(ATTR_CURVE_VMAX)
+    if cached is not None:
+        return float(cached)
+    waypoints = edge_attrs.get(ATTR_WAYPOINTS) or []
+    R = _curvature_radius_m(waypoints)
+    if math.isinf(R):
+        v_max = float("inf")
+    else:
+        v_max = math.sqrt(lateral_accel_max_ms2 * R)
+    edge_attrs[ATTR_CURVE_VMAX] = v_max
+    return v_max
 
 
 def _build_lane_context(
@@ -415,6 +695,11 @@ def _evaluate_lane_change(
 
     key = (node_path[ei], node_path[ei + 1])
     edge_attrs = graph.get_edge_attributes(*key)
+    # Dentro del anillo de una rotonda no cambiamos de carril: los cambios
+    # provocan trayectorias cruzadas y colisiones en la curvatura. MOBIL se
+    # ejecuta solo en tramos rectos/aproximaciones.
+    if edge_attrs.get(ATTR_IS_ROUNDABOUT):
+        return
     n_lanes = max(int(edge_attrs.get(ATTR_LANES, 1)), 1)
     if n_lanes <= 1:
         return
@@ -551,6 +836,92 @@ def _check_traffic_light(
 
 
 # ---------------------------------------------------------------------------
+# STOP / YIELD sign checks (Fase 7.1)
+# ---------------------------------------------------------------------------
+
+def _node_type_of(graph: RoadNetworkGraph, node_id: int) -> str | None:
+    attrs = graph.get_node_attributes(node_id)
+    raw = attrs.get(ATTR_NODE_TYPE)
+    if raw is None:
+        return None
+    if isinstance(raw, NodeType):
+        return raw.value
+    return str(raw)
+
+
+def _check_stop_yield_sign(
+    vehicle: SimVehicle,
+    graph: RoadNetworkGraph,
+    edge_index: dict[tuple[int, int], list[SimVehicle]],
+    dt: float,
+) -> NeighborInfo | None:
+    """Genera un líder virtual ante STOP / YIELD en el end_node de la arista.
+
+    STOP:
+      - Mientras el vehículo no haya dwelled (velocidad < STOP_SIGN_DWELL_SPEED_MS
+        durante STOP_SIGN_DWELL_TIME_S) frente a este nodo, genera un líder
+        estático en la línea de stop (v=0).
+      - Una vez cumplido el dwell (`stop_sign_cleared_node == end_node`),
+        libera el paso para este nodo. Se resetea al avanzar a otra arista.
+
+    YIELD:
+      - Líder virtual solo si se detecta un vehículo convergiendo por otra
+        rama al mismo nodo con TTC < YIELD_SIGN_TTC_S o gap < YIELD_SIGN_GAP_MIN_M.
+      - No exige parada; si la intersección está libre, pasa sin frenar.
+    """
+    node_path = vehicle.route.node_path
+    ei = vehicle.current_edge_index
+    if ei >= len(node_path) - 1:
+        return None
+
+    start_node = node_path[ei]
+    end_node = node_path[ei + 1]
+
+    # Reset del flag de STOP cumplido cuando cambiamos de arista objetivo.
+    if vehicle.stop_sign_cleared_node != -1 and vehicle.stop_sign_cleared_node != end_node:
+        vehicle.stop_sign_cleared_node = -1
+        vehicle.stop_sign_dwell_timer = 0.0
+
+    node_kind = _node_type_of(graph, end_node)
+    if node_kind not in (NodeType.STOP_SIGN.value, NodeType.YIELD_SIGN.value):
+        return None
+
+    edge_attrs = graph.get_edge_attributes(start_node, end_node)
+    edge_len = max(float(edge_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
+    dist_to_sign = edge_len * (1.0 - vehicle.progress_on_edge)
+    if dist_to_sign > SIGN_DETECTION_ZONE_M:
+        return None
+
+    if node_kind == NodeType.STOP_SIGN.value:
+        # Dwell tracking: acumulamos tiempo con velocidad muy baja cerca del nodo.
+        if dist_to_sign < 2.0 and vehicle.velocity < STOP_SIGN_DWELL_SPEED_MS:
+            vehicle.stop_sign_dwell_timer += dt
+            if vehicle.stop_sign_dwell_timer >= STOP_SIGN_DWELL_TIME_S:
+                vehicle.stop_sign_cleared_node = end_node
+        if vehicle.stop_sign_cleared_node == end_node:
+            return None  # ya paró
+        gap = max(dist_to_sign - VEHICLE_LENGTH_M, 0.01)
+        return NeighborInfo(gap_m=gap, velocity_ms=0.0)
+
+    # YIELD: ceder a tráfico que converge al mismo nodo por otra arista.
+    for (u, w), others in edge_index.items():
+        if w != end_node or (u == start_node and w == end_node):
+            continue
+        other_attrs = graph.get_edge_attributes(u, w)
+        other_len = max(float(other_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
+        for other in others:
+            if other.id == vehicle.id:
+                continue
+            dist_other_to_node = other_len * (1.0 - other.progress_on_edge)
+            ttc = dist_other_to_node / max(other.velocity, 1.0)
+            if ttc < YIELD_SIGN_TTC_S or dist_other_to_node < YIELD_SIGN_GAP_MIN_M:
+                gap = max(dist_to_sign - VEHICLE_LENGTH_M, 0.2)
+                return NeighborInfo(gap_m=gap, velocity_ms=0.0)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # IDM advance
 # ---------------------------------------------------------------------------
 
@@ -599,6 +970,16 @@ def _advance_vehicle_idm(
 
     # Velocidad deseada individual, acotada al límite de la vía actual
     desired_v = min(getattr(vehicle, "desired_speed_ms", v_max), v_max)
+
+    # Velocidad máxima por curvatura del tramo (rotondas y curvas cerradas).
+    # Se cachea en el edge_attrs. Si hay perfil con lateral_accel_max,
+    # usar ese; si no, el default global.
+    lateral_cap = CURVE_LATERAL_ACCEL_MAX_MS2
+    profile = PROFILES.get(getattr(vehicle, "vtype", VehicleType.CAR))
+    if profile is not None:
+        lateral_cap = float(getattr(profile, "lateral_accel_max_ms2", lateral_cap))
+    curve_vmax = _edge_curvature_vmax(edge_attrs, lateral_cap)
+    desired_v = min(desired_v, curve_vmax)
 
     # ── IDM acceleration ───────────────────────────────────────────────────────
     idm = _idm_for(vehicle)
@@ -704,6 +1085,9 @@ def _advance_vehicle_idm(
                 outgoing_wps, 1.0, _cache_key=(start_n, end_n)
             )
             vehicle.prev_edge_end_heading = end_heading
+            vehicle.prev_edge_was_roundabout = bool(
+                edge_attrs.get(ATTR_IS_ROUNDABOUT)
+            )
             ei                       += 1
             vehicle.progress_on_edge  = 0.0
             # Al entrar en la nueva arista, clampear el carril a su número de
@@ -745,20 +1129,25 @@ def _advance_vehicle_idm(
     )
 
     # ── Blend de tangentes entre aristas ──────────────────────────────────────
-    # Durante los primeros EDGE_HEADING_BLEND_DIST_M metros de una arista
-    # entrante, mezclamos la tangente final de la saliente con la actual.
-    # Así el cliente ve un giro continuo en vez de un snap instantáneo.
+    # Durante los primeros `blend_dist` metros de una arista entrante,
+    # mezclamos la tangente final de la saliente con la actual. Así el
+    # cliente ve un giro continuo en vez de un snap instantáneo. A la salida
+    # de una rotonda usamos una zona más larga para evitar cortes bruscos.
     if vehicle.prev_edge_end_heading >= 0.0:
         cur_edge_len = max(float(edge_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
         pos_on_edge_m = vehicle.progress_on_edge * cur_edge_len
-        if pos_on_edge_m < EDGE_HEADING_BLEND_DIST_M:
-            blend_t = pos_on_edge_m / EDGE_HEADING_BLEND_DIST_M
+        blend_dist = EDGE_HEADING_BLEND_DIST_M
+        if getattr(vehicle, "prev_edge_was_roundabout", False):
+            blend_dist = EDGE_HEADING_BLEND_DIST_ROUNDABOUT_EXIT_M
+        if pos_on_edge_m < blend_dist:
+            blend_t = pos_on_edge_m / blend_dist
             heading = _blend_heading_deg(
                 vehicle.prev_edge_end_heading, heading, blend_t
             )
         else:
             # Ya fuera de la zona de mezcla: limpiar el estado.
             vehicle.prev_edge_end_heading = -1.0
+            vehicle.prev_edge_was_roundabout = False
 
     vehicle.longitude = lon
     vehicle.latitude  = lat
@@ -774,25 +1163,29 @@ def _advance_vehicle_idm(
 def _trigger_collision(
     v1: SimVehicle,
     v2: SimVehicle,
-    blocked_edges: set[tuple[int, int]],
+    blocked_edges: dict[tuple[int, int], object | None],
 ) -> None:
     """
-    Marca dos vehículos como colisionados y bloquea el tramo donde ocurrió.
+    Marca dos vehículos como colisionados y bloquea el tramo indefinidamente.
 
-    Ambos vehículos se detienen durante COLLISION_DURATION_S segundos,
-    bloqueando el tráfico detrás de ellos. La arista queda marcada como
-    bloqueada para que A* la evite en rutas futuras.
+    Comportamiento de gemelo digital: el choque NO se auto-limpia. Los dos
+    vehículos se quedan en estado COLLISION (v=0) y la arista queda en
+    ``blocked_edges`` con valor ``None`` (bloqueo permanente) hasta que el
+    operador los retire por API (``/simulation/vehicles/{id}/clear-collision``).
+    A* los evita multiplicando su peso por BLOCKED_EDGE_PENALTY_FACTOR en vez
+    de excluirlas, para no perder conectividad cuando no hay alternativa.
     """
     for v in (v1, v2):
         v.status = VehicleStatus.COLLISION
         v.velocity = 0.0
-        v.collision_timer = COLLISION_DURATION_S
+        v.acceleration = 0.0
+        v.collision_timer = 0.0  # sin timer — limpiado por API
 
     # Bloquear el tramo de la arista donde ocurrió la colisión (usando v1)
     np_ = v1.route.node_path
     ei = v1.current_edge_index
     if ei < len(np_) - 1:
-        blocked_edges.add((np_[ei], np_[ei + 1]))
+        blocked_edges[(np_[ei], np_[ei + 1])] = None
 
 
 def update_vehicles(
@@ -800,7 +1193,7 @@ def update_vehicles(
     graph: RoadNetworkGraph,
     dt: float,
     tl_controller: object | None = None,
-    blocked_edges: set[tuple[int, int]] | None = None,
+    blocked_edges: dict[tuple[int, int], object | None] | None = None,
 ) -> list[str]:
     """
     Avanza todos los vehículos activos a lo largo de sus rutas usando IDM.
@@ -811,28 +1204,29 @@ def update_vehicles(
         dt:            Intervalo de tiempo en segundos.
         tl_controller: TrafficLightController (opcional). Si se pasa, los
                        vehículos frenan ante semáforos en rojo/amarillo.
-        blocked_edges: Conjunto de aristas bloqueadas por colisiones (modificado
-                       in-place cuando se detecta una nueva colisión).
+        blocked_edges: Mapa de aristas bloqueadas por colisiones (modificado
+                       in-place cuando se detecta una nueva colisión). Valor
+                       ``None`` = bloqueo permanente (retirada manual por API).
 
     Returns:
-        Lista de vehicle_ids que terminaron su ruta en este tick (incluye
-        vehículos que completan ruta Y vehículos cuyo timer de colisión expira).
+        Lista de vehicle_ids que terminaron su ruta en este tick.
     """
     if blocked_edges is None:
-        blocked_edges = set()
+        blocked_edges = {}
 
-    edge_index   = _build_edge_index(vehicles)
+    edge_index = _build_edge_index(vehicles)
+    ring_occupancy = _build_ring_occupancy(vehicles, graph)
+    entry_arms = _build_entry_arm_index(vehicles, graph)
     finished_ids: list[str] = []
 
     for vehicle in list(vehicles.values()):
         if vehicle.status == VehicleStatus.FINISHED:
             continue
 
-        # Vehículos en colisión: decrementar timer, eliminar cuando expira
+        # Vehículos en colisión: NO se auto-limpian (retirada manual por API).
+        # Se dejan en place con v=0 hasta que el operador llame al endpoint.
         if vehicle.status == VehicleStatus.COLLISION:
-            vehicle.collision_timer = getattr(vehicle, "collision_timer", 0.0) - dt
-            if vehicle.collision_timer <= 0.0:
-                finished_ids.append(vehicle.id)
+            vehicle.velocity = 0.0
             continue
 
         # Vehículos pausados manualmente: no se mueven
@@ -842,12 +1236,18 @@ def update_vehicles(
         if vehicle.status == VehicleStatus.IDLE:
             vehicle.status = VehicleStatus.MOVING
 
-        # Determinar el líder más restrictivo (vehículo o semáforo)
+        # Determinar el líder más restrictivo (vehículo, semáforo, yield-rotonda o señal).
         leader = _find_leader(vehicle, edge_index, graph)
         if tl_controller is not None:
             tl_leader = _check_traffic_light(vehicle, graph, tl_controller)
             if tl_leader is not None and (leader is None or tl_leader.gap_m < leader.gap_m):
                 leader = tl_leader
+        yield_leader = _find_roundabout_yield_leader(vehicle, graph, ring_occupancy, entry_arms)
+        if yield_leader is not None and (leader is None or yield_leader.gap_m < leader.gap_m):
+            leader = yield_leader
+        sign_leader = _check_stop_yield_sign(vehicle, graph, edge_index, dt)
+        if sign_leader is not None and (leader is None or sign_leader.gap_m < leader.gap_m):
+            leader = sign_leader
 
         # MOBIL: evaluar cambio de carril cada MOBIL_EVAL_INTERVAL_TICKS ticks
         # (el cooldown está escalonado al spawnear para repartir carga).
@@ -857,11 +1257,40 @@ def update_vehicles(
         else:
             vehicle.mobil_cooldown_ticks -= 1
 
-        # Detección determinista de colisiones: gap pequeño SOSTENIDO > umbral temporal
+        # Umbral de gap diferenciado según el tramo: en rotonda toleramos
+        # gaps mayores antes de declarar choque (curvatura y waypoints).
+        np_ = vehicle.route.node_path
+        ei = vehicle.current_edge_index
+        in_roundabout = False
+        if ei < len(np_) - 1:
+            cur_attrs = graph.get_edge_attributes(np_[ei], np_[ei + 1])
+            in_roundabout = bool(cur_attrs.get(ATTR_IS_ROUNDABOUT))
+        gap_threshold = (
+            COLLISION_GAP_THRESHOLD_ROUNDABOUT_M
+            if in_roundabout
+            else COLLISION_GAP_THRESHOLD_STRAIGHT_M
+        )
+
+        # Detección determinista de colisiones: gap pequeño SOSTENIDO + velocidad
+        # relativa real (evita falsos positivos entre dos vehículos parados).
+        rel_speed = 0.0
+        if leader is not None:
+            rel_speed = abs(vehicle.velocity - leader.velocity_ms)
+        # Solapamiento geométrico con ambos vehículos efectivamente parados:
+        # el sentinel de _find_leader devuelve gap_m=0.01 cuando hay overlap.
+        # Sin este flag, `rel_speed==0` impedía detectar stacks permanentes.
+        is_geometric_overlap = (
+            leader is not None
+            and leader.leader_id is not None
+            and leader.gap_m <= 0.05
+            and leader.velocity_ms == 0.0
+            and vehicle.velocity <= 0.2
+        )
         too_close = (
             leader is not None
             and leader.leader_id is not None
-            and leader.gap_m < COLLISION_GAP_THRESHOLD_M
+            and leader.gap_m < gap_threshold
+            and (rel_speed >= COLLISION_RELATIVE_SPEED_MIN_MS or is_geometric_overlap)
             and vehicle.status == VehicleStatus.MOVING
         )
         if too_close:
@@ -1079,7 +1508,7 @@ async def update_vehicles_parallel(
     graph: "RoadNetworkGraph",          # type: ignore[name-defined]
     dt: float,
     tl_controller: object | None = None,
-    blocked_edges: "set[tuple[int, int]] | None" = None,
+    blocked_edges: "dict[tuple[int, int], object | None] | None" = None,
 ) -> list[str]:
     """
     Avanza todos los vehículos usando todos los cores disponibles.
@@ -1109,10 +1538,10 @@ async def update_vehicles_parallel(
         # La detección requiere el estado global de todos los vehículos,
         # por lo que no puede delegarse a workers independientes.
         if blocked_edges is None:
-            blocked_edges = set()
+            blocked_edges = {}
 
-        # Manejar vehículos en COLLISION / PAUSED antes del IDM: decrementar
-        # timers, marcar finalizados, y excluirlos del despacho a workers.
+        # Vehículos en COLLISION se quedan en place (retirada manual por API).
+        # PAUSED y FINISHED se excluyen del despacho a workers. IDLE → MOVING.
         pre_finished: list[str] = []
         active_vehicles: dict[str, SimVehicle] = {}
         for v in vehicles.values():
@@ -1120,10 +1549,8 @@ async def update_vehicles_parallel(
                 pre_finished.append(v.id)
                 continue
             if v.status == VehicleStatus.COLLISION:
-                v.collision_timer = getattr(v, "collision_timer", 0.0) - dt
-                if v.collision_timer <= 0.0:
-                    pre_finished.append(v.id)
-                continue  # colisionados no se despachan
+                v.velocity = 0.0
+                continue  # permanece hasta retirada manual
             if v.status == VehicleStatus.PAUSED:
                 continue
             if v.status == VehicleStatus.IDLE:
@@ -1131,6 +1558,8 @@ async def update_vehicles_parallel(
             active_vehicles[v.id] = v
 
         edge_index = _build_edge_index(active_vehicles)
+        ring_occupancy = _build_ring_occupancy(active_vehicles, graph)
+        entry_arms = _build_entry_arm_index(active_vehicles, graph)
         vehicle_list = list(active_vehicles.values())
 
         leaders: dict[str, NeighborInfo | None] = {}
@@ -1141,12 +1570,34 @@ async def update_vehicles_parallel(
                 tl_ldr = _check_traffic_light(v, graph, tl_controller)
                 if tl_ldr is not None and (ldr is None or tl_ldr.gap_m < ldr.gap_m):
                     ldr = tl_ldr
+            yield_ldr = _find_roundabout_yield_leader(v, graph, ring_occupancy, entry_arms)
+            if yield_ldr is not None and (ldr is None or yield_ldr.gap_m < ldr.gap_m):
+                ldr = yield_ldr
+            sign_ldr = _check_stop_yield_sign(v, graph, edge_index, dt)
+            if sign_ldr is not None and (ldr is None or sign_ldr.gap_m < ldr.gap_m):
+                ldr = sign_ldr
 
-            # Detección determinista de colisiones en el proceso principal
+            # Umbral contextual (rotonda vs recto) + velocidad relativa mínima.
+            np_ = v.route.node_path
+            ei = v.current_edge_index
+            in_round = False
+            if ei < len(np_) - 1:
+                cur_attrs = graph.get_edge_attributes(np_[ei], np_[ei + 1])
+                in_round = bool(cur_attrs.get(ATTR_IS_ROUNDABOUT))
+            gap_threshold = (
+                COLLISION_GAP_THRESHOLD_ROUNDABOUT_M
+                if in_round
+                else COLLISION_GAP_THRESHOLD_STRAIGHT_M
+            )
+            rel_speed = 0.0
+            if ldr is not None:
+                rel_speed = abs(v.velocity - ldr.velocity_ms)
+
             too_close = (
                 ldr is not None
                 and ldr.leader_id is not None
-                and ldr.gap_m < COLLISION_GAP_THRESHOLD_M
+                and ldr.gap_m < gap_threshold
+                and rel_speed >= COLLISION_RELATIVE_SPEED_MIN_MS
                 and v.status == VehicleStatus.MOVING
             )
             if too_close:

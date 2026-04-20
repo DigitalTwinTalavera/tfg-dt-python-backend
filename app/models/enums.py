@@ -16,6 +16,8 @@ class NodeType(str, Enum):
     DEAD_END = "dead_end"
     ENTRY_POINT = "entry_point"
     EXIT_POINT = "exit_point"
+    STOP_SIGN = "stop_sign"
+    YIELD_SIGN = "yield_sign"
 
 
 class RoadType(str, Enum):

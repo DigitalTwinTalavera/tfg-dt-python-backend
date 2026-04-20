@@ -29,6 +29,7 @@ from app.core.constants import (
     IDX_EDGES_END_NODE,
     IDX_EDGES_GEOMETRY,
     IDX_EDGES_ROAD_TYPE,
+    IDX_EDGES_ROUNDABOUT,
     IDX_EDGES_START_NODE,
     IDX_NODES_ACTIVE,
     IDX_NODES_POSITION,
@@ -159,6 +160,12 @@ class EdgeModel(Base):
     one_way: Mapped[bool] = mapped_column(
         Boolean, default=DEFAULT_ONE_WAY, nullable=False
     )
+    is_roundabout: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    roundabout_id: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True
+    )
     is_active: Mapped[bool] = mapped_column(
         Boolean, default=DEFAULT_IS_ACTIVE, nullable=False
     )
@@ -187,6 +194,7 @@ class EdgeModel(Base):
         Index(IDX_EDGES_START_NODE, start_node_id),
         Index(IDX_EDGES_END_NODE, end_node_id),
         Index(IDX_EDGES_ACTIVE, is_active),
+        Index(IDX_EDGES_ROUNDABOUT, roundabout_id),
     )
 
     def __repr__(self) -> str:

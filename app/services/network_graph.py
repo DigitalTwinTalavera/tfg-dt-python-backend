@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import (
     ATTR_EDGE_ID,
+    ATTR_IS_ROUNDABOUT,
     ATTR_LANES,
     ATTR_LATITUDE,
     ATTR_LENGTH,
@@ -31,8 +32,10 @@ from app.core.constants import (
     ATTR_NODE_TYPE,
     ATTR_ONE_WAY,
     ATTR_ROAD_TYPE,
+    ATTR_ROUNDABOUT_ID,
     ATTR_WAYPOINTS,
     ATTR_WEIGHT,
+    BLOCKED_EDGE_PENALTY_FACTOR,
     DEFAULT_EDGE_WEIGHT,
     GRAPH_CACHE_TTL_SECONDS,
     KMH_TO_MS,
@@ -86,6 +89,11 @@ class RoadNetworkGraph:
         self._stats: Optional[GraphStats] = None
         self._last_build_time: float = 0
         self._cache_ttl = cache_ttl
+        # Indices por rotonda — reconstruidos al final de build_from_database.
+        self._roundabout_edges: dict[int, list[tuple[int, int]]] = {}
+        self._roundabout_length: dict[int, float] = {}
+        # Pesos dinámicos (Fase 6): multiplicador aplicado a edge_weight en A*.
+        self._dynamic_weights: dict[tuple[int, int], float] = {}
 
     @property
     def graph(self) -> nx.DiGraph:
@@ -238,6 +246,8 @@ class RoadNetworkGraph:
             EdgeModel.road_type,
             EdgeModel.one_way,
             EdgeModel.lanes,
+            EdgeModel.is_roundabout,
+            EdgeModel.roundabout_id,
             ST_AsGeoJSON(EdgeModel.geometry).label("geometry_json"),
         )
 
@@ -309,6 +319,8 @@ class RoadNetworkGraph:
                 ATTR_WAYPOINTS: waypoints,
                 ATTR_MID_TLS: mid_tls_fwd,
                 ATTR_LANES: max(int(row.lanes), 1),
+                ATTR_IS_ROUNDABOUT: bool(row.is_roundabout),
+                ATTR_ROUNDABOUT_ID: row.roundabout_id,
             }
 
             # Add forward edge
@@ -326,6 +338,66 @@ class RoadNetworkGraph:
                     ATTR_MID_TLS: mid_tls_rev,
                 }
                 self._graph.add_edge(row.end_node_id, row.start_node_id, **reverse_attrs)
+
+        # Reconstruir índices por rotonda tras cargar aristas.
+        self._rebuild_roundabout_indices()
+
+    def _rebuild_roundabout_indices(self) -> None:
+        """
+        Recalcular self._roundabout_edges y self._roundabout_length a partir
+        de las aristas actualmente cargadas en el grafo. Se llama al final
+        de _load_edges.
+        """
+        self._roundabout_edges.clear()
+        self._roundabout_length.clear()
+        for u, v, attrs in self._graph.edges(data=True):
+            rid = attrs.get(ATTR_ROUNDABOUT_ID)
+            if rid is None or not attrs.get(ATTR_IS_ROUNDABOUT):
+                continue
+            self._roundabout_edges.setdefault(rid, []).append((u, v))
+            self._roundabout_length[rid] = (
+                self._roundabout_length.get(rid, 0.0)
+                + float(attrs.get(ATTR_LENGTH, 0.0))
+            )
+
+    def get_roundabout_members(self, rid: int) -> list[tuple[int, int]]:
+        """
+        Devuelve las aristas (u, v) que pertenecen a la rotonda `rid`.
+
+        Las aristas del anillo son direccionales — si la rotonda es de doble
+        carril o bidireccional (poco común en OSM) aparecen en ambos sentidos.
+        """
+        return list(self._roundabout_edges.get(rid, ()))
+
+    def get_roundabout_length(self, rid: int) -> float:
+        """Longitud total (suma de aristas, en metros) del anillo `rid`."""
+        return self._roundabout_length.get(rid, 0.0)
+
+    def iter_roundabouts(self):
+        """Itera los ids de rotondas cargadas."""
+        return iter(self._roundabout_edges.keys())
+
+    def node_lonlat(self, node_id: int) -> tuple[float, float]:
+        """
+        Devuelve (lon, lat) del nodo. Fallback (0.0, 0.0) si no existe,
+        para facilitar uso en loops sin chequeo previo.
+        """
+        if node_id not in self._graph:
+            return (0.0, 0.0)
+        attrs = self._graph.nodes[node_id]
+        return (
+            float(attrs.get(ATTR_LONGITUDE, 0.0)),
+            float(attrs.get(ATTR_LATITUDE, 0.0)),
+        )
+
+    def set_dynamic_weights(
+        self, weights_by_edge: dict[tuple[int, int], float]
+    ) -> None:
+        """
+        Aplica multiplicadores por arista al peso en A* (Fase 6).
+        El dict sobrescribe por completo los pesos previos.
+        """
+        self._dynamic_weights = dict(weights_by_edge)
 
     def get_shortest_path(
         self,
@@ -382,6 +454,8 @@ class RoadNetworkGraph:
         self,
         start: int,
         end: int,
+        *,
+        blocked_edges: Optional[dict[tuple[int, int], Any]] = None,
     ) -> list[int]:
         """
         Find the shortest path using A* with a geographic heuristic.
@@ -396,6 +470,9 @@ class RoadNetworkGraph:
         Args:
             start: Starting node ID
             end:   Ending node ID
+            blocked_edges: Mapping (u,v) → cualquier valor (None o TTL). Las
+                aristas presentes pagan BLOCKED_EDGE_PENALTY_FACTOR. No se
+                eliminan del grafo para no perder conectividad.
 
         Returns:
             List of node IDs forming the shortest path
@@ -404,6 +481,10 @@ class RoadNetworkGraph:
             nx.NetworkXNoPath: If no path exists
             nx.NodeNotFound:   If start or end is not in the graph
         """
+        if start not in self._graph:
+            raise nx.NodeNotFound(f"Source {start} is not in G")
+        if end not in self._graph:
+            raise nx.NodeNotFound(f"Target {end} is not in G")
         end_attrs = self._graph.nodes[end]
         end_lat: float = end_attrs.get(ATTR_LATITUDE, 0.0)
         end_lon: float = end_attrs.get(ATTR_LONGITUDE, 0.0)
@@ -415,14 +496,31 @@ class RoadNetworkGraph:
             dist_m = math.sqrt(dlat * dlat + dlon * dlon) * _METERS_PER_DEGREE
             return dist_m * _ASTAR_MIN_ROAD_FACTOR / _ASTAR_MAX_SPEED_MS
 
+        dynamic = self._dynamic_weights
+        blocked = blocked_edges or {}
+
+        if not dynamic and not blocked:
+            return nx.astar_path(
+                self._graph, start, end, heuristic=_heuristic, weight=ATTR_WEIGHT
+            )
+
+        def _weight(u: int, v: int, data: dict[str, Any]) -> float:
+            base = float(data.get(ATTR_WEIGHT, DEFAULT_EDGE_WEIGHT))
+            mult = dynamic.get((u, v), 1.0)
+            if (u, v) in blocked:
+                mult *= BLOCKED_EDGE_PENALTY_FACTOR
+            return base * mult
+
         return nx.astar_path(
-            self._graph, start, end, heuristic=_heuristic, weight=ATTR_WEIGHT
+            self._graph, start, end, heuristic=_heuristic, weight=_weight
         )
 
     def get_shortest_path_astar_safe(
         self,
         start: int,
         end: int,
+        *,
+        blocked_edges: Optional[dict[tuple[int, int], Any]] = None,
     ) -> Optional[list[int]]:
         """
         A* shortest path (returns None if no path exists instead of raising).
@@ -430,12 +528,17 @@ class RoadNetworkGraph:
         Args:
             start: Starting node ID
             end:   Ending node ID
+            blocked_edges: Mapping de aristas bloqueadas (valor None o TTL);
+                se penalizan por BLOCKED_EDGE_PENALTY_FACTOR en vez de
+                eliminarlas.
 
         Returns:
             List of node IDs or None if no path exists
         """
         try:
-            return self.get_shortest_path_astar(start, end)
+            return self.get_shortest_path_astar(
+                start, end, blocked_edges=blocked_edges
+            )
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             return None
 

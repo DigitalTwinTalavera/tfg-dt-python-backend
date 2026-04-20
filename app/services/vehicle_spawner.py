@@ -19,19 +19,23 @@ import networkx as nx
 
 from app.config import settings
 from app.core.constants import (
+    ATTR_IS_ROUNDABOUT,
     ATTR_LANES,
     ATTR_LATITUDE,
     ATTR_LENGTH,
     ATTR_LONGITUDE,
     ATTR_MAX_SPEED,
     ATTR_NODE_TYPE,
+    ATTR_ROUNDABOUT_ID,
     DEFAULT_MAX_SPEED_MS,
     KMH_TO_MS,
     MIN_EDGE_LENGTH_M,
+    ROUNDABOUT_SATURATION_VEH_PER_100M,
     SPAWN_INITIAL_PROGRESS_MAX,
     SPAWN_INITIAL_PROGRESS_MIN,
     SPAWN_INITIAL_VELOCITY_MAX,
     SPAWN_INITIAL_VELOCITY_MIN,
+    SPAWN_MAX_ENTRIES_PER_ROUNDABOUT_PER_TICK,
     SPAWN_SPEED_VARIANCE_MAX,
     SPAWN_SPEED_VARIANCE_MIN,
     YELLOW_BRAKE_PROBABILITY,
@@ -77,11 +81,22 @@ class SimVehicle:
     # entrante durante los primeros EDGE_HEADING_BLEND_DIST_M metros y evitar
     # un snap visible al cambiar de tramo. < 0 → sin mezcla activa.
     prev_edge_end_heading: float = -1.0
+    # True si la arista anterior era una rotonda — amplía la distancia de
+    # mezcla de heading a la salida para evitar giros abruptos.
+    prev_edge_was_roundabout: bool = False
     # Cooldown de evaluación MOBIL (ticks). Evita recalcular cambios de carril
     # en cada tick: sólo cuando el contador llega a 0 se re-evalúa, y al hacerlo
     # se resetea a MOBIL_EVAL_INTERVAL_TICKS. Inicializado vía hash(id) para
     # repartir la carga computacional entre ticks.
     mobil_cooldown_ticks: int = 0
+    # Runtime STOP/YIELD sign tracking.
+    # `stop_sign_cleared_node` guarda el ID del nodo STOP cuya parada obligatoria
+    # ya se ha cumplido; mientras coincida con el end_node actual, el vehículo
+    # puede pasar sin volver a parar. Se resetea al cambiar de arista.
+    stop_sign_cleared_node: int = -1
+    # Tiempo acumulado (s) con velocidad < STOP_SIGN_DWELL_SPEED_MS frente al
+    # STOP. Al superar STOP_SIGN_DWELL_TIME_S se marca como cumplido.
+    stop_sign_dwell_timer: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -119,7 +134,9 @@ class VehicleSpawner:
         # spawn todos los vehículos siguientes son cache-hits y el coste es O(1).
         self._route_cache: dict[tuple[int, int], RouteInfo] = {}
         self._counter_lock = threading.Lock()  # Protege _counter ante acceso concurrente
-        self.blocked_edges: set[tuple[int, int]] = set()  # edges blocked by collisions
+        # blocked_edges: mapa arista → None (bloqueo permanente, retirada manual).
+        # Se usa como penalización en A* (no elimina la arista del grafo).
+        self.blocked_edges: dict[tuple[int, int], object | None] = {}
 
     @property
     def graph(self) -> RoadNetworkGraph:
@@ -336,6 +353,26 @@ class VehicleSpawner:
         # probabilidad 1/N. max_attempts = count * 2 es más que suficiente.
         max_attempts = count * 2
 
+        # ── Coordinación de entrada en rotonda (Fase 5) ───────────────────────
+        # Precalcular ocupación por rotonda (vehículos cuya arista actual
+        # pertenece a un anillo) y contador de entradas en este batch para
+        # limitar cuántos vehículos entran a cada rotonda por tick.
+        occupancy_by_rid: dict[int, int] = {}
+        for v in self._vehicles.values():
+            if v.status == VehicleStatus.FINISHED:
+                continue
+            np_ = v.route.node_path
+            ei = v.current_edge_index
+            if ei >= len(np_) - 1:
+                continue
+            attrs = self._graph.get_edge_attributes(np_[ei], np_[ei + 1])
+            if not attrs.get(ATTR_IS_ROUNDABOUT):
+                continue
+            rid = attrs.get(ATTR_ROUNDABOUT_ID)
+            if rid is not None:
+                occupancy_by_rid[int(rid)] = occupancy_by_rid.get(int(rid), 0) + 1
+        entered_this_batch: dict[int, int] = {}
+
         for _ in range(max_attempts):
             if len(spawned) >= count:
                 break
@@ -348,12 +385,31 @@ class VehicleSpawner:
             key = (start, end)
             route = self._route_cache.get(key)
             if route is None:
-                route = compute_route(self._graph, start, end)
+                route = compute_route(
+                    self._graph, start, end, blocked_edges=self.blocked_edges
+                )
                 if route is not None:
                     self._route_cache[key] = route
 
             if route is None:
                 continue
+
+            # Rechazar si la primera rotonda de la ruta está saturada o ya
+            # aceptó una entrada en este batch.
+            first_rid = _find_first_roundabout_in_route(route, self._graph)
+            if first_rid is not None:
+                ring_len_m = self._graph.get_roundabout_length(first_rid)
+                load = occupancy_by_rid.get(first_rid, 0) / max(ring_len_m / 100.0, 1.0)
+                if load > ROUNDABOUT_SATURATION_VEH_PER_100M:
+                    continue
+                if (
+                    entered_this_batch.get(first_rid, 0)
+                    >= SPAWN_MAX_ENTRIES_PER_ROUNDABOUT_PER_TICK
+                ):
+                    continue
+                entered_this_batch[first_rid] = (
+                    entered_this_batch.get(first_rid, 0) + 1
+                )
 
             node_attrs = self._graph.get_node_attributes(start)
             # Tipo de vehículo con probabilidad según spawn_weight del perfil
@@ -533,6 +589,24 @@ def _get_first_edge_speed_kmh(route: RouteInfo, graph: "RoadNetworkGraph") -> fl
     attrs = graph.get_edge_attributes(route.node_path[0], route.node_path[1])
     speed = float(attrs.get(ATTR_MAX_SPEED, 50.0))
     return speed if speed > 0 else 50.0
+
+
+def _find_first_roundabout_in_route(
+    route: RouteInfo, graph: "RoadNetworkGraph"  # type: ignore[name-defined]
+) -> int | None:
+    """
+    Devuelve el ``roundabout_id`` de la primera rotonda que atraviesa la ruta,
+    o ``None`` si la ruta no entra en ninguna. Se usa para coordinar spawns y
+    evitar saturación concurrente en el mismo anillo.
+    """
+    np_ = route.node_path
+    for i in range(len(np_) - 1):
+        attrs = graph.get_edge_attributes(np_[i], np_[i + 1])
+        if attrs.get(ATTR_IS_ROUNDABOUT):
+            rid = attrs.get(ATTR_ROUNDABOUT_ID)
+            if rid is not None:
+                return int(rid)
+    return None
 
 
 # Pre-compute weight list to avoid re-summing on each spawn (called thousands of times).

@@ -270,6 +270,105 @@ async def reroute_vehicle(
 
 
 # =========================================================================
+# Collision management endpoints
+# =========================================================================
+
+
+@router.get("/collisions")
+async def list_collisions(
+    spawner: VehicleSpawner = Depends(get_vehicle_spawner),
+) -> dict:
+    """
+    Lista los vehículos actualmente en estado de colisión.
+
+    Para cada choque se devuelve el id del vehículo, su posición (lon/lat) y
+    la arista donde ocurrió (start/end node). El cliente (UI del operador)
+    utiliza este endpoint para mostrar un panel de incidencias y ofrecer el
+    botón de retirada manual.
+    """
+    # Emparejar los vehículos por arista compartida (asumimos 2 por choque).
+    by_edge: dict[tuple[int, int], list] = {}
+    for v in spawner.vehicles.values():
+        if v.status != VehicleStatus.COLLISION:
+            continue
+        np_ = v.route.node_path
+        ei = v.current_edge_index
+        if ei >= len(np_) - 1:
+            continue
+        by_edge.setdefault((np_[ei], np_[ei + 1]), []).append(v)
+
+    collisions: list[dict] = []
+    for (u, w), vs in by_edge.items():
+        for v in vs:
+            partner_id = next((o.id for o in vs if o.id != v.id), "")
+            collisions.append(
+                {
+                    "vehicle_id": v.id,
+                    "partner_id": partner_id,
+                    "longitude": v.longitude,
+                    "latitude": v.latitude,
+                    "edge": [u, w],
+                }
+            )
+    return {"count": len(collisions), "collisions": collisions}
+
+
+@router.post("/vehicles/{vehicle_id}/clear-collision")
+async def clear_vehicle_collision(
+    vehicle_id: str,
+    spawner: VehicleSpawner = Depends(get_vehicle_spawner),
+) -> dict:
+    """
+    Retira manualmente un vehículo colisionado (gemelo digital: simula la
+    intervención de grúa/emergencias). Si tras retirarlo ninguna otra
+    colisión comparte la misma arista, se libera el bloqueo → A* vuelve a
+    usarla sin penalización.
+    """
+    vehicle = spawner.get_vehicle(vehicle_id)
+    if vehicle is None:
+        raise HTTPException(
+            status_code=404, detail=f"Vehículo '{vehicle_id}' no encontrado"
+        )
+    if vehicle.status != VehicleStatus.COLLISION:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Vehículo '{vehicle_id}' no está en estado de colisión",
+        )
+
+    np_ = vehicle.route.node_path
+    ei = vehicle.current_edge_index
+    edge_key: tuple[int, int] | None = None
+    if ei < len(np_) - 1:
+        edge_key = (np_[ei], np_[ei + 1])
+
+    spawner.remove_vehicle(vehicle_id)
+
+    released = False
+    if edge_key is not None and edge_key in spawner.blocked_edges:
+        still_blocked = False
+        for other in spawner.vehicles.values():
+            if other.status != VehicleStatus.COLLISION:
+                continue
+            onp = other.route.node_path
+            oei = other.current_edge_index
+            if oei < len(onp) - 1 and (onp[oei], onp[oei + 1]) == edge_key:
+                still_blocked = True
+                break
+        if not still_blocked:
+            spawner.blocked_edges.pop(edge_key, None)
+            released = True
+
+    return {
+        "status": "cleared",
+        "vehicle_id": vehicle_id,
+        "edge_released": released,
+        "edge": {"start_node_id": edge_key[0], "end_node_id": edge_key[1]}
+        if edge_key
+        else None,
+    }
+
+
+# =========================================================================
 # Traffic light endpoints
 # =========================================================================
 

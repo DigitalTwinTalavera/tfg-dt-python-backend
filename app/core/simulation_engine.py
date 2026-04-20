@@ -9,11 +9,20 @@ import time
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from app.core.constants import (
+    ATTR_IS_ROUNDABOUT,
+    ATTR_ROUNDABOUT_ID,
+    DYNAMIC_WEIGHT_CHANGE_THRESHOLD,
+    DYNAMIC_WEIGHT_MAX_MULT,
+    DYNAMIC_WEIGHTS_TICK_INTERVAL,
+    ROUNDABOUT_SATURATION_VEH_PER_100M,
+)
 from app.core.exceptions import (
     SimulationAlreadyRunningError,
     SimulationNotPausedError,
     SimulationNotRunningError,
 )
+from app.models.enums import VehicleStatus
 
 if TYPE_CHECKING:
     from app.core.broadcaster import SimulationBroadcaster
@@ -317,6 +326,17 @@ class SimulationEngine:
             except Exception:
                 logger.exception("Error inesperado en update_vehicles_parallel; tick ignorado")
 
+        # 4b. Recálculo periódico de pesos dinámicos por saturación en rotondas
+        #     (Fase 6). Penaliza en A* las aristas de anillos con mucha ocupación
+        #     → los nuevos spawns evitan el embudo y las rerutas pasan por rutas
+        #     alternativas. Solo invalida la caché de rutas si algún
+        #     multiplicador cambia más de DYNAMIC_WEIGHT_CHANGE_THRESHOLD.
+        if (
+            self._spawner is not None
+            and self._tick_count % DYNAMIC_WEIGHTS_TICK_INTERVAL == 0
+        ):
+            self._recompute_dynamic_weights()
+
         # 5. Broadcast vehicle_finished + eliminar vehículos completados
         for vid in finished_ids:
             if self._broadcaster is not None:
@@ -342,6 +362,72 @@ class SimulationEngine:
             await self._broadcaster.broadcast_traffic_lights(
                 self._tl_controller.get_snapshot()
             )
+
+    def _recompute_dynamic_weights(self) -> None:
+        """
+        Recalcula multiplicadores de A* por saturación de rotondas (Fase 6).
+
+        Para cada rotonda cargada en el grafo calcula su ocupación actual
+        (vehículos cuya arista pertenezca al anillo). El multiplicador es
+        ``1 + (MAX_MULT-1) * min(load/sat, 1)^2`` (saturación cuadrática),
+        y se aplica a todas las aristas del anillo.
+
+        Si el cambio relativo respecto a los pesos previos supera
+        ``DYNAMIC_WEIGHT_CHANGE_THRESHOLD`` en alguna arista, se invalida
+        la caché de rutas del spawner → los siguientes spawns usarán los
+        pesos nuevos.
+        """
+        spawner = self._spawner
+        if spawner is None:
+            return
+        graph = spawner.graph
+
+        # Ocupación por rotonda.
+        occ: dict[int, int] = {}
+        for v in spawner.vehicles.values():
+            if v.status == VehicleStatus.FINISHED:
+                continue
+            np_ = v.route.node_path
+            ei = v.current_edge_index
+            if ei >= len(np_) - 1:
+                continue
+            attrs = graph.get_edge_attributes(np_[ei], np_[ei + 1])
+            if not attrs.get(ATTR_IS_ROUNDABOUT):
+                continue
+            rid = attrs.get(ATTR_ROUNDABOUT_ID)
+            if rid is not None:
+                occ[int(rid)] = occ.get(int(rid), 0) + 1
+
+        new_weights: dict[tuple[int, int], float] = {}
+        max_extra = DYNAMIC_WEIGHT_MAX_MULT - 1.0
+        for rid in graph.iter_roundabouts():
+            ring_len = graph.get_roundabout_length(rid)
+            if ring_len <= 0:
+                continue
+            load = occ.get(rid, 0) / max(ring_len / 100.0, 1.0)
+            ratio = min(load / ROUNDABOUT_SATURATION_VEH_PER_100M, 1.0)
+            mult = 1.0 + max_extra * (ratio * ratio)
+            if mult <= 1.0001:
+                continue  # sin penalización efectiva → no guardar
+            for edge in graph.get_roundabout_members(rid):
+                new_weights[edge] = mult
+
+        # Invalidar caché solo si algún multiplicador cambió significativamente.
+        prev = graph._dynamic_weights  # acceso interno intencional
+        invalidate = False
+        touched = set(new_weights.keys()) | set(prev.keys())
+        for e in touched:
+            old_m = prev.get(e, 1.0)
+            new_m = new_weights.get(e, 1.0)
+            if old_m == 0.0:
+                continue
+            if abs(new_m - old_m) / old_m > DYNAMIC_WEIGHT_CHANGE_THRESHOLD:
+                invalidate = True
+                break
+
+        graph.set_dynamic_weights(new_weights)
+        if invalidate:
+            spawner.clear_route_cache()
 
     async def _cancel_task(self) -> None:
         """Cancela la tarea de background si existe."""

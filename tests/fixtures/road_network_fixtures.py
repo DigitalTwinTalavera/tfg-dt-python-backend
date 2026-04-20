@@ -3,7 +3,23 @@ Sample data fixtures for road network testing.
 Based on Talavera de la Reina geographic coordinates.
 """
 
+from app.core.constants import (
+    ATTR_EDGE_ID,
+    ATTR_IS_ROUNDABOUT,
+    ATTR_LANES,
+    ATTR_LATITUDE,
+    ATTR_LENGTH,
+    ATTR_LONGITUDE,
+    ATTR_MAX_SPEED,
+    ATTR_NODE_ID,
+    ATTR_NODE_TYPE,
+    ATTR_ONE_WAY,
+    ATTR_ROUNDABOUT_ID,
+    ATTR_WAYPOINTS,
+    ATTR_WEIGHT,
+)
 from app.models.enums import NodeType, RoadType
+from app.services.network_graph import RoadNetworkGraph
 
 # Talavera de la Reina approximate center coordinates
 TALAVERA_CENTER_LON = -4.8306
@@ -174,3 +190,77 @@ def create_sample_edge_data(
         "is_active": is_active,
         "metadata_json": metadata_json,
     }
+
+
+def build_two_entry_roundabout_graph() -> RoadNetworkGraph:
+    """
+    Construye un RoadNetworkGraph mínimo con una rotonda de 3 arcos y dos brazos
+    de entrada convergentes. Pensado para tests de `_find_roundabout_yield_leader`.
+
+    Topología::
+
+        A_in (1) ──► N_A (10) ──┐
+                                 ├─► anillo N_A ► N_B ► N_C ► N_A (is_roundabout=True)
+        B_in (2) ──► N_B (11) ──┘
+                                   N_C (12) ──► A_out (20)
+
+    Todas las aristas son one-way. Anillo: 3 arcos de 10 m. Brazos de entrada:
+    20 m cada uno. Salida: 20 m.
+    """
+    rng = RoadNetworkGraph()
+    g = rng.graph
+
+    nodes = {
+        1:  (-4.830, 39.960, NodeType.ENTRY_POINT.value),   # A_in
+        2:  (-4.832, 39.960, NodeType.ENTRY_POINT.value),   # B_in
+        3:  (-4.830, 39.961, NodeType.ENTRY_POINT.value),   # C_in (converge en N_A)
+        10: (-4.831, 39.961, NodeType.ROUNDABOUT.value),    # N_A
+        11: (-4.832, 39.961, NodeType.ROUNDABOUT.value),    # N_B
+        12: (-4.831, 39.962, NodeType.ROUNDABOUT.value),    # N_C
+        20: (-4.830, 39.962, NodeType.EXIT_POINT.value),    # A_out
+    }
+    for nid, (lon, lat, ntype) in nodes.items():
+        g.add_node(
+            nid,
+            **{
+                ATTR_NODE_ID: nid,
+                ATTR_LONGITUDE: lon,
+                ATTR_LATITUDE: lat,
+                ATTR_NODE_TYPE: ntype,
+            },
+        )
+
+    def _edge(eid: int, u: int, v: int, length: float, is_ring: bool, rid: int | None):
+        lon_u, lat_u, _ = nodes[u]
+        lon_v, lat_v, _ = nodes[v]
+        g.add_edge(
+            u, v,
+            **{
+                ATTR_EDGE_ID: eid,
+                ATTR_LENGTH: length,
+                ATTR_MAX_SPEED: 30,
+                ATTR_WEIGHT: length / 30.0,
+                ATTR_ONE_WAY: True,
+                ATTR_LANES: 1,
+                ATTR_WAYPOINTS: [(lon_u, lat_u), (lon_v, lat_v)],
+                ATTR_IS_ROUNDABOUT: is_ring,
+                ATTR_ROUNDABOUT_ID: rid,
+            },
+        )
+
+    # Brazos de entrada (no-ring), 20 m cada uno.
+    # A_in y C_in convergen en N_A (test cross-arm arbitration).
+    _edge(100, 1, 10, 20.0, is_ring=False, rid=None)
+    _edge(101, 2, 11, 20.0, is_ring=False, rid=None)
+    _edge(102, 3, 10, 20.0, is_ring=False, rid=None)
+
+    # Anillo (one-way, 10 m cada arco) — sentido N_A → N_B → N_C → N_A.
+    _edge(200, 10, 11, 10.0, is_ring=True, rid=1)
+    _edge(201, 11, 12, 10.0, is_ring=True, rid=1)
+    _edge(202, 12, 10, 10.0, is_ring=True, rid=1)
+
+    # Salida desde N_C.
+    _edge(300, 12, 20, 20.0, is_ring=False, rid=None)
+
+    rng._rebuild_roundabout_indices()
+    return rng
