@@ -24,6 +24,7 @@ from app.core.constants import (
     OSM_DEFAULT_SPEED_LIMITS,
     OSM_JUNCTION_ROUNDABOUT,
     OSM_NODE_TRAFFIC_SIGNALS,
+    OSM_TAG_CROSSING,
     OSM_ONEWAY_REVERSE,
     OSM_ONEWAY_YES,
     OSM_PBF_EXTENSION,
@@ -348,6 +349,8 @@ class OSMLoader:
         tags = osm_node.tags
 
         if tags.get(OSM_TAG_HIGHWAY) == OSM_NODE_TRAFFIC_SIGNALS:
+            return NodeType.TRAFFIC_LIGHT
+        if tags.get(OSM_TAG_CROSSING) == OSM_NODE_TRAFFIC_SIGNALS:
             return NodeType.TRAFFIC_LIGHT
         if tags.get(OSM_TAG_JUNCTION) == OSM_JUNCTION_ROUNDABOUT:
             return NodeType.ROUNDABOUT

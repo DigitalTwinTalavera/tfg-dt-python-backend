@@ -18,7 +18,24 @@ from dataclasses import dataclass, field
 import networkx as nx
 
 from app.config import settings
-from app.core.constants import ATTR_LATITUDE, ATTR_LONGITUDE, ATTR_NODE_TYPE
+from app.core.constants import (
+    ATTR_LATITUDE,
+    ATTR_LENGTH,
+    ATTR_LONGITUDE,
+    ATTR_MAX_SPEED,
+    ATTR_NODE_TYPE,
+    DEFAULT_MAX_SPEED_MS,
+    KMH_TO_MS,
+    MIN_EDGE_LENGTH_M,
+    SPAWN_INITIAL_PROGRESS_MAX,
+    SPAWN_INITIAL_PROGRESS_MIN,
+    SPAWN_INITIAL_VELOCITY_MAX,
+    SPAWN_INITIAL_VELOCITY_MIN,
+    SPAWN_SPEED_VARIANCE_MAX,
+    SPAWN_SPEED_VARIANCE_MIN,
+    VEHICLE_LENGTH_M,
+    YELLOW_BRAKE_PROBABILITY,
+)
 from app.core.route import RouteInfo, compute_route
 from app.models.enums import NodeType, VehicleStatus
 from app.services.network_graph import RoadNetworkGraph
@@ -42,6 +59,10 @@ class SimVehicle:
     acceleration: float = 0.0
     heading: float = 0.0
     progress_on_edge: float = 0.0
+    desired_speed_ms: float = DEFAULT_MAX_SPEED_MS  # velocidad deseada individual (m/s)
+    yellow_runs_light: bool = False   # set at spawn: 15% True → runs yellow lights
+    collision_timer: float = 0.0      # countdown to auto-remove after collision (s)
+    proximity_timer: float = 0.0      # tiempo sostenido con gap < umbral (s)
 
     def to_dict(self) -> dict:
         return {
@@ -77,6 +98,7 @@ class VehicleSpawner:
         # spawn todos los vehículos siguientes son cache-hits y el coste es O(1).
         self._route_cache: dict[tuple[int, int], RouteInfo] = {}
         self._counter_lock = threading.Lock()  # Protege _counter ante acceso concurrente
+        self.blocked_edges: set[tuple[int, int]] = set()  # edges blocked by collisions
 
     @property
     def graph(self) -> RoadNetworkGraph:
@@ -321,6 +343,50 @@ class VehicleSpawner:
                 longitude=node_attrs.get(ATTR_LONGITUDE, 0.0),
                 latitude=node_attrs.get(ATTR_LATITUDE, 0.0),
             )
+            # Velocidad deseada individual: varianza según constante del primer tramo
+            first_edge_kmh = _get_first_edge_speed_kmh(route, self._graph)
+            desired_kmh = first_edge_kmh * random.uniform(
+                SPAWN_SPEED_VARIANCE_MIN, SPAWN_SPEED_VARIANCE_MAX
+            )
+            vehicle.desired_speed_ms = desired_kmh * KMH_TO_MS
+            # Velocidad y posición inicial distribuidas para evitar aglomeración
+            vehicle.velocity = vehicle.desired_speed_ms * random.uniform(
+                SPAWN_INITIAL_VELOCITY_MIN, SPAWN_INITIAL_VELOCITY_MAX
+            )
+            vehicle.progress_on_edge = random.uniform(
+                SPAWN_INITIAL_PROGRESS_MIN, SPAWN_INITIAL_PROGRESS_MAX
+            )
+            # Comportamiento en semáforo amarillo: 40% de vehículos lo se saltan
+            vehicle.yellow_runs_light = random.random() > YELLOW_BRAKE_PROBABILITY
+
+            # ── Spawn collision avoidance ──────────────────────────────────────
+            # Verificar que la posición de spawn no choca con vehículos existentes
+            # en la misma arista (ya spawneados en este batch + vehículos activos).
+            first_node = route.node_path[0]
+            second_node = route.node_path[1]
+            first_edge_attrs = self._graph.get_edge_attributes(first_node, second_node)
+            first_edge_len = max(
+                float(first_edge_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M
+            )
+            min_sep_progress = (VEHICLE_LENGTH_M * 2.0) / first_edge_len
+            conflict = False
+            all_candidates = list(self._vehicles.values()) + spawned
+            for existing in all_candidates:
+                if existing.status == VehicleStatus.FINISHED:
+                    continue
+                enp = existing.route.node_path
+                eei = existing.current_edge_index
+                if (
+                    eei < len(enp) - 1
+                    and enp[eei] == first_node
+                    and enp[eei + 1] == second_node
+                    and abs(existing.progress_on_edge - vehicle.progress_on_edge) < min_sep_progress
+                ):
+                    conflict = True
+                    break
+            if conflict:
+                continue  # intentar con otro par entrada/salida
+
             spawned.append(vehicle)
 
         return spawned
@@ -380,6 +446,35 @@ class VehicleSpawner:
             return True
         return False
 
+    def reroute_vehicle(self, vehicle_id: str, end_node_id: int) -> bool:
+        """
+        Recalcula la ruta de un vehículo hacia un nuevo nodo destino.
+
+        Toma como punto de partida el nodo de inicio del segmento actual
+        para que el vehículo continúe desde donde está.
+
+        Returns:
+            True si se reroute con éxito, False si el vehículo no existe
+            o no se pudo calcular la ruta.
+        """
+        vehicle = self._vehicles.get(vehicle_id)
+        if vehicle is None:
+            return False
+
+        node_path = vehicle.route.node_path
+        ei = vehicle.current_edge_index
+        start_node = node_path[ei] if ei < len(node_path) else node_path[-1]
+
+        new_route = compute_route(self._graph, start_node, end_node_id)
+        if new_route is None:
+            return False
+
+        vehicle.route = new_route
+        vehicle.end_node_id = end_node_id
+        vehicle.current_edge_index = 0
+        vehicle.progress_on_edge = 0.0
+        return True
+
 
 class VehicleLifecycleManager:
     """
@@ -419,3 +514,21 @@ class VehicleLifecycleManager:
         for vid in finished_ids:
             self._spawner.remove_vehicle(vid)
         return len(finished_ids)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _get_first_edge_speed_kmh(route: RouteInfo, graph: "RoadNetworkGraph") -> float:  # type: ignore[name-defined]
+    """
+    Devuelve la velocidad máxima (km/h) del primer tramo de una ruta.
+
+    Usado para inicializar la velocidad deseada de cada vehículo basándose
+    en el límite real de la vía donde se spawnea.
+    """
+    if len(route.node_path) < 2:
+        return 50.0
+    attrs = graph.get_edge_attributes(route.node_path[0], route.node_path[1])
+    speed = float(attrs.get(ATTR_MAX_SPEED, 50.0))
+    return speed if speed > 0 else 50.0

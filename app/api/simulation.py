@@ -9,6 +9,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from app.api.deps import get_broadcaster, get_simulation_config, get_simulation_engine, get_vehicle_spawner
+from app.core.constants import KMH_TO_MS
+from app.models.enums import VehicleStatus
 from app.core.broadcaster import SimulationBroadcaster
 from app.core.exceptions import SimulationStateError
 from app.core.simulation_config import SimulationConfig
@@ -27,6 +29,14 @@ router = APIRouter(prefix="/simulation")
 
 class SpawnRequest(BaseModel):
     count: int = Field(default=1, ge=1, le=10000, description="Número de vehículos a generar")
+
+
+class SpeedRequest(BaseModel):
+    desired_speed_kmh: float = Field(ge=0.0, le=300.0, description="Nueva velocidad deseada en km/h")
+
+
+class RerouteRequest(BaseModel):
+    end_node_id: int = Field(description="Nodo de destino para la nueva ruta")
 
 
 # =========================================================================
@@ -190,3 +200,140 @@ async def delete_vehicle(
     if not removed:
         raise HTTPException(status_code=404, detail=f"Vehículo '{vehicle_id}' no encontrado")
     return {"status": "deleted", "vehicle_id": vehicle_id}
+
+
+@router.post("/vehicles/{vehicle_id}/pause")
+async def pause_vehicle(
+    vehicle_id: str,
+    spawner: VehicleSpawner = Depends(get_vehicle_spawner),
+) -> dict:
+    """Pausa manualmente un vehículo (deja de moverse)."""
+    vehicle = spawner.get_vehicle(vehicle_id)
+    if vehicle is None:
+        raise HTTPException(status_code=404, detail=f"Vehículo '{vehicle_id}' no encontrado")
+    vehicle.status = VehicleStatus.PAUSED
+    vehicle.velocity = 0.0
+    return {"status": "paused", "vehicle_id": vehicle_id}
+
+
+@router.post("/vehicles/{vehicle_id}/resume")
+async def resume_vehicle(
+    vehicle_id: str,
+    spawner: VehicleSpawner = Depends(get_vehicle_spawner),
+) -> dict:
+    """Reanuda un vehículo pausado manualmente."""
+    vehicle = spawner.get_vehicle(vehicle_id)
+    if vehicle is None:
+        raise HTTPException(status_code=404, detail=f"Vehículo '{vehicle_id}' no encontrado")
+    if vehicle.status != VehicleStatus.PAUSED:
+        raise HTTPException(status_code=409, detail=f"Vehículo '{vehicle_id}' no está pausado")
+    vehicle.status = VehicleStatus.MOVING
+    return {"status": "resumed", "vehicle_id": vehicle_id}
+
+
+@router.put("/vehicles/{vehicle_id}/speed")
+async def set_vehicle_speed(
+    vehicle_id: str,
+    body: SpeedRequest,
+    spawner: VehicleSpawner = Depends(get_vehicle_spawner),
+) -> dict:
+    """Cambia la velocidad deseada de un vehículo."""
+    vehicle = spawner.get_vehicle(vehicle_id)
+    if vehicle is None:
+        raise HTTPException(status_code=404, detail=f"Vehículo '{vehicle_id}' no encontrado")
+    vehicle.desired_speed_ms = body.desired_speed_kmh * KMH_TO_MS
+    return {
+        "status": "updated",
+        "vehicle_id": vehicle_id,
+        "desired_speed_kmh": body.desired_speed_kmh,
+        "desired_speed_ms": round(vehicle.desired_speed_ms, 3),
+    }
+
+
+@router.post("/vehicles/{vehicle_id}/reroute")
+async def reroute_vehicle(
+    vehicle_id: str,
+    body: RerouteRequest,
+    spawner: VehicleSpawner = Depends(get_vehicle_spawner),
+) -> dict:
+    """Reasigna la ruta de un vehículo hacia un nuevo nodo destino."""
+    success = spawner.reroute_vehicle(vehicle_id, body.end_node_id)
+    if not success:
+        vehicle = spawner.get_vehicle(vehicle_id)
+        if vehicle is None:
+            raise HTTPException(status_code=404, detail=f"Vehículo '{vehicle_id}' no encontrado")
+        raise HTTPException(
+            status_code=422,
+            detail=f"No se pudo calcular ruta desde vehículo '{vehicle_id}' a nodo {body.end_node_id}",
+        )
+    return {"status": "rerouted", "vehicle_id": vehicle_id, "end_node_id": body.end_node_id}
+
+
+# =========================================================================
+# Traffic light endpoints
+# =========================================================================
+
+
+def _get_tl_or_404(engine: SimulationEngine):
+    """Helper: devuelve el TrafficLightController o lanza 404."""
+    tl = engine.get_tl_controller()
+    if tl is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Controlador de semáforos no disponible (¿simulación iniciada?)",
+        )
+    return tl
+
+
+@router.get("/traffic-lights")
+async def get_traffic_lights(
+    engine: SimulationEngine = Depends(get_simulation_engine),
+) -> dict:
+    """Devuelve el snapshot actual de todos los semáforos y el modo de override."""
+    tl = engine.get_tl_controller()
+    if tl is None:
+        return {"mode": "normal", "count": 0, "states": {}}
+    return {
+        "mode": tl.get_override_mode(),
+        "count": tl.light_count,
+        "states": {
+            str(nid): {str(ek): ph for ek, ph in edges.items()}
+            for nid, edges in tl.get_snapshot().items()
+        },
+    }
+
+
+@router.post("/traffic-lights/all-green")
+async def tl_all_green(
+    engine: SimulationEngine = Depends(get_simulation_engine),
+    broadcaster: SimulationBroadcaster = Depends(get_broadcaster),
+) -> dict:
+    """Fuerza todos los semáforos en verde. Broadcast inmediato al cliente."""
+    tl = _get_tl_or_404(engine)
+    tl.set_all_override("green")
+    await broadcaster.broadcast_traffic_lights(tl.get_snapshot())
+    return {"mode": tl.get_override_mode(), "count": tl.light_count}
+
+
+@router.post("/traffic-lights/all-red")
+async def tl_all_red(
+    engine: SimulationEngine = Depends(get_simulation_engine),
+    broadcaster: SimulationBroadcaster = Depends(get_broadcaster),
+) -> dict:
+    """Fuerza todos los semáforos en rojo. Broadcast inmediato al cliente."""
+    tl = _get_tl_or_404(engine)
+    tl.set_all_override("red")
+    await broadcaster.broadcast_traffic_lights(tl.get_snapshot())
+    return {"mode": tl.get_override_mode(), "count": tl.light_count}
+
+
+@router.post("/traffic-lights/normal")
+async def tl_normal(
+    engine: SimulationEngine = Depends(get_simulation_engine),
+    broadcaster: SimulationBroadcaster = Depends(get_broadcaster),
+) -> dict:
+    """Elimina todos los overrides; los semáforos vuelven al ciclo de tiempo fijo."""
+    tl = _get_tl_or_404(engine)
+    tl.clear_overrides()
+    await broadcaster.broadcast_traffic_lights(tl.get_snapshot())
+    return {"mode": tl.get_override_mode(), "count": tl.light_count}

@@ -217,6 +217,11 @@ class TestNodeTypeDetection:
         node = OSMNode(osm_id=1, lat=0, lon=0, tags={"highway": "traffic_signals"})
         assert loader._determine_node_type(node) == NodeType.TRAFFIC_LIGHT
 
+    def test_crossing_traffic_signals(self, loader):
+        """Test pedestrian crossing with traffic signals node."""
+        node = OSMNode(osm_id=1, lat=0, lon=0, tags={"highway": "crossing", "crossing": "traffic_signals"})
+        assert loader._determine_node_type(node) == NodeType.TRAFFIC_LIGHT
+
     def test_roundabout(self, loader):
         """Test roundabout node."""
         node = OSMNode(osm_id=1, lat=0, lon=0, tags={"junction": "roundabout"})

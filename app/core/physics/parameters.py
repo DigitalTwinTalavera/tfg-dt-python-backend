@@ -22,10 +22,10 @@ class IDMParameters:
     """
 
     v0: float = 13.89   # ~50 km/h
-    s0: float = 2.0     # metros
-    T: float = 1.5      # segundos
+    s0: float = 8.0     # metros — holgura real (> longitud vehículo) para car-following visible
+    T: float = 1.8      # segundos — tiempo de seguimiento conservador
     a: float = 1.0      # m/s²
-    b: float = 1.5      # m/s²
+    b: float = 3.0      # m/s² — frenada confortable
     delta: float = 4.0  # exponente
 
 

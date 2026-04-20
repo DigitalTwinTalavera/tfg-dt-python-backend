@@ -6,12 +6,15 @@ Provides fast pathfinding and connectivity queries for traffic simulation.
 """
 
 import json
+import logging
 import math
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import networkx as nx
+
+logger = logging.getLogger(__name__)
 from geoalchemy2.functions import ST_AsGeoJSON, ST_X, ST_Y
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +25,7 @@ from app.core.constants import (
     ATTR_LENGTH,
     ATTR_LONGITUDE,
     ATTR_MAX_SPEED,
+    ATTR_MID_TLS,
     ATTR_NODE_ID,
     ATTR_NODE_TYPE,
     ATTR_ONE_WAY,
@@ -33,6 +37,7 @@ from app.core.constants import (
     KMH_TO_MS,
     ROAD_TYPE_WEIGHT_FACTORS,
 )
+from app.models.enums import NodeType
 
 # Heurística A*: cota inferior admisible basada en distancia geográfica.
 # Velocidad máxima posible en la red (autovía ≈ 130 km/h) con el factor de
@@ -139,6 +144,28 @@ class RoadNetworkGraph:
         # Load edges
         await self._load_edges(session, active_only)
 
+        # Diagnóstico: cobertura de TLs (endpoint vs mid-way). Un porcentaje
+        # alto de mid-way TLs sin detectar en edges indica mismatch de coordenadas.
+        tl_total = 0
+        tl_with_in_edges = 0
+        for nid, attrs in self._graph.nodes(data=True):
+            if attrs.get(ATTR_NODE_TYPE) == NodeType.TRAFFIC_LIGHT.value:
+                tl_total += 1
+                if self._graph.in_degree(nid) > 0:
+                    tl_with_in_edges += 1
+        edges_with_mid_tl = sum(
+            1 for _, _, a in self._graph.edges(data=True) if a.get(ATTR_MID_TLS)
+        )
+        mid_tl_count = sum(
+            len(a.get(ATTR_MID_TLS, [])) for _, _, a in self._graph.edges(data=True)
+        )
+        logger.info(
+            "Graph loaded: TLs=%d (endpoint=%d, mid-way-candidates=%d), "
+            "edges-with-mid-TL=%d, mid-TL-refs=%d",
+            tl_total, tl_with_in_edges, tl_total - tl_with_in_edges,
+            edges_with_mid_tl, mid_tl_count,
+        )
+
         # Calculate statistics
         build_time_ms = (time.time() - start_time) * 1000
         self._last_build_time = time.time()
@@ -218,6 +245,22 @@ class RoadNetworkGraph:
         result = await session.execute(stmt)
         rows = result.fetchall()
 
+        # Coordenada (redondeada) → node_id, sólo para nodos TRAFFIC_LIGHT.
+        # Se usa para detectar TLs en waypoints intermedios del LineString de
+        # cada edge (los TLs mid-way no son endpoints del DiGraph, porque cada
+        # way OSM se vuelve UNA arista first→last → el TL queda "dentro" del
+        # polyline).
+        # Precisión 6 decimales (~11 cm en longitud) para tolerar drift de
+        # PostGIS entre WKT de edges y ST_X/ST_Y de nodos.
+        tl_by_coord: dict[tuple[float, float], int] = {}
+        for nid, n_attrs in self._graph.nodes(data=True):
+            if n_attrs.get(ATTR_NODE_TYPE) == NodeType.TRAFFIC_LIGHT.value:
+                key = (
+                    round(float(n_attrs.get(ATTR_LONGITUDE, 0.0)), 6),
+                    round(float(n_attrs.get(ATTR_LATITUDE, 0.0)), 6),
+                )
+                tl_by_coord[key] = nid
+
         for row in rows:
             # Calculate weight as travel time (s) × road-type penalty factor.
             # Minor roads get higher weights so Dijkstra prefers major roads.
@@ -232,6 +275,28 @@ class RoadNetworkGraph:
                 geom = json.loads(row.geometry_json)
                 waypoints = [(c[0], c[1]) for c in geom.get("coordinates", [])]
 
+            # Detectar TLs intermedios y calcular su distancia acumulada desde
+            # start_node a lo largo del LineString. Usamos la misma fórmula que
+            # _calculate_length de osm_loader (distancia euclídea × 111320).
+            # Los waypoints extremos (índice 0 y -1) son start/end_node → los
+            # saltamos para evitar duplicar el TL endpoint cuando ya lo hay.
+            mid_tls_fwd: list[tuple[int, float]] = []
+            if waypoints and tl_by_coord:
+                cum_dist = 0.0
+                for i in range(len(waypoints)):
+                    if i > 0:
+                        lon1, lat1 = waypoints[i - 1]
+                        lon2, lat2 = waypoints[i]
+                        dlat = lat2 - lat1
+                        dlon = lon2 - lon1
+                        cum_dist += math.sqrt(dlat * dlat + dlon * dlon) * _METERS_PER_DEGREE
+                    if i == 0 or i == len(waypoints) - 1:
+                        continue  # endpoints ya son start/end del edge
+                    key = (round(waypoints[i][0], 6), round(waypoints[i][1], 6))
+                    tl_nid = tl_by_coord.get(key)
+                    if tl_nid is not None:
+                        mid_tls_fwd.append((tl_nid, cum_dist))
+
             edge_attrs = {
                 ATTR_EDGE_ID: row.id,
                 ATTR_LENGTH: row.length,
@@ -240,6 +305,7 @@ class RoadNetworkGraph:
                 ATTR_ROAD_TYPE: row.road_type,
                 ATTR_ONE_WAY: row.one_way,
                 ATTR_WAYPOINTS: waypoints,
+                ATTR_MID_TLS: mid_tls_fwd,
             }
 
             # Add forward edge
@@ -247,7 +313,15 @@ class RoadNetworkGraph:
 
             # Add reverse edge for bidirectional roads (reversed waypoint order)
             if not row.one_way:
-                reverse_attrs = {**edge_attrs, ATTR_WAYPOINTS: list(reversed(waypoints))}
+                total_len = float(row.length)
+                mid_tls_rev = [
+                    (nid, max(total_len - d, 0.0)) for nid, d in reversed(mid_tls_fwd)
+                ]
+                reverse_attrs = {
+                    **edge_attrs,
+                    ATTR_WAYPOINTS: list(reversed(waypoints)),
+                    ATTR_MID_TLS: mid_tls_rev,
+                }
                 self._graph.add_edge(row.end_node_id, row.start_node_id, **reverse_attrs)
 
     def get_shortest_path(

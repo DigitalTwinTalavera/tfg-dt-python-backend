@@ -68,3 +68,5 @@ class VehicleStatus(str, Enum):
     STOPPED = "stopped"  # Vehicle has stopped (e.g., at traffic light)
     WAITING = "waiting"  # Vehicle is waiting (e.g., in queue)
     FINISHED = "finished"  # Vehicle has completed its route
+    COLLISION = "collision"  # Vehicle is involved in a collision
+    PAUSED = "paused"  # Vehicle is manually paused

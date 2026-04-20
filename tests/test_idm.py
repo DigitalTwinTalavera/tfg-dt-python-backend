@@ -41,11 +41,15 @@ def custom_idm():
 class TestIDMParameters:
     @pytest.mark.unit
     def test_default_values(self, default_params):
+        # Parámetros ajustados para car-following realista:
+        #   s0=8.0  → holgura visible incluyendo longitud del vehículo
+        #   T=1.8   → tiempo de seguimiento conservador
+        #   b=3.0   → frenada confortable más firme
         assert default_params.v0 == 13.89
-        assert default_params.s0 == 2.0
-        assert default_params.T == 1.5
+        assert default_params.s0 == 8.0
+        assert default_params.T == 1.8
         assert default_params.a == 1.0
-        assert default_params.b == 1.5
+        assert default_params.b == 3.0
         assert default_params.delta == 4.0
 
     @pytest.mark.unit

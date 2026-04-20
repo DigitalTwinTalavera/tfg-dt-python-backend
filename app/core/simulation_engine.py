@@ -18,6 +18,7 @@ from app.core.exceptions import (
 if TYPE_CHECKING:
     from app.core.broadcaster import SimulationBroadcaster
     from app.core.simulation_config import SimulationConfig
+    from app.core.traffic_light_controller import TrafficLightController
     from app.services.vehicle_spawner import VehicleSpawner
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,7 @@ class SimulationEngine:
         self._config: SimulationConfig | None = None
         self._spawner: VehicleSpawner | None = None
         self._broadcaster: SimulationBroadcaster | None = None
+        self._tl_controller: "TrafficLightController | None" = None
 
     # -------------------------------------------------------------------------
     # Properties
@@ -125,6 +127,10 @@ class SimulationEngine:
         """Devuelve la configuración activa, o None si no se ha inyectado."""
         return self._config
 
+    def get_tl_controller(self) -> "TrafficLightController | None":
+        """Devuelve el controlador de semáforos activo, o None si no se ha inicializado."""
+        return self._tl_controller
+
     # -------------------------------------------------------------------------
     # State machine
     # -------------------------------------------------------------------------
@@ -139,6 +145,7 @@ class SimulationEngine:
         self._tick_count = 0
         self._simulation_time = 0.0
         self._start_wall_time = time.monotonic()
+        self._tl_controller = None  # se re-inicializa en el primer tick
         self._state = SimulationState.RUNNING
 
         if self._broadcaster is not None:
@@ -248,13 +255,36 @@ class SimulationEngine:
         Ejecuta un tick de simulación.
 
         Orden de operaciones:
-          1. Auto-spawn (si procede según config)
-          2. Broadcast del estado a clientes WS
+          1. Lazy-init del TrafficLightController.
+          2. Avance de ciclos de semáforos.
+          3. Auto-spawn (si procede según config).
+          4. Física de vehículos con IDM + restricción de semáforos.
+          5. Broadcast de vehículos terminados y estado de tick.
+          6. Broadcast de estados de semáforos (cada TL_BROADCAST_INTERVAL_TICKS).
 
         Args:
             dt: Delta time en segundos para este tick.
         """
-        # 1. Auto-spawn
+        from app.core.constants import TL_BROADCAST_INTERVAL_TICKS
+
+        # 1. Lazy-init del controlador de semáforos (primera vez que el grafo está listo)
+        if (
+            self._tl_controller is None
+            and self._spawner is not None
+            and self._spawner.graph.node_count > 0
+        ):
+            from app.core.traffic_light_controller import TrafficLightController
+            self._tl_controller = TrafficLightController(self._spawner.graph)
+            logger.info(
+                "TrafficLightController iniciado con %d semáforos",
+                self._tl_controller.light_count,
+            )
+
+        # 2. Avanzar ciclos de semáforos
+        if self._tl_controller is not None:
+            self._tl_controller.tick(dt)
+
+        # 3. Auto-spawn
         if (
             self._config is not None
             and self._config.auto_spawn
@@ -268,34 +298,49 @@ class SimulationEngine:
                 except ValueError:
                     pass  # sin nodos de entrada/salida -> ignorar silenciosamente
 
-        # 2 & 3. Física de vehículos.
+        # 4. Física de vehículos con IDM.
         #   - Con < 500 vehículos: asyncio.to_thread (libera el event loop).
-        #   - Con ≥ 500 vehículos: ProcessPoolExecutor con 20 workers para
-        #     aprovechar todos los cores del sistema.
+        #   - Con ≥ 500 vehículos: ProcessPoolExecutor con workers paralelos.
         #   update_vehicles_parallel tiene fallback interno a to_thread si el
         #   ProcessPool falla, así que no rompe la simulación.
+        finished_ids: list[str] = []
         if self._spawner is not None and self._spawner.graph.node_count > 0:
             from app.core.vehicle_physics import update_vehicles_parallel
             try:
                 finished_ids = await update_vehicles_parallel(
-                    self._spawner.vehicles, self._spawner.graph, dt
+                    self._spawner.vehicles,
+                    self._spawner.graph,
+                    dt,
+                    tl_controller=self._tl_controller,
+                    blocked_edges=self._spawner.blocked_edges,
                 )
             except Exception:
                 logger.exception("Error inesperado en update_vehicles_parallel; tick ignorado")
 
-            # 3. Broadcast vehicle_finished + eliminar vehículos completados
-            for vid in finished_ids:
-                if self._broadcaster is not None:
-                    await self._broadcaster.broadcast_vehicle_finished(vid)
+        # 5. Broadcast vehicle_finished + eliminar vehículos completados
+        for vid in finished_ids:
+            if self._broadcaster is not None:
+                await self._broadcaster.broadcast_vehicle_finished(vid)
+            if self._spawner is not None:
                 self._spawner.remove_vehicle(vid)
 
         self._vehicles_active = self._spawner.active_count if self._spawner else 0
 
-        # 4. Broadcast
+        # Broadcast tick
         if self._broadcaster is not None:
             await self._broadcaster.broadcast_tick(
                 tick=self._tick_count,
                 sim_time=self._simulation_time,
+            )
+
+        # 6. Broadcast estados de semáforos (a menor frecuencia que los ticks)
+        if (
+            self._tl_controller is not None
+            and self._broadcaster is not None
+            and self._tick_count % TL_BROADCAST_INTERVAL_TICKS == 0
+        ):
+            await self._broadcaster.broadcast_traffic_lights(
+                self._tl_controller.get_snapshot()
             )
 
     async def _cancel_task(self) -> None:

@@ -16,6 +16,8 @@ from app.api.websocket.manager import ConnectionManager
 from app.api.websocket.messages import (
     build_sim_state_message,
     build_tick_message,
+    build_traffic_lights_message,
+    build_vehicle_collision_message,
     build_vehicle_finished_message,
     build_vehicle_spawned_message,
     build_vehicle_state,
@@ -160,18 +162,6 @@ class SimulationBroadcaster:
         message = build_sim_state_message(state)
         await self._manager.broadcast(message)
 
-    async def broadcast_vehicles_batch_spawned(self, vehicles: list[SimVehicle]) -> None:
-        """
-        Emite un lote de vehículos recién generados con su posición inicial.
-
-        Enviado inmediatamente tras el spawn para que el cliente renderice
-        los vehículos sin esperar al próximo tick de simulación.
-        """
-        if self._manager.connection_count == 0 or not vehicles:
-            return
-        message = build_vehicles_batch_spawned_message(vehicles)
-        await self._manager.broadcast(message)
-
     async def broadcast_vehicle_spawned(self, vehicle: SimVehicle) -> None:
         """Emite notificación de vehículo generado."""
         if self._manager.connection_count == 0:
@@ -191,6 +181,19 @@ class SimulationBroadcaster:
         message = build_vehicle_finished_message(vehicle_id)
         await self._manager.broadcast(message)
 
+    async def broadcast_traffic_lights(
+        self, snapshot: dict[int, dict[str, str]]
+    ) -> None:
+        """
+        Emite el estado actual de todos los semáforos por arista de aproximación.
+
+        Args:
+            snapshot: {node_id: {"u_v": phase}} de TrafficLightController.get_snapshot().
+        """
+        if self._manager.connection_count == 0:
+            return
+        await self._manager.broadcast(build_traffic_lights_message(snapshot))
+
     async def broadcast_vehicles_batch_spawned(self, vehicles: list[SimVehicle]) -> None:
         """
         Emite un único mensaje con todos los vehículos creados en un spawn masivo.
@@ -208,3 +211,18 @@ class SimulationBroadcaster:
             "Batch WS enviado: %d vehículos (vehicles_batch_spawned)",
             len(vehicles),
         )
+
+    async def broadcast_vehicle_collision(
+        self,
+        vehicle_id_1: str,
+        vehicle_id_2: str,
+        node_from: int,
+        node_to: int,
+    ) -> None:
+        """Emite notificación de colisión entre dos vehículos."""
+        if self._manager.connection_count == 0:
+            return
+        message = build_vehicle_collision_message(
+            vehicle_id_1, vehicle_id_2, node_from, node_to
+        )
+        await self._manager.broadcast(message)

@@ -195,6 +195,10 @@ ATTR_WEIGHT = "weight"
 ATTR_ROAD_TYPE = "road_type"
 ATTR_ONE_WAY = "one_way"
 ATTR_WAYPOINTS = "waypoints"  # list[tuple[float,float]] — (lon, lat) pairs from LineString
+# Semáforos intermedios del edge (no en endpoints). Detectados por coordenada
+# contra los waypoints al cargar el grafo. Lista ordenada por distancia creciente:
+#   list[tuple[int, float]]  →  [(tl_node_id, distance_from_start_m), ...]
+ATTR_MID_TLS = "mid_tls"
 
 # Cache settings
 GRAPH_CACHE_TTL_SECONDS = 300  # 5 minutes
@@ -308,6 +312,7 @@ OSM_JUNCTION_ROUNDABOUT = "roundabout"
 
 # Node type detection values
 OSM_NODE_TRAFFIC_SIGNALS = "traffic_signals"
+OSM_TAG_CROSSING = "crossing"
 OSM_TAG_NOEXIT = "noexit"
 OSM_VALUE_YES = "yes"
 
@@ -331,3 +336,56 @@ DEFAULT_TICK_INTERVAL_MS = 100.0
 # Simulation status messages
 MSG_SIMULATION_STARTED = "Simulación iniciada"
 MSG_SIMULATION_STOPPED = "Simulación detenida por shutdown"
+
+# =============================================================================
+# Traffic Light Constants
+# =============================================================================
+
+# Phase durations (seconds)
+TL_GREEN_SECONDS: float = 30.0
+TL_YELLOW_SECONDS: float = 5.0
+TL_RED_SECONDS: float = 35.0
+
+# Phase name strings
+TL_PHASE_GREEN = "green"
+TL_PHASE_YELLOW = "yellow"
+TL_PHASE_RED = "red"
+
+# Broadcast TL snapshot every N simulation ticks
+TL_BROADCAST_INTERVAL_TICKS = 10
+
+# =============================================================================
+# Vehicle Physics Constants
+# =============================================================================
+
+VEHICLE_LENGTH_M: float = 4.5           # bumper-to-bumper length (metres)
+MAX_EMERGENCY_DECEL_MS2: float = 8.0    # physical braking cap (m/s²)
+DEFAULT_VEHICLE_SPEED_KMH: float = 50.0 # default desired speed in km/h
+MIN_EDGE_LENGTH_M: float = 0.1          # prevent division by zero
+VEHICLE_PHYSICS_PARALLEL_THRESHOLD: int = 500
+
+# =============================================================================
+# Spawn Randomisation Constants
+# =============================================================================
+
+SPAWN_SPEED_VARIANCE_MIN: float = 0.85
+SPAWN_SPEED_VARIANCE_MAX: float = 1.10
+SPAWN_INITIAL_VELOCITY_MIN: float = 0.0
+SPAWN_INITIAL_VELOCITY_MAX: float = 0.7
+SPAWN_INITIAL_PROGRESS_MIN: float = 0.0
+SPAWN_INITIAL_PROGRESS_MAX: float = 0.4
+
+# =============================================================================
+# Collision Constants
+# =============================================================================
+
+COLLISION_GAP_THRESHOLD_M: float = 0.3           # gap below this triggers proximity timer
+COLLISION_PROXIMITY_DURATION_S: float = 0.5      # sostenido > este tiempo → choque
+COLLISION_DURATION_S: float = 300.0              # 5 minutos bloqueado tras el choque
+
+# =============================================================================
+# Traffic Light Yellow Behaviour
+# =============================================================================
+
+YELLOW_BRAKE_DISTANCE_M: float = 15.0   # if closer than this, always run yellow
+YELLOW_BRAKE_PROBABILITY: float = 0.85  # 85% de vehículos frena en amarillo

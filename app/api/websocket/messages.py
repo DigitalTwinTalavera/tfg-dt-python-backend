@@ -21,7 +21,8 @@ MSG_TYPE_VEHICLES_BATCH_SPAWNED = "vehicles_batch_spawned"
 MSG_TYPE_VEHICLE_FINISHED = "vehicle_finished"
 MSG_TYPE_VEHICLE_UPDATE = "vehicle_update"
 MSG_TYPE_MAP_SWITCHED = "map_switched"
-MSG_TYPE_VEHICLES_BATCH_SPAWNED = "vehicles_batch_spawned"
+MSG_TYPE_TRAFFIC_LIGHT = "traffic_light"
+MSG_TYPE_VEHICLE_COLLISION = "vehicle_collision"
 
 
 # =============================================================================
@@ -110,7 +111,7 @@ def build_vehicle_finished_message(vehicle_id: str) -> dict[str, Any]:
 
 def build_vehicles_batch_spawned_message(vehicles: list[Any]) -> dict[str, Any]:
     """
-    Mensaje de batch de vehículos recién generados.
+    Mensaje de lote de vehículos recién generados, con posición inicial y ruta.
 
     Enviado por el broadcaster tras completar un spawn masivo en background.
     El cliente lo usa para registrar y renderizar todos los vehículos de golpe,
@@ -127,6 +128,7 @@ def build_vehicles_batch_spawned_message(vehicles: list[Any]) -> dict[str, Any]:
                 "id": v.id,
                 "lon": round(v.longitude, 7),
                 "lat": round(v.latitude, 7),
+                "h": round(v.heading, 1),
                 "status": v.status.value,
                 "route_edges": v.route.edge_ids,
             }
@@ -135,29 +137,18 @@ def build_vehicles_batch_spawned_message(vehicles: list[Any]) -> dict[str, Any]:
     }
 
 
-def build_vehicles_batch_spawned_message(vehicles: list) -> dict[str, Any]:
-    """
-    Mensaje de lote de vehículos recién generados, con posición inicial.
-
-    Enviado inmediatamente tras el spawn para que el cliente pueda
-    renderizar los vehículos sin esperar al próximo tick.
-
-    Args:
-        vehicles: Lista de SimVehicle recién creados.
-    """
+def build_vehicle_collision_message(
+    vehicle_id_1: str,
+    vehicle_id_2: str,
+    node_from: int,
+    node_to: int,
+) -> dict[str, Any]:
+    """Mensaje de colisión entre dos vehículos, indicando el tramo bloqueado."""
     return {
-        "type": MSG_TYPE_VEHICLES_BATCH_SPAWNED,
-        "vehicles": [
-            {
-                "id": v.id,
-                "lon": round(v.longitude, 7),
-                "lat": round(v.latitude, 7),
-                "h": round(v.heading, 1),
-                "status": v.status.value,
-            }
-            for v in vehicles
-        ],
-        "count": len(vehicles),
+        "type": MSG_TYPE_VEHICLE_COLLISION,
+        "vehicle_id_1": vehicle_id_1,
+        "vehicle_id_2": vehicle_id_2,
+        "blocked_edge": [node_from, node_to],
     }
 
 
@@ -172,4 +163,27 @@ def build_map_switched_message(
         "map": map_name,
         "nodes": nodes,
         "edges": edges,
+    }
+
+
+def build_traffic_lights_message(
+    states: dict[int, dict[str, str]],
+) -> dict[str, Any]:
+    """
+    Snapshot de estados de semáforos por arista de aproximación.
+
+    Args:
+        states: {node_id: {"u_v": phase}} del TrafficLightController.get_snapshot().
+                Cada nodo puede tener fases distintas por eje (N-S vs E-O).
+
+    Returns:
+        Dict con type='traffic_light', version=2 y states anidados.
+    """
+    return {
+        "type": MSG_TYPE_TRAFFIC_LIGHT,
+        "version": 2,
+        "states": {
+            str(nid): {str(k): v for k, v in edges.items()}
+            for nid, edges in states.items()
+        },
     }

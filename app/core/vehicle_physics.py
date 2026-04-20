@@ -1,10 +1,19 @@
 """
 Física de movimiento de vehículos a lo largo de sus rutas.
 
-Avanza cada vehículo activo una distancia = velocidad × dt en cada tick.
-Cuando un vehículo cruza el final de un segmento, el tiempo sobrante se
-aplica al siguiente segmento. Cuando se agotan los segmentos, el vehículo
-pasa a FINISHED.
+Modelo de car-following: Intelligent Driver Model (IDM).
+  - Cada vehículo tiene una velocidad deseada individual (desired_speed_ms).
+  - La aceleración viene del IDM: libre en carretera vacía, frenado suave
+    detrás de un líder, frenado de emergencia ante un semáforo en rojo.
+  - El avance es por distancia (v·dt) en lugar de tiempo constante.
+
+Detección de líder:
+  - Se construye un índice {(start_node, end_node): [vehicles sorted by progress desc]}.
+  - Para cada vehículo, el líder es el primero con mayor progreso en la misma arista.
+
+Restricción de semáforos:
+  - Si el nodo final de la arista actual está en rojo, se genera un "líder virtual"
+    estacionado en la línea de stop (distancia = longitud_restante - vehicle_length).
 
 Los vehículos siguen los waypoints reales de la geometría de la calzada
 (LineString de PostGIS) en lugar de interpolar en línea recta entre nodos.
@@ -23,30 +32,62 @@ import logging
 import math
 import multiprocessing
 import os
+from dataclasses import dataclass
 
 from app.core.constants import (
     ATTR_LATITUDE,
     ATTR_LENGTH,
     ATTR_LONGITUDE,
     ATTR_MAX_SPEED,
+    ATTR_MID_TLS,
     ATTR_WAYPOINTS,
+    COLLISION_DURATION_S,
+    COLLISION_GAP_THRESHOLD_M,
+    COLLISION_PROXIMITY_DURATION_S,
+    DEFAULT_VEHICLE_SPEED_KMH,
     KMH_TO_MS,
+    MAX_EMERGENCY_DECEL_MS2,
+    MIN_EDGE_LENGTH_M,
+    TL_PHASE_GREEN,
+    TL_PHASE_RED,
+    TL_PHASE_YELLOW,
+    VEHICLE_LENGTH_M,
+    VEHICLE_PHYSICS_PARALLEL_THRESHOLD,
+    YELLOW_BRAKE_DISTANCE_M,
 )
+from app.core.physics.idm import IDMModel
 from app.models.enums import VehicleStatus
 from app.services.network_graph import RoadNetworkGraph
 from app.services.vehicle_spawner import SimVehicle
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_SPEED_KMH: float = 50.0   # Fallback when edge has no speed data
-_MIN_EDGE_LENGTH: float = 0.1      # Minimum edge length (metres) to avoid division by zero
-_EARTH_RADIUS_M: float = 6_371_000.0  # Mean Earth radius in metres
+_EARTH_RADIUS_M: float = 6_371_000.0
 
-# Cache de longitudes de segmentos por arista (start_node, end_node).
-# La geometría de las aristas no cambia durante la simulación, por lo que
-# calcular los segmentos haversine una sola vez y reutilizarlos elimina
-# ~250 000 llamadas trigonométricas/seg con 5000 vehículos a 10 Hz.
+# Instancia singleton del IDM: stateless, seguro para multiprocessing
+_IDM = IDMModel()
+
+# Caché de longitudes de segmentos por arista (start_node, end_node).
 _SEG_CACHE: dict[tuple[int, int], tuple[list[float], float]] = {}
+
+
+# ---------------------------------------------------------------------------
+# Neighbor info
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NeighborInfo:
+    """
+    Información sobre el vehículo líder (o semáforo virtual) que precede a un ego.
+
+    Attrs:
+        gap_m:       Distancia bumper-to-bumper en metros (≥ 0.01 m).
+        velocity_ms: Velocidad del líder en m/s (0.0 para semáforo en rojo).
+        leader_id:   ID del vehículo líder real, o None si es un líder virtual (semáforo).
+    """
+    gap_m: float
+    velocity_ms: float
+    leader_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +164,6 @@ def _position_along_waypoints(
         seg_lengths, total_length = _waypoint_segments(waypoints)
 
     if total_length < 1e-6:
-        # Degenerate geometry — all waypoints at same spot
         lon, lat = waypoints[-1]
         return lon, lat, 0.0
 
@@ -132,7 +172,6 @@ def _position_along_waypoints(
 
     for i, seg_len in enumerate(seg_lengths):
         if accumulated + seg_len >= target_dist or i == len(seg_lengths) - 1:
-            # Position is on segment i
             local_t = (target_dist - accumulated) / seg_len if seg_len > 1e-6 else 1.0
             local_t = max(0.0, min(1.0, local_t))
 
@@ -149,7 +188,6 @@ def _position_along_waypoints(
             return lon, lat, heading
         accumulated += seg_len
 
-    # Fallback: end of last waypoint
     lon, lat = waypoints[-1]
     lon_prev, lat_prev = waypoints[-2]
     heading = math.degrees(math.atan2(lon - lon_prev, lat - lat_prev)) % 360.0
@@ -170,7 +208,6 @@ def _get_waypoints(
     waypoints: list[tuple[float, float]] = edge_attrs.get(ATTR_WAYPOINTS, [])
     if len(waypoints) >= 2:
         return waypoints
-    # Fallback: straight line
     start_lon = float(start_node_attrs.get(ATTR_LONGITUDE, 0.0))
     start_lat = float(start_node_attrs.get(ATTR_LATITUDE,  0.0))
     end_lon   = float(end_node_attrs.get(ATTR_LONGITUDE,   0.0))
@@ -179,48 +216,209 @@ def _get_waypoints(
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Leader detection
 # ---------------------------------------------------------------------------
 
-def update_vehicles(
+def _build_edge_index(
     vehicles: dict[str, SimVehicle],
-    graph: RoadNetworkGraph,
-    dt: float,
-) -> list[str]:
+) -> dict[tuple[int, int], list[SimVehicle]]:
     """
-    Avanza todos los vehículos activos a lo largo de sus rutas.
+    Construye un índice {(start_node, end_node): [vehicles sorted by progress desc]}.
 
-    Args:
-        vehicles: Diccionario vehicle_id → SimVehicle (modificado in-place).
-        graph: Grafo de red vial para consultas de coordenadas y velocidades.
-        dt: Intervalo de tiempo en segundos (un tick de simulación).
+    Permite encontrar el líder de cualquier vehículo en O(k) donde k es el
+    número de vehículos en la misma arista (en promedio muy pequeño).
+
+    Solo incluye vehículos activos (no FINISHED).
+    """
+    index: dict[tuple[int, int], list[SimVehicle]] = {}
+    for v in vehicles.values():
+        if v.status == VehicleStatus.FINISHED:
+            continue
+        node_path = v.route.node_path
+        ei = v.current_edge_index
+        if ei < len(node_path) - 1:
+            key = (node_path[ei], node_path[ei + 1])
+            index.setdefault(key, []).append(v)
+    # Ordenar por progreso descendente → el primero de la lista es el líder
+    for key in index:
+        index[key].sort(key=lambda v: v.progress_on_edge, reverse=True)
+    return index
+
+
+def _find_leader(
+    vehicle: SimVehicle,
+    edge_index: dict[tuple[int, int], list[SimVehicle]],
+    graph: RoadNetworkGraph,
+) -> NeighborInfo | None:
+    """
+    Busca el vehículo más cercano por delante en la misma arista.
 
     Returns:
-        Lista de vehicle_ids que han terminado su ruta en este tick.
+        NeighborInfo con el gap bumper-to-bumper y la velocidad del líder,
+        o None si la arista está libre.
     """
-    finished_ids: list[str] = []
+    node_path = vehicle.route.node_path
+    ei = vehicle.current_edge_index
+    if ei >= len(node_path) - 1:
+        return None
 
-    for vehicle in list(vehicles.values()):
-        if vehicle.status == VehicleStatus.FINISHED:
+    key = (node_path[ei], node_path[ei + 1])
+    edge_attrs = graph.get_edge_attributes(node_path[ei], node_path[ei + 1])
+    edge_len = max(float(edge_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
+
+    for candidate in edge_index.get(key, []):
+        if candidate.id == vehicle.id:
             continue
-        # Activate vehicles that were just spawned
-        if vehicle.status == VehicleStatus.IDLE:
-            vehicle.status = VehicleStatus.MOVING
+        if candidate.progress_on_edge > vehicle.progress_on_edge:
+            raw_gap = (candidate.progress_on_edge - vehicle.progress_on_edge) * edge_len - VEHICLE_LENGTH_M
+            if raw_gap <= 0.0:
+                # Overlap geométrico: parada de emergencia — forzar velocidad cero
+                return NeighborInfo(gap_m=0.01, velocity_ms=0.0, leader_id=candidate.id)
+            return NeighborInfo(gap_m=raw_gap, velocity_ms=candidate.velocity, leader_id=candidate.id)
 
-        if _advance_vehicle(vehicle, graph, dt):
-            finished_ids.append(vehicle.id)
+    # ── Look-ahead al inicio de la siguiente arista ────────────────────────────
+    # Si el vehículo está cerca del final (>70%), busca el vehículo más retrasado
+    # en la arista siguiente para evitar que dos coches de rutas distintas entren
+    # simultáneamente y se solapen.
+    if vehicle.progress_on_edge > 0.70 and ei + 1 < len(node_path) - 1:
+        next_key   = (node_path[ei + 1], node_path[ei + 2])
+        next_attrs = graph.get_edge_attributes(node_path[ei + 1], node_path[ei + 2])
+        next_edge_len = max(float(next_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
+        candidates_next = edge_index.get(next_key, [])
+        if candidates_next:
+            # El que tiene menor progress está más cerca del inicio → el que más molesta
+            first_on_next = min(candidates_next, key=lambda v: v.progress_on_edge)
+            if first_on_next.id != vehicle.id:
+                remaining_current = (1.0 - vehicle.progress_on_edge) * edge_len
+                dist_on_next      = first_on_next.progress_on_edge * next_edge_len
+                total_gap = remaining_current + dist_on_next - VEHICLE_LENGTH_M
+                return NeighborInfo(
+                    gap_m=max(total_gap, 0.01),
+                    velocity_ms=first_on_next.velocity,
+                    leader_id=first_on_next.id,
+                )
 
-    return finished_ids
+    return None
 
 
-def _advance_vehicle(
+def _phase_blocks(phase: str, vehicle: SimVehicle, dist_to_stop: float) -> bool:
+    """¿Esta fase obliga a parar al vehículo en la línea de stop?
+
+    Rojo siempre bloquea. Amarillo bloquea si el vehículo no es `yellow_runs_light`
+    Y está lo suficientemente lejos para frenar con seguridad.
+    """
+    if phase == TL_PHASE_RED:
+        return True
+    if phase == TL_PHASE_YELLOW:
+        if dist_to_stop < YELLOW_BRAKE_DISTANCE_M:
+            return False
+        return not getattr(vehicle, "yellow_runs_light", False)
+    return False
+
+
+def _check_traffic_light(
+    vehicle: SimVehicle,
+    graph: RoadNetworkGraph,
+    tl_controller: object,
+) -> NeighborInfo | None:
+    """
+    Genera un líder virtual en la línea de stop del TL más cercano que bloquee.
+
+    Se comprueban tres fuentes de TL, en orden de cercanía al vehículo:
+
+      1. TLs *mid-way* en la arista actual (nodos TRAFFIC_LIGHT que están sobre
+         la geometría del edge pero no son endpoints del DiGraph — caso
+         dominante en OSM, donde un way se vuelve una sola arista first→last).
+      2. El `end_node` de la arista actual si es un TL.
+      3. TLs mid-way en la siguiente arista + su `end_node` (look-ahead para
+         aristas cortas donde el IDM no tendría margen para frenar).
+
+    La fase se consulta por arista cuando hay info (`get_phase_for_edge`) para
+    que dos brazos del mismo cruce vean fases opuestas; los TLs mid-way usan
+    `get_phase` (fase del grupo 0) porque no tienen agrupación por eje.
+
+    Rojo siempre frena. Amarillo frena si el vehículo no es `yellow_runs_light`
+    y la línea de stop está a >= YELLOW_BRAKE_DISTANCE_M.
+    """
+    node_path = vehicle.route.node_path
+    ei = vehicle.current_edge_index
+    if ei >= len(node_path) - 1:
+        return None
+
+    start_node = node_path[ei]
+    end_node = node_path[ei + 1]
+    edge_attrs = graph.get_edge_attributes(start_node, end_node)
+    edge_len = max(float(edge_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
+    pos_on_edge_m = edge_len * vehicle.progress_on_edge
+    dist_to_end = edge_len - pos_on_edge_m
+
+    # 1) TLs mid-way en la arista actual (ordenados por distancia ascendente
+    # desde start_node). El primero con fase bloqueante que esté por delante
+    # del vehículo define la línea de stop.
+    mid_tls: list[tuple[int, float]] = edge_attrs.get(ATTR_MID_TLS, []) or []
+    for tl_nid, dist_from_start in mid_tls:
+        if dist_from_start <= pos_on_edge_m:
+            continue  # ya lo pasó
+        dist_to_tl = dist_from_start - pos_on_edge_m
+        phase = tl_controller.get_phase(tl_nid)  # type: ignore[union-attr]
+        if _phase_blocks(phase, vehicle, dist_to_tl):
+            return NeighborInfo(gap_m=max(dist_to_tl - VEHICLE_LENGTH_M, 0.01), velocity_ms=0.0)
+
+    # 2) TL en el end_node (cruce clásico): consulta por arista entrante.
+    end_phase = tl_controller.get_phase_for_edge(end_node, (start_node, end_node))  # type: ignore[union-attr]
+    if _phase_blocks(end_phase, vehicle, dist_to_end):
+        return NeighborInfo(gap_m=max(dist_to_end - VEHICLE_LENGTH_M, 0.01), velocity_ms=0.0)
+
+    # 3) Look-ahead a la arista siguiente (mid-TLs + end_node).
+    if ei + 2 < len(node_path):
+        next_end = node_path[ei + 2]
+        next_attrs = graph.get_edge_attributes(end_node, next_end)
+        next_len = max(float(next_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
+
+        next_mid_tls: list[tuple[int, float]] = next_attrs.get(ATTR_MID_TLS, []) or []
+        for tl_nid, dist_from_start in next_mid_tls:
+            total_dist = dist_to_end + dist_from_start
+            phase = tl_controller.get_phase(tl_nid)  # type: ignore[union-attr]
+            if _phase_blocks(phase, vehicle, total_dist):
+                return NeighborInfo(gap_m=max(total_dist - VEHICLE_LENGTH_M, 0.01), velocity_ms=0.0)
+
+        next_end_phase = tl_controller.get_phase_for_edge(next_end, (end_node, next_end))  # type: ignore[union-attr]
+        total_dist = dist_to_end + next_len
+        if _phase_blocks(next_end_phase, vehicle, total_dist):
+            return NeighborInfo(gap_m=max(total_dist - VEHICLE_LENGTH_M, 0.01), velocity_ms=0.0)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# IDM advance
+# ---------------------------------------------------------------------------
+
+def _advance_vehicle_idm(
     vehicle: SimVehicle,
     graph: RoadNetworkGraph,
     dt: float,
+    leader: NeighborInfo | None,
+    tl_ref: object | None = None,
 ) -> bool:
     """
-    Avanza un vehículo por su ruta durante dt segundos siguiendo los
-    waypoints de la geometría real de la calzada.
+    Avanza un vehículo por su ruta durante dt segundos usando el IDM.
+
+    Flujo:
+      1. Calcula aceleración IDM basada en el líder (o libre si no hay líder).
+      2. Actualiza velocidad: v_new = clamp(v + a·dt, 0, v_max).
+      3. Avanza la posición: dist = v_new · dt (Euler explícito).
+      4. Recorre aristas multi-segmento hasta consumir la distancia.
+         → Hard-stop: si el nodo de destino está bloqueado (rojo siempre,
+           amarillo si el vehículo no tiene yellow_runs_light), se detiene
+           antes de cruzar aunque el IDM no haya podido frenar a tiempo
+           (aristas cortas).
+      5. Interpola la posición geográfica con los waypoints reales.
+
+    Args:
+        tl_ref: Objeto con método get_phase_for_edge(node_id, edge) → str,
+                opcional. Cuando se proporciona, activa el hard-stop de
+                seguridad en el bucle de avance de aristas.
 
     Returns:
         True si el vehículo completó su ruta en este tick.
@@ -228,62 +426,136 @@ def _advance_vehicle(
     node_path = vehicle.route.node_path
 
     if len(node_path) < 2 or vehicle.current_edge_index >= len(node_path) - 1:
-        vehicle.status    = VehicleStatus.FINISHED
-        vehicle.velocity  = 0.0
+        vehicle.status   = VehicleStatus.FINISHED
+        vehicle.velocity = 0.0
         return True
 
-    remaining_time = dt
-    edge_idx       = vehicle.current_edge_index
+    ei = vehicle.current_edge_index
+    start_n = node_path[ei]
+    end_n   = node_path[ei + 1]
+    edge_attrs  = graph.get_edge_attributes(start_n, end_n)
+    speed_kmh   = float(edge_attrs.get(ATTR_MAX_SPEED, DEFAULT_VEHICLE_SPEED_KMH)) or DEFAULT_VEHICLE_SPEED_KMH
+    v_max       = speed_kmh * KMH_TO_MS
 
-    # ── Advance through edges until dt is consumed or route ends ──────────────
-    while remaining_time > 1e-9 and edge_idx < len(node_path) - 1:
-        start_node = node_path[edge_idx]
-        end_node   = node_path[edge_idx + 1]
+    # Velocidad deseada individual, acotada al límite de la vía actual
+    desired_v = min(getattr(vehicle, "desired_speed_ms", v_max), v_max)
 
-        edge_attrs  = graph.get_edge_attributes(start_node, end_node)
-        edge_length = max(float(edge_attrs.get(ATTR_LENGTH, 1.0)), _MIN_EDGE_LENGTH)
-        speed_kmh   = float(edge_attrs.get(ATTR_MAX_SPEED, _DEFAULT_SPEED_KMH)) or _DEFAULT_SPEED_KMH
-        speed_ms    = speed_kmh * KMH_TO_MS
+    # ── IDM acceleration ───────────────────────────────────────────────────────
+    if leader is not None:
+        a = _IDM.calculate_acceleration(
+            v=vehicle.velocity,
+            v0=desired_v,
+            s=leader.gap_m,
+            v_lead=leader.velocity_ms,
+        )
+    else:
+        a = _IDM.calculate_acceleration(v=vehicle.velocity, v0=desired_v)
 
-        # Distance and time remaining to reach end of this edge
-        dist_to_end = edge_length * (1.0 - vehicle.progress_on_edge)
-        time_to_end = dist_to_end / speed_ms
+    a = max(a, -MAX_EMERGENCY_DECEL_MS2)  # límite físico de frenado
 
-        if remaining_time >= time_to_end:
-            # ── Cross into next edge ───────────────────────────────────────────
-            remaining_time           -= time_to_end
-            edge_idx                 += 1
+    # ── Update velocity ────────────────────────────────────────────────────────
+    new_v = max(0.0, min(vehicle.velocity + a * dt, v_max))
+
+    # Safety cap: si el gap con el líder es ínfimo, no superar su velocidad
+    # (evita que el IDM "atraviese" al vehículo delantero en aristas cortas)
+    if leader is not None and leader.gap_m < 1.0:
+        new_v = min(new_v, max(leader.velocity_ms, 0.0))
+
+    vehicle.velocity     = new_v
+    vehicle.acceleration = a
+
+    # ── Distance to travel this tick ──────────────────────────────────────────
+    # Euler explícito: dist = v_new * dt
+    # (v_new ya incorpora la aceleración; evitamos double-count con 0.5·a·dt²)
+    remaining_dist = new_v * dt
+
+    # ── Multi-edge advance loop ────────────────────────────────────────────────
+    while remaining_dist > 1e-6 and ei < len(node_path) - 1:
+        start_n    = node_path[ei]
+        end_n      = node_path[ei + 1]
+        edge_attrs = graph.get_edge_attributes(start_n, end_n)
+        edge_len   = max(float(edge_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
+
+        pos_on_edge = edge_len * vehicle.progress_on_edge
+        dist_to_end = edge_len - pos_on_edge
+
+        # ── Hard-stop por TLs mid-way en la arista actual ──────────────────
+        # Si el IDM no frenó lo bastante, bloqueamos manualmente antes del
+        # cruce peatonal / semáforo interno. mid_tls está ordenada por
+        # distancia creciente desde start_node.
+        mid_stop_hit = False
+        if tl_ref is not None:
+            mid_tls: list[tuple[int, float]] = edge_attrs.get(ATTR_MID_TLS, []) or []
+            for tl_nid, dist_from_start in mid_tls:
+                if dist_from_start <= pos_on_edge:
+                    continue
+                dist_to_tl = dist_from_start - pos_on_edge
+                if dist_to_tl > remaining_dist:
+                    break  # fuera de alcance este tick
+                phase = tl_ref.get_phase(tl_nid)  # type: ignore[union-attr]
+                blocks = phase == TL_PHASE_RED or (
+                    phase == TL_PHASE_YELLOW
+                    and not getattr(vehicle, "yellow_runs_light", False)
+                )
+                if blocks:
+                    stop_pos_m = max(dist_from_start - VEHICLE_LENGTH_M, pos_on_edge)
+                    vehicle.progress_on_edge = min(stop_pos_m / edge_len, 0.98)
+                    vehicle.velocity = 0.0
+                    remaining_dist = 0.0
+                    mid_stop_hit = True
+                    break
+        if mid_stop_hit:
+            break
+
+        if remaining_dist >= dist_to_end:
+            # ── Hard-stop de seguridad en línea de stop del end_node ──────
+            # Aunque el IDM ya debería haber frenado (via _check_traffic_light),
+            # en aristas muy cortas puede que la distancia no haya sido suficiente.
+            # ROJO → siempre frena; AMARILLO → frena si yellow_runs_light es False.
+            if tl_ref is not None:
+                phase = tl_ref.get_phase_for_edge(end_n, (start_n, end_n))  # type: ignore[union-attr]
+                blocks = phase == TL_PHASE_RED or (
+                    phase == TL_PHASE_YELLOW
+                    and not getattr(vehicle, "yellow_runs_light", False)
+                )
+                if blocks:
+                    stop_progress = max(
+                        vehicle.progress_on_edge,
+                        min(1.0 - (VEHICLE_LENGTH_M / edge_len), 0.98),
+                    )
+                    vehicle.progress_on_edge = stop_progress
+                    vehicle.velocity         = 0.0
+                    remaining_dist           = 0.0
+                    break
+            remaining_dist           -= dist_to_end
+            ei                       += 1
             vehicle.progress_on_edge  = 0.0
-            vehicle.velocity          = speed_ms
         else:
-            # ── Stay on this edge ─────────────────────────────────────────────
-            advance_m                 = speed_ms * remaining_time
-            vehicle.progress_on_edge += advance_m / edge_length
+            vehicle.progress_on_edge += remaining_dist / edge_len
             vehicle.progress_on_edge  = min(vehicle.progress_on_edge, 1.0)
-            vehicle.velocity          = speed_ms
-            remaining_time            = 0.0
+            remaining_dist            = 0.0
 
-    vehicle.current_edge_index = edge_idx
+    vehicle.current_edge_index = ei
 
     # ── Route finished ─────────────────────────────────────────────────────────
-    if edge_idx >= len(node_path) - 1:
-        last_node_attrs   = graph.get_node_attributes(node_path[-1])
-        vehicle.longitude  = float(last_node_attrs.get(ATTR_LONGITUDE, vehicle.longitude))
-        vehicle.latitude   = float(last_node_attrs.get(ATTR_LATITUDE,  vehicle.latitude))
+    if ei >= len(node_path) - 1:
+        last_attrs        = graph.get_node_attributes(node_path[-1])
+        vehicle.longitude  = float(last_attrs.get(ATTR_LONGITUDE, vehicle.longitude))
+        vehicle.latitude   = float(last_attrs.get(ATTR_LATITUDE,  vehicle.latitude))
         vehicle.velocity   = 0.0
         vehicle.status     = VehicleStatus.FINISHED
         return True
 
     # ── Interpolate position along road geometry ───────────────────────────────
-    start_node  = node_path[edge_idx]
-    end_node    = node_path[edge_idx + 1]
-    edge_attrs  = graph.get_edge_attributes(start_node, end_node)
-    start_attrs = graph.get_node_attributes(start_node)
-    end_attrs   = graph.get_node_attributes(end_node)
+    start_n     = node_path[ei]
+    end_n       = node_path[ei + 1]
+    edge_attrs  = graph.get_edge_attributes(start_n, end_n)
+    start_attrs = graph.get_node_attributes(start_n)
+    end_attrs   = graph.get_node_attributes(end_n)
 
     waypoints = _get_waypoints(edge_attrs, start_attrs, end_attrs)
     lon, lat, heading = _position_along_waypoints(
-        waypoints, vehicle.progress_on_edge, _cache_key=(start_node, end_node)
+        waypoints, vehicle.progress_on_edge, _cache_key=(start_n, end_n)
     )
 
     vehicle.longitude = lon
@@ -294,22 +566,158 @@ def _advance_vehicle(
 
 
 # ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def _trigger_collision(
+    v1: SimVehicle,
+    v2: SimVehicle,
+    blocked_edges: set[tuple[int, int]],
+) -> None:
+    """
+    Marca dos vehículos como colisionados y bloquea el tramo donde ocurrió.
+
+    Ambos vehículos se detienen durante COLLISION_DURATION_S segundos,
+    bloqueando el tráfico detrás de ellos. La arista queda marcada como
+    bloqueada para que A* la evite en rutas futuras.
+    """
+    for v in (v1, v2):
+        v.status = VehicleStatus.COLLISION
+        v.velocity = 0.0
+        v.collision_timer = COLLISION_DURATION_S
+
+    # Bloquear el tramo de la arista donde ocurrió la colisión (usando v1)
+    np_ = v1.route.node_path
+    ei = v1.current_edge_index
+    if ei < len(np_) - 1:
+        blocked_edges.add((np_[ei], np_[ei + 1]))
+
+
+def update_vehicles(
+    vehicles: dict[str, SimVehicle],
+    graph: RoadNetworkGraph,
+    dt: float,
+    tl_controller: object | None = None,
+    blocked_edges: set[tuple[int, int]] | None = None,
+) -> list[str]:
+    """
+    Avanza todos los vehículos activos a lo largo de sus rutas usando IDM.
+
+    Args:
+        vehicles:      Diccionario vehicle_id → SimVehicle (modificado in-place).
+        graph:         Grafo de red vial.
+        dt:            Intervalo de tiempo en segundos.
+        tl_controller: TrafficLightController (opcional). Si se pasa, los
+                       vehículos frenan ante semáforos en rojo/amarillo.
+        blocked_edges: Conjunto de aristas bloqueadas por colisiones (modificado
+                       in-place cuando se detecta una nueva colisión).
+
+    Returns:
+        Lista de vehicle_ids que terminaron su ruta en este tick (incluye
+        vehículos que completan ruta Y vehículos cuyo timer de colisión expira).
+    """
+    if blocked_edges is None:
+        blocked_edges = set()
+
+    edge_index   = _build_edge_index(vehicles)
+    finished_ids: list[str] = []
+
+    for vehicle in list(vehicles.values()):
+        if vehicle.status == VehicleStatus.FINISHED:
+            continue
+
+        # Vehículos en colisión: decrementar timer, eliminar cuando expira
+        if vehicle.status == VehicleStatus.COLLISION:
+            vehicle.collision_timer = getattr(vehicle, "collision_timer", 0.0) - dt
+            if vehicle.collision_timer <= 0.0:
+                finished_ids.append(vehicle.id)
+            continue
+
+        # Vehículos pausados manualmente: no se mueven
+        if vehicle.status == VehicleStatus.PAUSED:
+            continue
+
+        if vehicle.status == VehicleStatus.IDLE:
+            vehicle.status = VehicleStatus.MOVING
+
+        # Determinar el líder más restrictivo (vehículo o semáforo)
+        leader = _find_leader(vehicle, edge_index, graph)
+        if tl_controller is not None:
+            tl_leader = _check_traffic_light(vehicle, graph, tl_controller)
+            if tl_leader is not None and (leader is None or tl_leader.gap_m < leader.gap_m):
+                leader = tl_leader
+
+        # Detección determinista de colisiones: gap pequeño SOSTENIDO > umbral temporal
+        too_close = (
+            leader is not None
+            and leader.leader_id is not None
+            and leader.gap_m < COLLISION_GAP_THRESHOLD_M
+            and vehicle.status == VehicleStatus.MOVING
+        )
+        if too_close:
+            vehicle.proximity_timer = getattr(vehicle, "proximity_timer", 0.0) + dt
+            if vehicle.proximity_timer >= COLLISION_PROXIMITY_DURATION_S:
+                other = vehicles.get(leader.leader_id)  # type: ignore[union-attr]
+                if other is not None and other.status == VehicleStatus.MOVING:
+                    _trigger_collision(vehicle, other, blocked_edges)
+                    vehicle.proximity_timer = 0.0
+                    continue  # no avanzar este tick
+        else:
+            vehicle.proximity_timer = 0.0
+
+        if _advance_vehicle_idm(vehicle, graph, dt, leader, tl_ref=tl_controller):
+            finished_ids.append(vehicle.id)
+
+    return finished_ids
+
+
+# ---------------------------------------------------------------------------
+# Lightweight TL proxy for parallel workers
+# ---------------------------------------------------------------------------
+
+class _FrozenTL:
+    """
+    Snapshot inmutable de fases por arista para uso en procesos worker.
+
+    Estructura: `{node_id: {"u_v": phase, ...}}` — misma que
+    `TrafficLightController.get_snapshot()`. Los workers no tienen acceso al
+    controlador vivo; se les pasa este snapshot serializable.
+    """
+    __slots__ = ("_phases",)
+
+    def __init__(self, phases: dict[int, dict[str, str]]) -> None:
+        self._phases = phases
+
+    def get_phase_for_edge(self, node_id: int, incoming_edge: tuple[int, int]) -> str:
+        edges = self._phases.get(node_id)
+        if not edges:
+            return TL_PHASE_GREEN
+        key = f"{incoming_edge[0]}_{incoming_edge[1]}"
+        if key in edges:
+            return edges[key]
+        # Fallback: TL sin aristas entrantes registradas (mid-street OSM) → "*"
+        if "*" in edges:
+            return edges["*"]
+        return next(iter(edges.values()), TL_PHASE_GREEN)
+
+    def get_phase(self, node_id: int) -> str:
+        """Fase representativa del nodo (primera arista del diccionario)."""
+        edges = self._phases.get(node_id)
+        if not edges:
+            return TL_PHASE_GREEN
+        return next(iter(edges.values()))
+
+
+# ---------------------------------------------------------------------------
 # Multi-core parallel physics (ProcessPoolExecutor)
 # ---------------------------------------------------------------------------
 
-# Worker-process state — populated once per worker via initializer.
 _worker_graph: "RoadNetworkGraph | None" = None  # type: ignore[name-defined]
-
-# Module-level executor — created on first use, reused across ticks.
 _EXECUTOR: concurrent.futures.ProcessPoolExecutor | None = None
-_EXECUTOR_GRAPH_ID: int = 0  # id() of the graph used to create the executor
-
-# Minimum vehicle count to justify IPC overhead.
-_PARALLEL_THRESHOLD: int = 500
+_EXECUTOR_GRAPH_ID: int = 0
 
 
 def _worker_init(graph: "RoadNetworkGraph") -> None:  # type: ignore[name-defined]
-    """Initializer for each worker process: pre-loads the road graph."""
     global _worker_graph
     _worker_graph = graph
 
@@ -317,15 +725,11 @@ def _worker_init(graph: "RoadNetworkGraph") -> None:  # type: ignore[name-define
 def _ensure_executor(
     graph: "RoadNetworkGraph",  # type: ignore[name-defined]
 ) -> concurrent.futures.ProcessPoolExecutor:
-    """Return (creating if needed) a ProcessPoolExecutor whose workers hold *graph*."""
     global _EXECUTOR, _EXECUTOR_GRAPH_ID
     gid = id(graph)
     if _EXECUTOR is None or _EXECUTOR_GRAPH_ID != gid:
         if _EXECUTOR is not None:
             _EXECUTOR.shutdown(wait=False, cancel_futures=True)
-        # spawn evita conflictos con el event loop de asyncio que usa fork en Linux.
-        # Los workers importan el módulo de nuevo, lo que es seguro porque
-        # _process_chunk hace sus propios imports internos.
         _EXECUTOR = concurrent.futures.ProcessPoolExecutor(
             max_workers=os.cpu_count(),
             initializer=_worker_init,
@@ -336,8 +740,12 @@ def _ensure_executor(
     return _EXECUTOR
 
 
-def _vehicle_to_dict(v: "SimVehicle") -> dict:  # type: ignore[name-defined]
-    """Serialize the mutable fields of a SimVehicle for inter-process transfer."""
+def _vehicle_to_dict(
+    v: "SimVehicle",  # type: ignore[name-defined]
+    leader: "NeighborInfo | None" = None,
+    tl_phases: "dict[int, dict[str, str]] | None" = None,
+) -> dict:
+    """Serializa los campos mutables de un SimVehicle para IPC entre procesos."""
     return {
         "id": v.id,
         "status": v.status.value,
@@ -346,10 +754,18 @@ def _vehicle_to_dict(v: "SimVehicle") -> dict:  # type: ignore[name-defined]
         "current_edge_index": v.current_edge_index,
         "progress_on_edge": v.progress_on_edge,
         "velocity": v.velocity,
+        "acceleration": v.acceleration,
         "longitude": v.longitude,
         "latitude": v.latitude,
         "heading": v.heading,
-        "acceleration": v.acceleration,
+        "desired_speed_ms": getattr(v, "desired_speed_ms", 13.89),
+        "yellow_runs_light": getattr(v, "yellow_runs_light", False),
+        # Líder pre-computado en el proceso principal para evitar
+        # la necesidad de reconstruir el edge_index en cada worker.
+        "leader_gap_m": leader.gap_m if leader is not None else None,
+        "leader_vel_ms": leader.velocity_ms if leader is not None else None,
+        # Snapshot completo de fases de semáforos para _FrozenTL en workers.
+        "tl_phases": tl_phases,
     }
 
 
@@ -359,8 +775,14 @@ def _process_chunk(
     """
     Worker-process entry point.
 
-    Reconstructs lightweight SimVehicle objects from dicts, advances each one,
-    and returns the updated mutable fields plus the list of finished vehicle IDs.
+    Reconstruye SimVehicle ligeros desde dicts, avanza cada uno con IDM
+    usando el líder pre-computado, y devuelve los campos actualizados
+    más la lista de IDs terminados.
+
+    El hard-stop de semáforo se activa a través de _FrozenTL, reconstruido
+    desde la lista de nodos bloqueados serializada en el dict del vehículo.
+    Todos los vehículos del mismo chunk comparten el mismo snapshot, por lo
+    que se crea una sola instancia de _FrozenTL por chunk.
     """
     from app.core.route import RouteInfo
     from app.models.enums import VehicleStatus
@@ -368,6 +790,14 @@ def _process_chunk(
 
     finished_ids: list[str] = []
     updates: list[dict] = []
+
+    # Reconstruir _FrozenTL desde el primer vehículo del chunk (todos comparten el mismo snapshot)
+    frozen_tl: _FrozenTL | None = None
+    if vehicle_dicts:
+        raw_phases = vehicle_dicts[0].get("tl_phases")
+        if raw_phases is not None:
+            # node_id keys llegan como int/str según IPC — normalizar a int
+            frozen_tl = _FrozenTL({int(k): v for k, v in raw_phases.items()})
 
     for vd in vehicle_dicts:
         node_path = vd["node_path"]
@@ -391,8 +821,19 @@ def _process_chunk(
             acceleration=vd["acceleration"],
             heading=vd["heading"],
             progress_on_edge=vd["progress_on_edge"],
+            desired_speed_ms=vd.get("desired_speed_ms", 13.89),
+            yellow_runs_light=vd.get("yellow_runs_light", False),
         )
-        finished = _advance_vehicle(v, _worker_graph, dt)  # type: ignore[arg-type]
+
+        # Reconstruir líder pre-computado
+        leader: NeighborInfo | None = None
+        if vd.get("leader_gap_m") is not None:
+            leader = NeighborInfo(
+                gap_m=vd["leader_gap_m"],
+                velocity_ms=vd["leader_vel_ms"],
+            )
+
+        finished = _advance_vehicle_idm(v, _worker_graph, dt, leader, tl_ref=frozen_tl)  # type: ignore[arg-type]
         if finished:
             finished_ids.append(v.id)
         updates.append({
@@ -401,6 +842,7 @@ def _process_chunk(
             "current_edge_index": v.current_edge_index,
             "progress_on_edge": v.progress_on_edge,
             "velocity": v.velocity,
+            "acceleration": v.acceleration,
             "longitude": v.longitude,
             "latitude": v.latitude,
             "heading": v.heading,
@@ -413,16 +855,19 @@ async def update_vehicles_parallel(
     vehicles: "dict[str, SimVehicle]",  # type: ignore[name-defined]
     graph: "RoadNetworkGraph",          # type: ignore[name-defined]
     dt: float,
+    tl_controller: object | None = None,
+    blocked_edges: "set[tuple[int, int]] | None" = None,
 ) -> list[str]:
     """
     Avanza todos los vehículos usando todos los cores disponibles.
 
-    - Con < _PARALLEL_THRESHOLD vehículos: corre update_vehicles en asyncio.to_thread
-      para liberar el event loop sin incurrir en el overhead de IPC.
-    - Con ≥ _PARALLEL_THRESHOLD vehículos: divide la lista en chunks (uno por core),
-      los procesa en paralelo en un ProcessPoolExecutor y reintegra los resultados.
-    - Si el ProcessPoolExecutor falla (error de pickle, imports, etc.) cae
-      automáticamente a asyncio.to_thread para no romper la simulación.
+    La detección de líderes y semáforos se realiza siempre en el proceso
+    principal (requiere visibilidad global de todos los vehículos), y los
+    resultados se pasan como datos a los workers para el cálculo IDM.
+
+    - Con < _PARALLEL_THRESHOLD vehículos: asyncio.to_thread (sin IPC overhead).
+    - Con ≥ _PARALLEL_THRESHOLD: ProcessPoolExecutor con un chunk por core.
+    - Fallback automático a asyncio.to_thread si el ProcessPool falla.
 
     Returns:
         Lista de vehicle_ids que terminaron su ruta en este tick.
@@ -431,51 +876,122 @@ async def update_vehicles_parallel(
 
     n = len(vehicles)
 
-    if n < _PARALLEL_THRESHOLD:
-        return await asyncio.to_thread(update_vehicles, vehicles, graph, dt)
+    if n < VEHICLE_PHYSICS_PARALLEL_THRESHOLD:
+        return await asyncio.to_thread(
+            update_vehicles, vehicles, graph, dt, tl_controller, blocked_edges
+        )
 
     try:
-        executor = _ensure_executor(graph)
-        vehicle_list = list(vehicles.values())
-        n_workers = min(os.cpu_count() or 1, n)
-        chunk_size = math.ceil(n / n_workers)
-        chunks = [
-            [_vehicle_to_dict(v) for v in vehicle_list[i : i + chunk_size]]
-            for i in range(0, n, chunk_size)
-        ]
+        # ── Pre-compute leaders in main process ────────────────────────────────
+        # La detección requiere el estado global de todos los vehículos,
+        # por lo que no puede delegarse a workers independientes.
+        if blocked_edges is None:
+            blocked_edges = set()
 
-        loop = asyncio.get_running_loop()
-        futures = [
-            loop.run_in_executor(executor, _process_chunk, chunk, dt)
-            for chunk in chunks
-        ]
-        results = await asyncio.gather(*futures)
+        # Manejar vehículos en COLLISION / PAUSED antes del IDM: decrementar
+        # timers, marcar finalizados, y excluirlos del despacho a workers.
+        pre_finished: list[str] = []
+        active_vehicles: dict[str, SimVehicle] = {}
+        for v in vehicles.values():
+            if v.status == VehicleStatus.FINISHED:
+                pre_finished.append(v.id)
+                continue
+            if v.status == VehicleStatus.COLLISION:
+                v.collision_timer = getattr(v, "collision_timer", 0.0) - dt
+                if v.collision_timer <= 0.0:
+                    pre_finished.append(v.id)
+                continue  # colisionados no se despachan
+            if v.status == VehicleStatus.PAUSED:
+                continue
+            if v.status == VehicleStatus.IDLE:
+                v.status = VehicleStatus.MOVING
+            active_vehicles[v.id] = v
+
+        edge_index = _build_edge_index(active_vehicles)
+        vehicle_list = list(active_vehicles.values())
+
+        leaders: dict[str, NeighborInfo | None] = {}
+        colliding_ids: set[str] = set()
+        for v in vehicle_list:
+            ldr = _find_leader(v, edge_index, graph)
+            if tl_controller is not None:
+                tl_ldr = _check_traffic_light(v, graph, tl_controller)
+                if tl_ldr is not None and (ldr is None or tl_ldr.gap_m < ldr.gap_m):
+                    ldr = tl_ldr
+
+            # Detección determinista de colisiones en el proceso principal
+            too_close = (
+                ldr is not None
+                and ldr.leader_id is not None
+                and ldr.gap_m < COLLISION_GAP_THRESHOLD_M
+                and v.status == VehicleStatus.MOVING
+            )
+            if too_close:
+                v.proximity_timer = getattr(v, "proximity_timer", 0.0) + dt
+                if v.proximity_timer >= COLLISION_PROXIMITY_DURATION_S:
+                    other = vehicles.get(ldr.leader_id)  # type: ignore[union-attr]
+                    if other is not None and other.status == VehicleStatus.MOVING:
+                        _trigger_collision(v, other, blocked_edges)
+                        v.proximity_timer = 0.0
+                        colliding_ids.add(v.id)
+                        colliding_ids.add(other.id)
+            else:
+                v.proximity_timer = 0.0
+
+            leaders[v.id] = ldr
+
+        # Serializar snapshot completo de fases para _FrozenTL en workers
+        tl_phases_dict: dict[int, dict[str, str]] | None = None
+        if tl_controller is not None:
+            tl_phases_dict = tl_controller.get_snapshot()  # type: ignore[union-attr]
+
+        # Excluir colisionados de esta iteración: su status ya es COLLISION y
+        # el worker no debe reintegrarlos en el IDM ni mover su posición.
+        dispatch_list = [v for v in vehicle_list if v.id not in colliding_ids]
+        n_dispatch = len(dispatch_list)
+        if n_dispatch == 0:
+            results = []
+        else:
+            executor  = _ensure_executor(graph)
+            n_workers = min(os.cpu_count() or 1, n_dispatch)
+            chunk_size = max(1, math.ceil(n_dispatch / n_workers))
+            chunks = [
+                [_vehicle_to_dict(v, leaders.get(v.id), tl_phases_dict)
+                 for v in dispatch_list[i : i + chunk_size]]
+                for i in range(0, n_dispatch, chunk_size)
+            ]
+
+            loop    = asyncio.get_running_loop()
+            futures = [
+                loop.run_in_executor(executor, _process_chunk, chunk, dt)
+                for chunk in chunks
+            ]
+            results = await asyncio.gather(*futures)
 
     except Exception:
-        # Fallback: el ProcessPoolExecutor puede fallar al arrancar (pickle del grafo,
-        # imports de app.* en workers spawn, etc.). En ese caso degradamos
-        # gracefully al path de un solo hilo para no romper la simulación.
         logger.exception(
-            "ProcessPoolExecutor falló (n=%d vehículos); degradando a asyncio.to_thread",
-            n,
+            "ProcessPoolExecutor falló (n=%d vehículos); degradando a asyncio.to_thread", n
         )
         global _EXECUTOR
-        _EXECUTOR = None  # Forzar recreación en el próximo tick
-        return await asyncio.to_thread(update_vehicles, vehicles, graph, dt)
+        _EXECUTOR = None
+        return await asyncio.to_thread(
+            update_vehicles, vehicles, graph, dt, tl_controller, blocked_edges
+        )
 
-    finished_ids: list[str] = []
+    finished_ids: list[str] = list(pre_finished)
     for updates, chunk_finished in results:
         for upd in updates:
             vid = upd["id"]
             if vid in vehicles:
                 v = vehicles[vid]
-                v.status = VehicleStatus(upd["status"])
+                v.status             = VehicleStatus(upd["status"])
                 v.current_edge_index = upd["current_edge_index"]
-                v.progress_on_edge = upd["progress_on_edge"]
-                v.velocity = upd["velocity"]
-                v.longitude = upd["longitude"]
-                v.latitude = upd["latitude"]
-                v.heading = upd["heading"]
+                v.progress_on_edge   = upd["progress_on_edge"]
+                v.velocity           = upd["velocity"]
+                v.acceleration       = upd["acceleration"]
+                v.longitude          = upd["longitude"]
+                v.latitude           = upd["latitude"]
+                v.heading            = upd["heading"]
         finished_ids.extend(chunk_finished)
 
     return finished_ids
