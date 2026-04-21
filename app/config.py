@@ -65,9 +65,9 @@ class Settings(BaseSettings):
         description="Segundos entre updates de simulación",
     )
     MAX_VEHICLES: int = Field(
-        default=10000,
+        default=1_000_000_000,
         ge=1,
-        description="Número máximo de vehículos en simulación",
+        description="Número máximo de vehículos en simulación (default ilimitado)",
     )
 
     # Database Configuration

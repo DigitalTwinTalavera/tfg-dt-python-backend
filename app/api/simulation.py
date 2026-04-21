@@ -28,7 +28,7 @@ router = APIRouter(prefix="/simulation")
 
 
 class SpawnRequest(BaseModel):
-    count: int = Field(default=1, ge=1, le=10000, description="Número de vehículos a generar")
+    count: int = Field(default=1, ge=1, description="Número de vehículos a generar")
 
 
 class SpeedRequest(BaseModel):

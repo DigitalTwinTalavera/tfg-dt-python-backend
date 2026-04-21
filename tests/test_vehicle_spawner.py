@@ -129,13 +129,18 @@ class TestVehicleSpawnerInit:
 
     @pytest.mark.unit
     def test_entry_nodes(self, spawner):
+        # Origenes permitidos = ENTRY_POINT ∪ INTERSECTION (cobertura amplia
+        # para que cualquier calle interior pueda ser punto de spawn).
         entries = spawner.get_entry_nodes()
-        assert set(entries) == {1, 2}
+        assert {1, 2}.issubset(set(entries))
+        assert {10, 11}.issubset(set(entries))
 
     @pytest.mark.unit
     def test_exit_nodes(self, spawner):
+        # Destinos permitidos = EXIT_POINT ∪ INTERSECTION.
         exits = spawner.get_exit_nodes()
-        assert set(exits) == {100, 101}
+        assert {100, 101}.issubset(set(exits))
+        assert {10, 11}.issubset(set(exits))
 
 
 # =============================================================================
@@ -170,21 +175,23 @@ class TestVehicleSpawnerSpawn:
         assert v3[0].id == "v_003"
 
     @pytest.mark.unit
-    def test_spawn_respects_max_vehicles(self, spawner):
+    def test_spawn_allows_unlimited_active(self, spawner):
+        # max_vehicles ya no actúa como tope duro: el spawner siempre
+        # intenta crear exactamente `count` vehículos (sólo limitado por
+        # la capacidad física del grafo en pruebas extremas).
         spawner.spawn(count=10)
         assert spawner.active_count == 10
 
-        # Intentar spawn más allá del límite
         overflow = spawner.spawn(count=5)
-        assert len(overflow) == 0
-        assert spawner.active_count == 10
+        assert len(overflow) == 5
+        assert spawner.active_count == 15
 
     @pytest.mark.unit
-    def test_spawn_partial_when_near_limit(self, spawner):
+    def test_spawn_full_count_even_near_limit(self, spawner):
         spawner.spawn(count=8)
         extra = spawner.spawn(count=5)
-        assert len(extra) == 2
-        assert spawner.active_count == 10
+        assert len(extra) == 5
+        assert spawner.active_count == 13
 
     @pytest.mark.unit
     def test_spawn_vehicle_has_position(self, spawner):
