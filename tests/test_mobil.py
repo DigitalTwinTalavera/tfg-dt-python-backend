@@ -337,3 +337,66 @@ class TestMOBILConstructor:
         idm_p = IDMParameters(v0=30.0)
         m = MOBILModel(idm_params=idm_p)
         assert m.idm.params.v0 == 30.0
+
+
+# =============================================================================
+# Plan C: suelo absoluto de gap en MOBIL
+# =============================================================================
+
+
+class TestMOBILMinGapFloor:
+    @pytest.mark.unit
+    def test_rejects_change_with_subthreshold_front_gap(self):
+        """Un candidato delante en el carril destino a <3 m rechaza el cambio
+        aunque el incentivo sería positivo: el suelo de seguridad actúa antes
+        del criterio IDM, protegiendo frente al clamp `max(gap, 0.01)` que
+        engaña al IDM cuando hay solape físico."""
+        m = MOBILModel(
+            mobil_params=MOBILParameters(politeness=0.0, b_safe=4.0, a_threshold=0.1),
+        )
+        target = LaneContext(
+            gap_front=1.5, v_front=0.0,   # líder pegado casi parado
+            gap_back=None, v_back=None,   # sin seguidor
+        )
+        decision = m.evaluate_lane_change(
+            v_ego=5.0, v0_ego=13.89, current_accel=-6.0,
+            gap_front_current=None, v_front_current=None,
+            lane_left=target, lane_right=None,
+        )
+        assert decision.should_change is False
+
+    @pytest.mark.unit
+    def test_rejects_change_with_subthreshold_back_gap(self):
+        """Seguidor pegado por detrás en el carril destino rechaza el cambio
+        explícitamente sin depender de si el IDM llega al umbral b_safe."""
+        m = MOBILModel(
+            mobil_params=MOBILParameters(politeness=0.0, b_safe=4.0, a_threshold=0.1),
+        )
+        target = LaneContext(
+            gap_front=50.0, v_front=10.0,
+            gap_back=1.0, v_back=0.0, v_back_current_accel=0.0,
+        )
+        decision = m.evaluate_lane_change(
+            v_ego=5.0, v0_ego=13.89, current_accel=0.0,
+            gap_front_current=None, v_front_current=None,
+            lane_left=target, lane_right=None,
+        )
+        assert decision.should_change is False
+
+    @pytest.mark.unit
+    def test_accepts_change_when_gaps_above_floor(self):
+        """Verificación negativa: con gaps por encima del suelo y sin conflicto
+        de IDM, MOBIL sigue aceptando el cambio — el suelo no rompe el happy path."""
+        m = MOBILModel(
+            mobil_params=MOBILParameters(politeness=0.0, b_safe=4.0, a_threshold=0.1),
+        )
+        target = LaneContext(
+            gap_front=50.0, v_front=10.0,
+            gap_back=30.0, v_back=5.0, v_back_current_accel=0.0,
+        )
+        decision = m.evaluate_lane_change(
+            v_ego=5.0, v0_ego=13.89, current_accel=-1.0,
+            gap_front_current=3.0, v_front_current=0.0,
+            lane_left=target, lane_right=None,
+        )
+        assert decision.should_change is True

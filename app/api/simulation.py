@@ -317,6 +317,7 @@ async def list_collisions(
 async def clear_vehicle_collision(
     vehicle_id: str,
     spawner: VehicleSpawner = Depends(get_vehicle_spawner),
+    broadcaster: SimulationBroadcaster = Depends(get_broadcaster),
 ) -> dict:
     """
     Retira manualmente un vehículo colisionado (gemelo digital: simula la
@@ -342,6 +343,10 @@ async def clear_vehicle_collision(
         edge_key = (np_[ei], np_[ei + 1])
 
     spawner.remove_vehicle(vehicle_id)
+    # El cliente Godot sólo retira el vehículo del MultiMesh cuando recibe
+    # vehicle_finished; sin este broadcast el coche quedaría pintado en la
+    # escena aun habiendo sido borrado del backend.
+    await broadcaster.broadcast_vehicle_finished(vehicle_id)
 
     released = False
     if edge_key is not None and edge_key in spawner.blocked_edges:
@@ -365,6 +370,45 @@ async def clear_vehicle_collision(
         "edge": {"start_node_id": edge_key[0], "end_node_id": edge_key[1]}
         if edge_key
         else None,
+    }
+
+
+@router.post("/collisions/clear-all")
+async def clear_all_collisions(
+    spawner: VehicleSpawner = Depends(get_vehicle_spawner),
+    broadcaster: SimulationBroadcaster = Depends(get_broadcaster),
+) -> dict:
+    """
+    Retira de una sola vez todos los vehículos en estado de colisión y
+    libera las aristas bloqueadas por ellos. Equivalente a pulsar "Retirar"
+    en cada fila del panel de colisiones.
+    """
+    to_clear: list[tuple[str, tuple[int, int] | None]] = []
+    for v in list(spawner.vehicles.values()):
+        if v.status != VehicleStatus.COLLISION:
+            continue
+        np_ = v.route.node_path
+        ei = v.current_edge_index
+        edge_key = (np_[ei], np_[ei + 1]) if ei < len(np_) - 1 else None
+        to_clear.append((v.id, edge_key))
+
+    edges_to_release: set[tuple[int, int]] = set()
+    for vid, edge_key in to_clear:
+        spawner.remove_vehicle(vid)
+        await broadcaster.broadcast_vehicle_finished(vid)
+        if edge_key is not None:
+            edges_to_release.add(edge_key)
+
+    released: list[list[int]] = []
+    for edge_key in edges_to_release:
+        if edge_key in spawner.blocked_edges:
+            spawner.blocked_edges.pop(edge_key, None)
+            released.append([edge_key[0], edge_key[1]])
+
+    return {
+        "status": "cleared_all",
+        "count": len(to_clear),
+        "edges_released": released,
     }
 
 

@@ -36,6 +36,7 @@ from dataclasses import dataclass
 
 from app.core.constants import (
     ATTR_CURVE_VMAX,
+    ATTR_EDGE_ID,
     ATTR_IS_ROUNDABOUT,
     ATTR_LANES,
     ATTR_LATITUDE,
@@ -54,14 +55,19 @@ from app.core.constants import (
     DEFAULT_VEHICLE_SPEED_KMH,
     EDGE_HEADING_BLEND_DIST_M,
     EDGE_HEADING_BLEND_DIST_ROUNDABOUT_EXIT_M,
+    EMERGENCY_BRAKE_EGO_V_DELTA_MS,
+    EMERGENCY_BRAKE_GAP_MAX_M,
+    EMERGENCY_BRAKE_LEADER_V_MAX_MS,
     ENTRY_ARBITRATION_ZONE_M,
     KMH_TO_MS,
+    LOOKAHEAD_ENTRY_TRIGGER_M,
     LOOKAHEAD_ROUNDABOUT_TRIGGER_M,
     MAX_EMERGENCY_DECEL_MS2,
     MIN_EDGE_LENGTH_M,
     MIN_ROUNDABOUT_RADIUS_M,
     MOBIL_EVAL_INTERVAL_TICKS,
     MOBIL_MIN_DIST_TO_EDGE_END_M,
+    PERIODIC_REROUTE_TICK_INTERVAL,
     SIGN_DETECTION_ZONE_M,
     STOP_SIGN_DWELL_SPEED_MS,
     STOP_SIGN_DWELL_TIME_S,
@@ -345,24 +351,56 @@ def _find_leader(
             return NeighborInfo(gap_m=raw_gap, velocity_ms=candidate.velocity, leader_id=candidate.id)
 
     # ── Look-ahead al inicio de la siguiente arista ────────────────────────────
-    # Gate fraccional (>70%) + gate por distancia absoluta cuando la siguiente
-    # arista es rotonda: en entradas cortas un tick puede saltar 65%→105% sin
-    # disparar el gate del 70%, dejando solapar a dos coches en la transición.
+    # Gate fraccional (>70%) + gate por distancia absoluta cuando la actual o la
+    # siguiente son rotonda: en arcos cortos (15 m) un tick puede saltar 65%→105%
+    # sin disparar el gate del 70%, dejando que un coche rápido alcance al lento
+    # del arco siguiente sin verlo. Se dispara tanto al entrar al anillo como
+    # dentro del propio anillo (dos arcos consecutivos del mismo rid). En
+    # entry-to-ring (cur NO anillo, next SÍ) se usa ventana más ancha porque
+    # el ego puede tener que frenar desde velocidad de crucero ante cola en
+    # el anillo siguiente (v²/2b ≈ 34 m con b=2.5).
     if ei + 1 < len(node_path) - 1:
         next_attrs = graph.get_edge_attributes(node_path[ei + 1], node_path[ei + 2])
         remaining_current_m = (1.0 - vehicle.progress_on_edge) * edge_len
-        distance_gate = (
-            bool(next_attrs.get(ATTR_IS_ROUNDABOUT))
-            and remaining_current_m < LOOKAHEAD_ROUNDABOUT_TRIGGER_M
-        )
+        cur_is_roundabout = bool(edge_attrs.get(ATTR_IS_ROUNDABOUT))
+        next_is_roundabout = bool(next_attrs.get(ATTR_IS_ROUNDABOUT))
+        is_entry = next_is_roundabout and not cur_is_roundabout
+        if cur_is_roundabout or next_is_roundabout:
+            threshold = (
+                LOOKAHEAD_ENTRY_TRIGGER_M if is_entry else LOOKAHEAD_ROUNDABOUT_TRIGGER_M
+            )
+            distance_gate = remaining_current_m < threshold
+        else:
+            distance_gate = False
         if vehicle.progress_on_edge > 0.70 or distance_gate:
             next_key = (node_path[ei + 1], node_path[ei + 2])
             next_edge_len = max(float(next_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
             candidates_next = edge_index.get(next_key, [])
+            # Dentro del mismo anillo los carriles están geométricamente alineados
+            # entre arcos: un coche en lane=0 del arco A solo es líder de los
+            # que vienen detrás en lane=0; los de lane=1 no le afectan. Fuera
+            # de esta condición mantenemos el comportamiento conservador de
+            # ignorar el carril (entrada a rotonda, cambio a calle normal…)
+            # porque el lane puede reasignarse en la transición.
+            same_ring = (
+                cur_is_roundabout
+                and next_is_roundabout
+                and edge_attrs.get(ATTR_ROUNDABOUT_ID) == next_attrs.get(ATTR_ROUNDABOUT_ID)
+                and edge_attrs.get(ATTR_ROUNDABOUT_ID) is not None
+            )
+            if same_ring:
+                candidates_next = [
+                    c for c in candidates_next if getattr(c, "lane", 0) == ego_lane
+                ]
+            elif is_entry:
+                # El ego entrará en un carril determinista según su ruta; los
+                # circulantes del anillo en otro carril no le afectan.
+                ego_target_lane = _target_roundabout_lane(vehicle, graph)
+                candidates_next = [
+                    c for c in candidates_next if getattr(c, "lane", 0) == ego_target_lane
+                ]
             if candidates_next:
                 # El que tiene menor progress está más cerca del inicio → el que más molesta.
-                # Ignoramos carril porque al cambiar de arista el lane se reasigna,
-                # y queremos una estimación conservadora para evitar overlaps en la transición.
                 first_on_next = min(candidates_next, key=lambda v: v.progress_on_edge)
                 if first_on_next.id != vehicle.id:
                     dist_on_next = first_on_next.progress_on_edge * next_edge_len
@@ -406,24 +444,72 @@ def _build_ring_occupancy(
     return occ
 
 
+def _target_roundabout_lane(
+    v: SimVehicle,
+    graph: RoadNetworkGraph,
+) -> int:
+    """
+    Devuelve el carril que `v` debería ocupar dentro del anillo según su ruta.
+
+    Estrategia de rotonda de 2 carriles realista:
+      - Si la ruta recorre 1 arco o menos dentro del anillo (sale en la próxima
+        salida) → carril EXTERIOR (lane 0).
+      - Si la ruta recorre ≥ 2 arcos → carril INTERIOR (lane n_lanes-1).
+      - Si la primera arista del anillo es de 1 carril → 0.
+
+    Función pura (sin RNG) — puede llamarse varias veces por tick y cachearse.
+    Devuelve 0 si el vehículo no tiene arista de anillo en su ruta.
+    """
+    np_ = v.route.node_path
+    ei = v.current_edge_index
+    # Localizar el primer arco de anillo a partir de la posición actual del vehículo.
+    first_ring_k: int | None = None
+    first_rid: int | None = None
+    first_n_lanes: int = 1
+    for k in range(ei, len(np_) - 1):
+        attrs = graph.get_edge_attributes(np_[k], np_[k + 1])
+        if attrs.get(ATTR_IS_ROUNDABOUT):
+            first_ring_k = k
+            first_rid = attrs.get(ATTR_ROUNDABOUT_ID)
+            first_n_lanes = max(int(attrs.get(ATTR_LANES, 1)), 1)
+            break
+    if first_ring_k is None or first_rid is None or first_n_lanes <= 1:
+        return 0
+    # Contar arcos consecutivos con el mismo rid hasta la primera arista no-anillo.
+    ring_arc_count = 0
+    for k in range(first_ring_k, len(np_) - 1):
+        attrs = graph.get_edge_attributes(np_[k], np_[k + 1])
+        if (
+            attrs.get(ATTR_IS_ROUNDABOUT)
+            and attrs.get(ATTR_ROUNDABOUT_ID) == first_rid
+        ):
+            ring_arc_count += 1
+        else:
+            break
+    if ring_arc_count <= 1:
+        return 0  # carril exterior: saldrá en la próxima
+    return first_n_lanes - 1  # carril interior: dará (al menos) un arco más
+
+
 def _build_entry_arm_index(
     vehicles: dict[str, SimVehicle],
     graph: RoadNetworkGraph,
-) -> dict[int, list[SimVehicle]]:
+) -> dict[tuple[int, int], list[SimVehicle]]:
     """
-    Índice {entry_node_id → vehículos que se aproximan a esa línea de entrada
-    desde una arista exterior al anillo}.
+    Índice {(entry_node_id, target_lane) → vehículos que se aproximan a esa
+    línea de entrada y pretenden ocupar ese carril dentro del anillo}.
 
     Un vehículo se considera "aproximándose" cuando:
       - su arista actual NO es de rotonda;
       - su arista siguiente SÍ es de rotonda;
       - la distancia restante hasta el nodo de entrada < ENTRY_ARBITRATION_ZONE_M.
 
-    Se precomputa una vez por tick y lo usa `_find_roundabout_yield_leader` para
-    arbitrar entre brazos convergentes (varios vehículos apuntando al mismo
-    entry_node deben entrar uno a uno).
+    Se segmenta por carril de destino (calculado con `_target_roundabout_lane`)
+    para que dos vehículos que entran al mismo nodo pero a carriles distintos
+    NO se arbitren como conflicto: cada carril tiene su propia cola de
+    prioridad.
     """
-    arms: dict[int, list[SimVehicle]] = {}
+    arms: dict[tuple[int, int], list[SimVehicle]] = {}
     for v in vehicles.values():
         if v.status == VehicleStatus.FINISHED:
             continue
@@ -441,7 +527,8 @@ def _build_entry_arm_index(
         dist_to_ring = (1.0 - v.progress_on_edge) * edge_len
         if dist_to_ring > ENTRY_ARBITRATION_ZONE_M:
             continue
-        arms.setdefault(np_[ei + 1], []).append(v)
+        target_lane = _target_roundabout_lane(v, graph)
+        arms.setdefault((np_[ei + 1], target_lane), []).append(v)
     return arms
 
 
@@ -487,17 +574,20 @@ def _find_roundabout_yield_leader(
     vehicle: SimVehicle,
     graph: RoadNetworkGraph,
     ring_occupancy: dict[int, list[SimVehicle]],
-    entry_arms: dict[int, list[SimVehicle]],
+    entry_arms: dict[tuple[int, int], list[SimVehicle]],
 ) -> NeighborInfo | None:
     """
     Genera un "líder virtual" parado en la línea de entrada de la rotonda.
 
     Dispara en dos casos:
       1. Un vehículo ya circulando en el anillo llegará antes que el ego al nodo
-         de entrada (regla de ceda-el-paso clásica).
+         de entrada Y va en el MISMO carril de destino (regla de ceda-el-paso
+         clásica). Si el circulante va por otro carril su trayectoria no
+         conflicta con la del ego.
       2. Otro vehículo se aproxima al MISMO entry_node desde otra arista
-         convergente y está más cerca — arbitración cross-arm para evitar que
-         dos coches crucen la línea a la vez y se solapen en el primer arco.
+         convergente Y pretende ocupar el MISMO carril destino del anillo; en
+         ese caso se arbitra cross-arm. Si apuntan a carriles distintos, ambos
+         entran sin ceder.
 
     Solo se evalúa para vehículos fuera del anillo cuya siguiente arista es
     rotonda y están dentro de YIELD_DETECTION_ZONE_M de la línea de entrada.
@@ -528,11 +618,15 @@ def _find_roundabout_yield_leader(
         return None
 
     entry_node = np_[ei + 1]
+    ego_target_lane = _target_roundabout_lane(vehicle, graph)
 
     # ── (1) Vehículos ya circulando: regla de ceda clásica ─────────────────────
     must_yield = False
     for other in ring_occupancy.get(int(rid), ()):
         if other.id == vehicle.id:
+            continue
+        # Otro carril del anillo: trayectorias paralelas, no conflictan.
+        if getattr(other, "lane", 0) != ego_target_lane:
             continue
         # `_arc_distance_on_ring` respeta la direccionalidad del anillo y
         # devuelve inf si la ruta del otro no pasa por nuestro entry_node.
@@ -547,9 +641,10 @@ def _find_roundabout_yield_leader(
             break
 
     # ── (2) Arbitración cross-arm: gana el más cercano al entry_node ──────────
-    # Determinista: tie-break por `vehicle.id` (UUID estable). El perdedor cede.
+    # Segmentada por carril destino — dos coches que entran al mismo nodo pero
+    # a carriles distintos NO conflictan. Tie-break determinista por vehicle.id.
     if not must_yield:
-        contenders = entry_arms.get(entry_node, ())
+        contenders = entry_arms.get((entry_node, ego_target_lane), ())
         if len(contenders) > 1:
             def _remaining(v: SimVehicle) -> tuple[float, str]:
                 v_np = v.route.node_path
@@ -700,6 +795,14 @@ def _evaluate_lane_change(
     # ejecuta solo en tramos rectos/aproximaciones.
     if edge_attrs.get(ATTR_IS_ROUNDABOUT):
         return
+    # Aproximación a rotonda: disciplinar la cola. Un cambio de carril aquí
+    # crea alcances en el nuevo carril cuando el circulante que ya venía por
+    # detrás no puede frenar a tiempo — y MOBIL no gana nada, porque el
+    # carril destino lo fija _target_roundabout_lane según la ruta.
+    if ei + 1 < len(node_path) - 1:
+        next_attrs = graph.get_edge_attributes(node_path[ei + 1], node_path[ei + 2])
+        if bool(next_attrs.get(ATTR_IS_ROUNDABOUT)):
+            return
     n_lanes = max(int(edge_attrs.get(ATTR_LANES, 1)), 1)
     if n_lanes <= 1:
         return
@@ -993,6 +1096,19 @@ def _advance_vehicle_idm(
     else:
         a = idm.calculate_acceleration(v=vehicle.velocity, v0=desired_v)
 
+    # Red de seguridad: ante líder casi parado a gap corto y ego más rápido,
+    # forzar freno máximo. Ampliado respecto a la versión previa (líder parado
+    # y gap<5m) para atajar rear-ends de aproximación a cola — principal causa
+    # primaria de colisiones en E2E con 5000 veh. Cubre el caso donde un
+    # vehículo llega a 8 m/s detrás de una cola a 1 m/s en 10 m: el IDM puro
+    # no alcanza MAX_EMERGENCY_DECEL_MS2 a tiempo.
+    if (
+        leader is not None
+        and leader.velocity_ms < EMERGENCY_BRAKE_LEADER_V_MAX_MS
+        and leader.gap_m < EMERGENCY_BRAKE_GAP_MAX_M
+        and vehicle.velocity > leader.velocity_ms + EMERGENCY_BRAKE_EGO_V_DELTA_MS
+    ):
+        a = -MAX_EMERGENCY_DECEL_MS2
     a = max(a, -MAX_EMERGENCY_DECEL_MS2)  # límite físico de frenado
     # Clamp al rango físico del perfil: útil para el cliente (dead reckoning)
     a = min(a, idm.params.a)
@@ -1100,6 +1216,17 @@ def _advance_vehicle_idm(
                 new_lanes = max(int(new_edge_attrs.get(ATTR_LANES, 1)), 1)
                 cur_lane = getattr(vehicle, "lane", 0)
                 vehicle.lane = min(cur_lane, new_lanes - 1)
+                # Cruzando la línea de entrada a un anillo: forzar el carril
+                # según la ruta (exterior si sale ya, interior si da ≥1 vuelta
+                # más). Reparte carga entre carriles y evita que todo el
+                # tráfico se apile en lane=0 cuando la arista previa era de
+                # 1 carril. Gated a la transición NO-anillo → SÍ-anillo.
+                entering_ring = bool(new_edge_attrs.get(ATTR_IS_ROUNDABOUT)) and not bool(
+                    edge_attrs.get(ATTR_IS_ROUNDABOUT)
+                )
+                if entering_ring:
+                    target = _target_roundabout_lane(vehicle, graph)
+                    vehicle.lane = min(target, new_lanes - 1)
         else:
             vehicle.progress_on_edge += remaining_dist / edge_len
             vehicle.progress_on_edge  = min(vehicle.progress_on_edge, 1.0)
@@ -1160,6 +1287,141 @@ def _advance_vehicle_idm(
 # Public API
 # ---------------------------------------------------------------------------
 
+def _maybe_reroute_around_blocks(
+    vehicle: SimVehicle,
+    graph: RoadNetworkGraph,
+    blocked_edges: dict[tuple[int, int], object | None],
+    trigger_blocks: set[tuple[int, int]] | None = None,
+) -> bool:
+    """
+    Re-rutea un vehículo individual si su ruta pendiente toca alguna arista
+    de ``trigger_blocks`` (subconjunto relevante — típicamente bloques recién
+    creados o el conjunto total). Si se pasa ``None`` se usa ``blocked_edges``
+    completo (modo periódico / dead-wall).
+
+    La arista CURRENT (ei → ei+1) NO se re-rutea: el vehículo ya está sobre
+    ella y comprometido a su geometría. Se re-planifica desde NEXT node
+    (``node_path[ei+1]``) hacia el destino; se mantiene progreso, carril y
+    prefijo [0..ei].
+
+    Si A* devuelve una ruta que aún contiene algún bloqueo conocido (no hay
+    alternativa real), no se muta: seguir con el camino original penalizado
+    es equivalente y evita churn.
+
+    Returns:
+        True si el vehículo fue re-ruteado; False en cualquier otro caso.
+    """
+    if vehicle.status != VehicleStatus.MOVING:
+        return False
+    np_ = vehicle.route.node_path
+    ei = vehicle.current_edge_index
+    if ei >= len(np_) - 1:
+        return False
+
+    check_set = trigger_blocks if trigger_blocks is not None else set(blocked_edges.keys())
+    if not check_set:
+        return False
+
+    # ¿Alguna arista PENDIENTE (a partir de ei+1) toca el conjunto de trigger?
+    hit = False
+    for i in range(ei + 1, len(np_) - 1):
+        if (np_[i], np_[i + 1]) in check_set:
+            hit = True
+            break
+    if not hit:
+        return False
+
+    from app.core.route import RouteInfo, compute_route
+
+    pivot_node = np_[ei + 1]
+    end_node = vehicle.route.end_node_id
+    new_route = compute_route(
+        graph, pivot_node, end_node, blocked_edges=blocked_edges
+    )
+    if new_route is None or len(new_route.node_path) < 2:
+        return False
+
+    nnp = new_route.node_path
+    # Si la nueva ruta sigue atravesando un bloqueo conocido, no aporta.
+    blocked_set = set(blocked_edges.keys())
+    if any((nnp[i], nnp[i + 1]) in blocked_set for i in range(len(nnp) - 1)):
+        return False
+
+    # Concatenar prefijo [0..ei] + nueva ruta (que empieza en pivot=np_[ei+1]).
+    prefix = np_[: ei + 1]
+    combined = list(prefix) + list(nnp)
+
+    # Recalcular edge_ids y length_m del path completo.
+    total_len = 0.0
+    edge_ids: list[int] = []
+    for i in range(len(combined) - 1):
+        ea = graph.get_edge_attributes(combined[i], combined[i + 1])
+        eid = ea.get(ATTR_EDGE_ID)
+        if eid is not None:
+            edge_ids.append(eid)
+        total_len += ea.get(ATTR_LENGTH, 0.0)
+
+    vehicle.route = RouteInfo(
+        start_node_id=vehicle.route.start_node_id,
+        end_node_id=end_node,
+        node_path=combined,
+        edge_ids=edge_ids,
+        length_m=total_len,
+    )
+    return True
+
+
+def _reroute_affected_by_new_blocks(
+    vehicles: dict[str, SimVehicle],
+    graph: RoadNetworkGraph,
+    new_blocks: set[tuple[int, int]],
+    blocked_edges: dict[tuple[int, int], object | None],
+) -> int:
+    """
+    Re-rutea a todos los vehículos MOVING cuya cola de ruta pase por alguna
+    arista recién bloqueada. Se ejecuta una vez por tick tras procesar todas
+    las colisiones nuevas.
+
+    Returns:
+        Número de vehículos re-ruteados.
+    """
+    if not new_blocks:
+        return 0
+    rerouted = 0
+    for vehicle in vehicles.values():
+        if _maybe_reroute_around_blocks(
+            vehicle, graph, blocked_edges, trigger_blocks=new_blocks
+        ):
+            rerouted += 1
+    return rerouted
+
+
+def _periodic_reroute_all(
+    vehicles: dict[str, SimVehicle],
+    graph: RoadNetworkGraph,
+    blocked_edges: dict[tuple[int, int], object | None],
+) -> int:
+    """
+    Plan D1 — reroute proactivo. Recorre TODOS los MOVING y re-planifica a los
+    que siguen enrutados por aristas bloqueadas. Se llama periódicamente (ver
+    ``PERIODIC_REROUTE_TICK_INTERVAL``). Idempotente: si una ruta ya es limpia,
+    `_maybe_reroute_around_blocks` sale sin mutar.
+
+    Returns:
+        Número de vehículos re-ruteados en esta pasada.
+    """
+    if not blocked_edges:
+        return 0
+    blocked_set = set(blocked_edges.keys())
+    rerouted = 0
+    for vehicle in vehicles.values():
+        if _maybe_reroute_around_blocks(
+            vehicle, graph, blocked_edges, trigger_blocks=blocked_set
+        ):
+            rerouted += 1
+    return rerouted
+
+
 def _trigger_collision(
     v1: SimVehicle,
     v2: SimVehicle,
@@ -1194,6 +1456,7 @@ def update_vehicles(
     dt: float,
     tl_controller: object | None = None,
     blocked_edges: dict[tuple[int, int], object | None] | None = None,
+    tick_count: int = 0,
 ) -> list[str]:
     """
     Avanza todos los vehículos activos a lo largo de sus rutas usando IDM.
@@ -1207,12 +1470,19 @@ def update_vehicles(
         blocked_edges: Mapa de aristas bloqueadas por colisiones (modificado
                        in-place cuando se detecta una nueva colisión). Valor
                        ``None`` = bloqueo permanente (retirada manual por API).
+        tick_count:    Contador global de ticks. Usado para cadenciar el
+                       reroute proactivo periódico (Plan D1).
 
     Returns:
         Lista de vehicle_ids que terminaron su ruta en este tick.
     """
     if blocked_edges is None:
         blocked_edges = {}
+
+    # Snapshot de bloqueos ANTES del tick para detectar nuevos bloqueos al
+    # final y disparar auto-reroute de los vehículos cuya ruta atraviese
+    # alguna arista recién bloqueada (mitigación de pileups en cascada).
+    blocked_before: set[tuple[int, int]] = set(blocked_edges.keys())
 
     edge_index = _build_edge_index(vehicles)
     ring_occupancy = _build_ring_occupancy(vehicles, graph)
@@ -1248,6 +1518,19 @@ def update_vehicles(
         sign_leader = _check_stop_yield_sign(vehicle, graph, edge_index, dt)
         if sign_leader is not None and (leader is None or sign_leader.gap_m < leader.gap_m):
             leader = sign_leader
+
+        # Plan D2 — dead-wall detection. Si el líder detectado es un vehículo
+        # en COLLISION, la arista donde está ya figura en blocked_edges. Se
+        # intenta reroute inmediato desde el siguiente nodo (sin esperar al
+        # pase periódico). El IDM sigue frenando este tick; el reroute se
+        # aplica a la ruta pendiente.
+        if (
+            leader is not None
+            and leader.leader_id is not None
+        ):
+            ldr_v = vehicles.get(leader.leader_id)
+            if ldr_v is not None and ldr_v.status == VehicleStatus.COLLISION:
+                _maybe_reroute_around_blocks(vehicle, graph, blocked_edges)
 
         # MOBIL: evaluar cambio de carril cada MOBIL_EVAL_INTERVAL_TICKS ticks
         # (el cooldown está escalonado al spawnear para repartir carga).
@@ -1306,6 +1589,24 @@ def update_vehicles(
 
         if _advance_vehicle_idm(vehicle, graph, dt, leader, tl_ref=tl_controller):
             finished_ids.append(vehicle.id)
+
+    # Auto-reroute en bloque: detectar aristas bloqueadas en este tick y
+    # re-planificar a los vehículos MOVING cuya ruta pendiente las atraviese.
+    new_blocks = set(blocked_edges.keys()) - blocked_before
+    if new_blocks:
+        _reroute_affected_by_new_blocks(vehicles, graph, new_blocks, blocked_edges)
+
+    # Plan D1: reroute proactivo periódico. Cubre vehículos cuya ruta pasa
+    # por una arista bloqueada pero que no fueron alcanzados por el reroute
+    # on-block (ej. spawneados después del bloqueo, o rutas cuyo primer
+    # intento de reroute falló por no haber alternativa limpia en ese tick).
+    if (
+        blocked_edges
+        and PERIODIC_REROUTE_TICK_INTERVAL > 0
+        and tick_count > 0
+        and tick_count % PERIODIC_REROUTE_TICK_INTERVAL == 0
+    ):
+        _periodic_reroute_all(vehicles, graph, blocked_edges)
 
     return finished_ids
 
@@ -1509,6 +1810,7 @@ async def update_vehicles_parallel(
     dt: float,
     tl_controller: object | None = None,
     blocked_edges: "dict[tuple[int, int], object | None] | None" = None,
+    tick_count: int = 0,
 ) -> list[str]:
     """
     Avanza todos los vehículos usando todos los cores disponibles.
@@ -1530,7 +1832,7 @@ async def update_vehicles_parallel(
 
     if n < VEHICLE_PHYSICS_PARALLEL_THRESHOLD:
         return await asyncio.to_thread(
-            update_vehicles, vehicles, graph, dt, tl_controller, blocked_edges
+            update_vehicles, vehicles, graph, dt, tl_controller, blocked_edges, tick_count
         )
 
     try:
@@ -1539,6 +1841,10 @@ async def update_vehicles_parallel(
         # por lo que no puede delegarse a workers independientes.
         if blocked_edges is None:
             blocked_edges = {}
+
+        # Snapshot previo: cualquier arista añadida durante este tick activará
+        # el auto-reroute de los vehículos cuya ruta pendiente la atraviese.
+        blocked_before: set[tuple[int, int]] = set(blocked_edges.keys())
 
         # Vehículos en COLLISION se quedan en place (retirada manual por API).
         # PAUSED y FINISHED se excluyen del despacho a workers. IDLE → MOVING.
@@ -1621,6 +1927,15 @@ async def update_vehicles_parallel(
             else:
                 v.mobil_cooldown_ticks -= 1
 
+            # Plan D2 — dead-wall detection en el path paralelo. Si el líder
+            # es un vehículo en COLLISION, reruta inmediato desde el siguiente
+            # nodo sin esperar al pase periódico. El IDM seguirá frenando en
+            # el worker con el líder ya calculado.
+            if ldr is not None and ldr.leader_id is not None:
+                ldr_v = vehicles.get(ldr.leader_id)
+                if ldr_v is not None and ldr_v.status == VehicleStatus.COLLISION:
+                    _maybe_reroute_around_blocks(v, graph, blocked_edges)
+
             leaders[v.id] = ldr
 
         # Serializar snapshot completo de fases para _FrozenTL en workers
@@ -1658,7 +1973,7 @@ async def update_vehicles_parallel(
         global _EXECUTOR
         _EXECUTOR = None
         return await asyncio.to_thread(
-            update_vehicles, vehicles, graph, dt, tl_controller, blocked_edges
+            update_vehicles, vehicles, graph, dt, tl_controller, blocked_edges, tick_count
         )
 
     finished_ids: list[str] = list(pre_finished)
@@ -1680,5 +1995,21 @@ async def update_vehicles_parallel(
                     "prev_edge_end_heading", v.prev_edge_end_heading
                 )
         finished_ids.extend(chunk_finished)
+
+    # Auto-reroute de vehículos afectados por bloqueos surgidos en este tick.
+    # Se ejecuta tras aplicar los updates de los workers para que el
+    # current_edge_index e índices asociados sean los más recientes.
+    new_blocks = set(blocked_edges.keys()) - blocked_before
+    if new_blocks:
+        _reroute_affected_by_new_blocks(vehicles, graph, new_blocks, blocked_edges)
+
+    # Plan D1: pase proactivo periódico (cadenciado por tick_count).
+    if (
+        blocked_edges
+        and PERIODIC_REROUTE_TICK_INTERVAL > 0
+        and tick_count > 0
+        and tick_count % PERIODIC_REROUTE_TICK_INTERVAL == 0
+    ):
+        _periodic_reroute_all(vehicles, graph, blocked_edges)
 
     return finished_ids

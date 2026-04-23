@@ -199,7 +199,19 @@ ATTR_ROUNDABOUT_ID = "roundabout_id"   # int|None — identifies a connected rin
 ATTR_CURVE_VMAX = "curve_vmax"         # float m/s — cached curvature speed cap for the edge
 
 # Routing penalties
-BLOCKED_EDGE_PENALTY_FACTOR: float = 1000.0  # multiplicador de peso para aristas con choque activo
+# Plan D3: exclusión efectiva de aristas bloqueadas en A*. Con el factor
+# anterior (1000×) un camino alternativo de 500 s perdía frente a un atajo
+# bloqueado de ~0.5 s; la cascada seguía alimentando la arista bloqueada.
+# 1e9 garantiza que cualquier alternativa finita gana, manteniendo fallback
+# cuando el grafo queda realmente desconectado (no se excluye del grafo).
+BLOCKED_EDGE_PENALTY_FACTOR: float = 1e9
+
+# Plan D1: cadencia del reroute proactivo periódico. Cada N ticks todos los
+# vehículos MOVING re-evalúan si su ruta pendiente toca alguna arista bloqueada
+# y recalculan. Compensa el hecho de que `_reroute_affected_by_new_blocks` sólo
+# dispara sobre bloques recién creados — vehículos spawneados/ruteados después
+# no se enteran. 50 ticks ≈ 5 s a 10 Hz.
+PERIODIC_REROUTE_TICK_INTERVAL: int = 50
 
 # Cache settings
 GRAPH_CACHE_TTL_SECONDS = 300  # 5 minutes
@@ -408,10 +420,44 @@ COLLISION_GAP_THRESHOLD_M: float = 0.3
 # discretización de waypoints; tolerar gap mayor antes de declarar choque.
 COLLISION_GAP_THRESHOLD_STRAIGHT_M: float = 0.3
 COLLISION_GAP_THRESHOLD_ROUNDABOUT_M: float = 0.8
-COLLISION_PROXIMITY_DURATION_S: float = 0.5      # sostenido > este tiempo → choque
+COLLISION_PROXIMITY_DURATION_S: float = 1.0      # sostenido > este tiempo → choque
 # Velocidad relativa mínima para disparar colisión. Evita que dos vehículos
 # parados juntos (p. ej. en cola de semáforo) se marquen como choque.
 COLLISION_RELATIVE_SPEED_MIN_MS: float = 1.0
+
+# =============================================================================
+# Emergency Brake (Plan C)
+# =============================================================================
+
+# Ventana ampliada de freno de emergencia ante cola densa: si el líder está
+# casi parado a distancia corta y el ego va significativamente más rápido,
+# se fuerza decel=MAX_EMERGENCY_DECEL_MS2 (el IDM puro puede quedarse corto
+# cuando el gap cae más rápido que un tick de 100 ms).
+EMERGENCY_BRAKE_LEADER_V_MAX_MS: float = 2.0   # líder a < 2 m/s ⇒ potencial cola
+EMERGENCY_BRAKE_GAP_MAX_M: float = 12.0        # dentro de 12 m
+EMERGENCY_BRAKE_EGO_V_DELTA_MS: float = 2.0    # ego ≥ 2 m/s más rápido que líder
+
+# =============================================================================
+# Auto-Reroute on Block (Plan C)
+# =============================================================================
+
+# Cuando una colisión marca una arista como bloqueada, todos los vehículos
+# MOVING cuya ruta pendiente atraviese esa arista se re-rutean inmediatamente.
+# Evita el efecto cascada (coches rutados antes del bloqueo que siguen
+# avanzando hacia la pared de parados).
+REROUTE_ON_BLOCK_ENABLED: bool = True
+
+# =============================================================================
+# MOBIL Safety Floor (Plan C)
+# =============================================================================
+
+# Suelo absoluto de gap en carril destino para que MOBIL acepte el cambio.
+# Complementa al criterio IDM (b_safe): en `_build_lane_context` cualquier
+# gap negativo se satura a 0.01 m, haciendo que el IDM pueda evaluar un
+# `accel_new_follower` engañosamente tratable cuando el "back" tiene v=0.
+# Con este suelo, cambios sobre vehículos físicamente solapados se rechazan
+# de plano sin depender de la aritmética de IDM.
+MOBIL_MIN_SAFE_GAP_M: float = 3.0
 
 # =============================================================================
 # Roundabout Yield Constants (Fase 2)
@@ -430,6 +476,11 @@ YIELD_GAP_MIN_M: float = 10.0
 # Cubre ~5 ticks a 50 km/h (13.9 m/s · 0.1 s ≈ 1.39 m), evitando que entradas
 # cortas salten el gate fraccional del 70% en un único tick.
 LOOKAHEAD_ROUNDABOUT_TRIGGER_M: float = 8.0
+# Ventana extendida de look-ahead cuando la arista actual NO es anillo pero la
+# siguiente SÍ: el ego encola ante la línea de ceda y puede tener parado al
+# líder del siguiente arco (o una cola en el propio anillo). 30 m cubre la
+# distancia de frenado IDM desde 50 km/h con b≈2.5 (v²/2b ≈ 34 m) con margen.
+LOOKAHEAD_ENTRY_TRIGGER_M: float = 30.0
 # Distancia (m) antes del nodo de entrada en la que se activa la arbitración
 # entre brazos convergentes. Alineada con YIELD_DETECTION_ZONE_M.
 ENTRY_ARBITRATION_ZONE_M: float = 15.0

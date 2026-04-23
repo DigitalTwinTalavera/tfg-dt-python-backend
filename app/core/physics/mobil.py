@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from app.core.constants import MOBIL_MIN_SAFE_GAP_M
 from app.core.physics.idm import IDMModel
 from app.core.physics.parameters import IDMParameters, MOBILParameters
 
@@ -150,6 +151,16 @@ class MOBILModel:
             Incentivo neto (m/s²) si es seguro, None si no pasa safety check.
         """
         p = self.params
+
+        # --- Safety floor absoluto: gaps sub-MIN_SAFE_GAP rechazados ---
+        # `_build_lane_context` satura gaps negativos a 0.01 m, lo que engaña al
+        # criterio IDM cuando el candidato adyacente está físicamente solapado.
+        # Un suelo explícito corta de raíz cambios sobre vehículos pegados sin
+        # depender de la aritmética de `accel_new_follower`.
+        if target.gap_front is not None and target.gap_front < MOBIL_MIN_SAFE_GAP_M:
+            return None
+        if target.gap_back is not None and target.gap_back < MOBIL_MIN_SAFE_GAP_M:
+            return None
 
         # --- Aceleración del ego en el carril objetivo ---
         accel_ego_target = self.idm.calculate_acceleration(

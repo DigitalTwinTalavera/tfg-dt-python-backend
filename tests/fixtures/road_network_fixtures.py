@@ -264,3 +264,87 @@ def build_two_entry_roundabout_graph() -> RoadNetworkGraph:
 
     rng._rebuild_roundabout_indices()
     return rng
+
+
+def build_two_lane_roundabout_graph() -> RoadNetworkGraph:
+    """
+    Construye un RoadNetworkGraph con una rotonda de 3 arcos con **2 carriles**
+    y 2 salidas también de 2 carriles. Pensado para probar la segmentación por
+    carril destino y el look-ahead intra-anillo.
+
+    Topología::
+
+        A_in (1) ──► N_A (10) ──┐
+                                 ├─► anillo 2 carriles N_A→N_B→N_C→N_A (rid=1)
+        B_in (2) ──► N_B (11) ──┘
+                                   N_A (10) ──► A_out (20)  [2 carriles]
+                                   N_C (12) ──► C_out (21)  [2 carriles]
+
+    Aristas de entrada: 1 carril, 20 m. Anillo: 3 arcos de 15 m, 2 carriles.
+    Salidas: 20 m, 2 carriles.
+    """
+    rng = RoadNetworkGraph()
+    g = rng.graph
+
+    nodes = {
+        1:  (-4.830, 39.960, NodeType.ENTRY_POINT.value),   # A_in
+        2:  (-4.832, 39.960, NodeType.ENTRY_POINT.value),   # B_in
+        10: (-4.831, 39.961, NodeType.ROUNDABOUT.value),    # N_A
+        11: (-4.832, 39.961, NodeType.ROUNDABOUT.value),    # N_B
+        12: (-4.831, 39.962, NodeType.ROUNDABOUT.value),    # N_C
+        20: (-4.830, 39.962, NodeType.EXIT_POINT.value),    # A_out (desde N_A)
+        21: (-4.831, 39.963, NodeType.EXIT_POINT.value),    # C_out (desde N_C)
+    }
+    for nid, (lon, lat, ntype) in nodes.items():
+        g.add_node(
+            nid,
+            **{
+                ATTR_NODE_ID: nid,
+                ATTR_LONGITUDE: lon,
+                ATTR_LATITUDE: lat,
+                ATTR_NODE_TYPE: ntype,
+            },
+        )
+
+    def _edge(
+        eid: int,
+        u: int,
+        v: int,
+        length: float,
+        *,
+        is_ring: bool,
+        rid: int | None,
+        lanes: int,
+    ):
+        lon_u, lat_u, _ = nodes[u]
+        lon_v, lat_v, _ = nodes[v]
+        g.add_edge(
+            u, v,
+            **{
+                ATTR_EDGE_ID: eid,
+                ATTR_LENGTH: length,
+                ATTR_MAX_SPEED: 30,
+                ATTR_WEIGHT: length / 30.0,
+                ATTR_ONE_WAY: True,
+                ATTR_LANES: lanes,
+                ATTR_WAYPOINTS: [(lon_u, lat_u), (lon_v, lat_v)],
+                ATTR_IS_ROUNDABOUT: is_ring,
+                ATTR_ROUNDABOUT_ID: rid,
+            },
+        )
+
+    # Entradas (1 carril, 20 m).
+    _edge(100, 1, 10, 20.0, is_ring=False, rid=None, lanes=1)
+    _edge(101, 2, 11, 20.0, is_ring=False, rid=None, lanes=1)
+
+    # Anillo (one-way, 15 m cada arco, 2 carriles) — sentido N_A → N_B → N_C → N_A.
+    _edge(200, 10, 11, 15.0, is_ring=True, rid=1, lanes=2)
+    _edge(201, 11, 12, 15.0, is_ring=True, rid=1, lanes=2)
+    _edge(202, 12, 10, 15.0, is_ring=True, rid=1, lanes=2)
+
+    # Salidas de 2 carriles.
+    _edge(300, 10, 20, 20.0, is_ring=False, rid=None, lanes=2)  # N_A → A_out
+    _edge(301, 12, 21, 20.0, is_ring=False, rid=None, lanes=2)  # N_C → C_out
+
+    rng._rebuild_roundabout_indices()
+    return rng

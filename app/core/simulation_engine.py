@@ -322,6 +322,7 @@ class SimulationEngine:
                     dt,
                     tl_controller=self._tl_controller,
                     blocked_edges=self._spawner.blocked_edges,
+                    tick_count=self._tick_count,
                 )
             except Exception:
                 logger.exception("Error inesperado en update_vehicles_parallel; tick ignorado")
