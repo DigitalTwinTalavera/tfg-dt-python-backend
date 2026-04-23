@@ -56,7 +56,7 @@ class SimulationEngine:
       - SimulationBroadcaster (broadcast a clientes WS)
     """
 
-    def __init__(self, tick_interval_ms: float = 100.0) -> None:
+    def __init__(self, tick_interval_ms: float = 200.0) -> None:
         self._state: SimulationState = SimulationState.IDLE
         self._tick_interval_ms: float = tick_interval_ms
         self._tick_count: int = 0
@@ -69,6 +69,12 @@ class SimulationEngine:
         self._spawner: VehicleSpawner | None = None
         self._broadcaster: SimulationBroadcaster | None = None
         self._tl_controller: "TrafficLightController | None" = None
+
+        # Decoupling del broadcast: el tick arranca el broadcast del estado
+        # del tick anterior y espera a que termine el actual solo si no
+        # está ya completado. Así física (tick N+1) y broadcast (tick N)
+        # corren en paralelo dentro del event loop de asyncio.
+        self._prev_broadcast_task: asyncio.Task | None = None
 
     # -------------------------------------------------------------------------
     # Properties
@@ -237,11 +243,19 @@ class SimulationEngine:
     # -------------------------------------------------------------------------
 
     async def _run_loop(self) -> None:
-        """Bucle principal de simulación con timestep fijo.
+        """Bucle principal de simulación con scheduling por deadline.
 
         Recomputa interval_s en cada iteración para que los hot-updates
         de tick_rate se apliquen sin reiniciar el loop.
+
+        Scheduling: calcula una deadline fija (``next_deadline``) para cada
+        tick. Si un tick se pasa del presupuesto, el siguiente intenta
+        recuperar el tiempo perdido. Si el retraso supera 2 intervalos,
+        re-sincroniza en lugar de encadenar ticks atrasados (evita el
+        "catch-up storm" que produce saltos visibles en el cliente).
+        Los slow-ticks se registran en el log para diagnóstico.
         """
+        next_deadline = time.monotonic()
         try:
             while self._state == SimulationState.RUNNING:
                 tick_start = time.monotonic()
@@ -253,7 +267,29 @@ class SimulationEngine:
                 self._simulation_time += interval_s
 
                 elapsed = time.monotonic() - tick_start
-                sleep_time = max(0.0, interval_s - elapsed)
+                if elapsed > interval_s * 1.2:
+                    logger.warning(
+                        "Slow tick #%d: %.0f ms (presupuesto %.0f ms)",
+                        self._tick_count,
+                        elapsed * 1000.0,
+                        interval_s * 1000.0,
+                    )
+
+                next_deadline += interval_s
+                now = time.monotonic()
+                # Si acumulamos más de 2 ticks de retraso, re-sincronizamos la
+                # deadline en vez de encadenar ticks rápidos sin dormir: en el
+                # cliente esto se percibe como un salto hacia adelante brusco.
+                if now - next_deadline > 2 * interval_s:
+                    logger.warning(
+                        "Re-sincronización del tick loop: "
+                        "%.0f ms de retraso acumulado (>%.0f ms)",
+                        (now - next_deadline) * 1000.0,
+                        2 * interval_s * 1000.0,
+                    )
+                    next_deadline = now + interval_s
+
+                sleep_time = next_deadline - now
                 if sleep_time > 0:
                     await asyncio.sleep(sleep_time)
         except asyncio.CancelledError:
@@ -347,11 +383,27 @@ class SimulationEngine:
 
         self._vehicles_active = self._spawner.active_count if self._spawner else 0
 
-        # Broadcast tick
+        # Broadcast tick — decoupleado del critical path. Esperamos a que el
+        # broadcast del tick ANTERIOR termine (si aún está en marcha) y después
+        # arrancamos el de este tick SIN esperarlo. El siguiente tick hará lo
+        # mismo. Resultado: mientras corre la física del tick N+1, el broadcast
+        # del tick N se serializa + envía en paralelo dentro del event loop.
+        # Nota: el broadcast lee v.longitude/latitude directamente de los
+        # SimVehicle; en CPython lecturas/escrituras de atributos float son
+        # atómicas bajo GIL — el cliente puede ver un tick con algunos vehículos
+        # ya una iteración por delante, pero su interpolador lo absorbe.
         if self._broadcaster is not None:
-            await self._broadcaster.broadcast_tick(
-                tick=self._tick_count,
-                sim_time=self._simulation_time,
+            if self._prev_broadcast_task is not None:
+                try:
+                    await self._prev_broadcast_task
+                except Exception:
+                    logger.exception("Error en broadcast previo (tick %d)", self._tick_count - 1)
+                self._prev_broadcast_task = None
+            self._prev_broadcast_task = asyncio.create_task(
+                self._broadcaster.broadcast_tick(
+                    tick=self._tick_count,
+                    sim_time=self._simulation_time,
+                )
             )
 
         # 6. Broadcast estados de semáforos (a menor frecuencia que los ticks)
@@ -439,6 +491,14 @@ class SimulationEngine:
             except asyncio.CancelledError:
                 pass
         self._task = None
+        # Drenar cualquier broadcast pendiente para que los clientes no se
+        # queden colgando con un mensaje a medias cuando paramos el motor.
+        if self._prev_broadcast_task is not None:
+            try:
+                await self._prev_broadcast_task
+            except Exception:
+                pass
+            self._prev_broadcast_task = None
 
 
 # Instancia singleton a nivel de aplicación

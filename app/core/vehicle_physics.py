@@ -66,7 +66,9 @@ from app.core.constants import (
     MIN_EDGE_LENGTH_M,
     MIN_ROUNDABOUT_RADIUS_M,
     MOBIL_EVAL_INTERVAL_TICKS,
+    MOBIL_MIN_VELOCITY_MS,
     MOBIL_MIN_DIST_TO_EDGE_END_M,
+    PERIODIC_REROUTE_BATCH_SIZE,
     PERIODIC_REROUTE_TICK_INTERVAL,
     SIGN_DETECTION_ZONE_M,
     STOP_SIGN_DWELL_SPEED_MS,
@@ -783,6 +785,13 @@ def _evaluate_lane_change(
       de la arista (donde el lane ya se reasigna al entrar en la siguiente).
     - Modifica `vehicle.lane` in-place si MOBIL decide un cambio seguro.
     """
+    # Early-out barato antes de cualquier lookup de grafo: un vehículo casi
+    # parado no tiene incentivo de aceleración para cambiar de carril y gastar
+    # CPU construyendo contextos y llamando al modelo es puro waste. En tráfico
+    # urbano gran parte del parque está en esta franja cada tick.
+    if vehicle.velocity < MOBIL_MIN_VELOCITY_MS:
+        return
+
     node_path = vehicle.route.node_path
     ei = vehicle.current_edge_index
     if ei >= len(node_path) - 1:
@@ -1422,6 +1431,49 @@ def _periodic_reroute_all(
     return rerouted
 
 
+def _periodic_reroute_batch(
+    vehicles: dict[str, SimVehicle],
+    graph: "RoadNetworkGraph",  # type: ignore[name-defined]
+    blocked_edges: dict[tuple[int, int], object | None],
+    tick_count: int,
+) -> int:
+    """
+    Versión amortizada de ``_periodic_reroute_all``. En lugar de revisar los N
+    vehículos en un único tick (→ picos de 1-1.5 s con 3500+ vehículos), cada
+    tick procesa ``PERIODIC_REROUTE_BATCH_SIZE`` vehículos arrancando desde un
+    cursor rotatorio derivado del ``tick_count``. Cada vehículo es visitado
+    cada ``ceil(N / batch)`` ticks, cobertura idéntica a la versión all-in-one
+    pero con latencia constante por tick (≤ 5-10 ms típicamente).
+
+    El reroute inmediato cuando aparece un nuevo bloqueo se mantiene vía
+    ``_reroute_affected_by_new_blocks`` — esto es el safety net para los
+    vehículos que esa pasada no atrapó.
+    """
+    if not blocked_edges:
+        return 0
+    if PERIODIC_REROUTE_BATCH_SIZE <= 0:
+        return 0
+    # snapshot del orden: dict.values() en Python 3.7+ es orden de inserción,
+    # estable mientras no haya inserciones/borrados dentro del batch.
+    vehicles_list = list(vehicles.values())
+    n = len(vehicles_list)
+    if n == 0:
+        return 0
+    batch_size = min(PERIODIC_REROUTE_BATCH_SIZE, n)
+    start = (tick_count * batch_size) % n
+    blocked_set = set(blocked_edges.keys())
+    rerouted = 0
+    for i in range(batch_size):
+        idx = start + i
+        if idx >= n:
+            idx -= n
+        if _maybe_reroute_around_blocks(
+            vehicles_list[idx], graph, blocked_edges, trigger_blocks=blocked_set
+        ):
+            rerouted += 1
+    return rerouted
+
+
 def _trigger_collision(
     v1: SimVehicle,
     v2: SimVehicle,
@@ -1596,17 +1648,12 @@ def update_vehicles(
     if new_blocks:
         _reroute_affected_by_new_blocks(vehicles, graph, new_blocks, blocked_edges)
 
-    # Plan D1: reroute proactivo periódico. Cubre vehículos cuya ruta pasa
-    # por una arista bloqueada pero que no fueron alcanzados por el reroute
-    # on-block (ej. spawneados después del bloqueo, o rutas cuyo primer
-    # intento de reroute falló por no haber alternativa limpia en ese tick).
-    if (
-        blocked_edges
-        and PERIODIC_REROUTE_TICK_INTERVAL > 0
-        and tick_count > 0
-        and tick_count % PERIODIC_REROUTE_TICK_INTERVAL == 0
-    ):
-        _periodic_reroute_all(vehicles, graph, blocked_edges)
+    # Plan D1: reroute proactivo amortizado por tick. Cada tick revisa
+    # PERIODIC_REROUTE_BATCH_SIZE vehículos desde un cursor rotatorio, cubriendo
+    # todos los activos cada ceil(N / batch) ticks. Reemplaza el pase all-in-one
+    # cada PERIODIC_REROUTE_TICK_INTERVAL ticks que producía picos de 1-1.5 s.
+    if blocked_edges:
+        _periodic_reroute_batch(vehicles, graph, blocked_edges, tick_count)
 
     return finished_ids
 
@@ -2003,13 +2050,9 @@ async def update_vehicles_parallel(
     if new_blocks:
         _reroute_affected_by_new_blocks(vehicles, graph, new_blocks, blocked_edges)
 
-    # Plan D1: pase proactivo periódico (cadenciado por tick_count).
-    if (
-        blocked_edges
-        and PERIODIC_REROUTE_TICK_INTERVAL > 0
-        and tick_count > 0
-        and tick_count % PERIODIC_REROUTE_TICK_INTERVAL == 0
-    ):
-        _periodic_reroute_all(vehicles, graph, blocked_edges)
+    # Plan D1: pase proactivo amortizado por tick (ver _periodic_reroute_batch).
+    # Sustituye el pase all-in-one cada PERIODIC_REROUTE_TICK_INTERVAL ticks.
+    if blocked_edges:
+        _periodic_reroute_batch(vehicles, graph, blocked_edges, tick_count)
 
     return finished_ids

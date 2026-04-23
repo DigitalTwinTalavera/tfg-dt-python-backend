@@ -121,6 +121,17 @@ class ConnectionManager:
         """
         await self._broadcast_to_all("send_text", message)
 
+    async def broadcast_bytes(self, data: bytes) -> None:
+        """
+        Broadcast raw bytes to all connected clients.
+
+        Pensado para payloads JSON ya serializados con orjson (evita que cada
+        conexión vuelva a encodear). Godot recibe el paquete binario y lo
+        decodifica con `get_string_from_utf8()` antes de `JSON.parse_string`:
+        mismo resultado que send_json pero sin serializar N veces.
+        """
+        await self._broadcast_to_all("send_bytes", data)
+
 
 # Singleton instance for the application
 connection_manager = ConnectionManager()

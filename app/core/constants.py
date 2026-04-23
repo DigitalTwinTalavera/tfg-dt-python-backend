@@ -212,6 +212,14 @@ BLOCKED_EDGE_PENALTY_FACTOR: float = 1e9
 # dispara sobre bloques recién creados — vehículos spawneados/ruteados después
 # no se enteran. 50 ticks ≈ 5 s a 10 Hz.
 PERIODIC_REROUTE_TICK_INTERVAL: int = 50
+# Antes `_periodic_reroute_all` revisaba los N vehículos cada PERIODIC_REROUTE_TICK_INTERVAL
+# ticks → con 3500+ coches esto causaba picos de 1000-1500 ms cada 5 s bloqueando el tick
+# loop (visibles como tirones en el cliente). Ahora se amortiza: cada tick procesa
+# PERIODIC_REROUTE_BATCH_SIZE vehículos arrancando desde un cursor rotatorio, de modo que
+# todos los vehículos son visitados cada ceil(N / batch) ticks. Para 6000 vehículos
+# con batch=50 → cobertura completa en 120 ticks = 24 s a 5 Hz. El on-block reroute
+# sigue disparándose de forma inmediata vía `_reroute_affected_by_new_blocks`.
+PERIODIC_REROUTE_BATCH_SIZE: int = 50
 
 # Cache settings
 GRAPH_CACHE_TTL_SECONDS = 300  # 5 minutes
@@ -391,10 +399,19 @@ VEHICLE_PHYSICS_PARALLEL_THRESHOLD: int = 500
 # con la inicial de la entrante al cambiar de arista. Elimina el snap visible
 # de heading en cruces sin curvar el movimiento más de lo necesario.
 EDGE_HEADING_BLEND_DIST_M: float = 3.0
-# Cada cuántos ticks se evalúa MOBIL por vehículo. Con tick=100 ms, un valor de
-# 5 corresponde a 500 ms: suficiente para que un cambio de carril sea reactivo
-# sin saturar CPU ni producir oscilaciones por re-evaluación inmediata.
-MOBIL_EVAL_INTERVAL_TICKS: int = 5
+# Cada cuántos ticks se evalúa MOBIL por vehículo. Con tick=200 ms (5 Hz), un
+# valor de 20 corresponde a 4 s: suficiente para que un cambio de carril sea
+# reactivo sin saturar CPU. MOBIL corre en el main thread (workers no tienen
+# edge_index completo), así que bajar su frecuencia es el mayor win CPU-side
+# con miles de vehículos. 4 s es coherente con el tiempo de decisión humano
+# para un cambio de carril discrecional en tráfico medio.
+MOBIL_EVAL_INTERVAL_TICKS: int = 20
+# Velocidad mínima por debajo de la cual saltamos la evaluación de MOBIL. Un
+# vehículo casi parado no tiene incentivo IDM para cambiar de carril (la
+# ganancia de aceleración es despreciable), así que el coste de construir el
+# contexto y llamar al modelo es puro waste. Con 4000-6000 vehículos en ciudad
+# gran parte está parada o rodando a <10 km/h en cada tick.
+MOBIL_MIN_VELOCITY_MS: float = 3.0
 # No re-evaluar MOBIL en los últimos metros de una arista: la transición ya
 # reasigna el carril (min(lane, new_lanes-1)) y un cambio aquí sería inútil.
 MOBIL_MIN_DIST_TO_EDGE_END_M: float = 15.0

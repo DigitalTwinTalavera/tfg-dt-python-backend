@@ -12,6 +12,8 @@ import logging
 import time
 from typing import Any
 
+import orjson
+
 from app.api.websocket.manager import ConnectionManager
 from app.api.websocket.messages import (
     build_sim_state_message,
@@ -93,18 +95,35 @@ class SimulationBroadcaster:
         vehicle_states = self._build_delta_states(vehicles)
 
         if vehicle_states or tick == 0:
+            # orjson + broadcast_bytes: serializamos cada chunk UNA vez aquí y
+            # enviamos los bytes pre-codificados a todas las conexiones, en
+            # lugar de que send_json re-serialice N veces (una por cliente).
+            # orjson es 3-5× más rápido que stdlib json para payloads grandes.
             chunk_size = self._TICK_CHUNK_SIZE
             if len(vehicle_states) <= chunk_size:
-                await self._manager.broadcast(
-                    build_tick_message(tick=tick, sim_time=sim_time, vehicles=vehicle_states)
+                message = build_tick_message(
+                    tick=tick,
+                    sim_time=sim_time,
+                    vehicles=vehicle_states,
+                    chunk_index=0,
+                    chunk_total=1,
                 )
+                await self._manager.broadcast_bytes(orjson.dumps(message))
             else:
-                # Enviar en múltiples mensajes para no superar el límite de tamaño
-                for i in range(0, len(vehicle_states), chunk_size):
+                # Enviar en múltiples mensajes para no superar el límite de tamaño.
+                # `chunk_index` y `chunk_total` permiten al cliente re-ensamblar
+                # el tick de forma atómica antes de aplicarlo al renderer.
+                total = (len(vehicle_states) + chunk_size - 1) // chunk_size
+                for idx, i in enumerate(range(0, len(vehicle_states), chunk_size)):
                     chunk = vehicle_states[i : i + chunk_size]
-                    await self._manager.broadcast(
-                        build_tick_message(tick=tick, sim_time=sim_time, vehicles=chunk)
+                    message = build_tick_message(
+                        tick=tick,
+                        sim_time=sim_time,
+                        vehicles=chunk,
+                        chunk_index=idx,
+                        chunk_total=total,
                     )
+                    await self._manager.broadcast_bytes(orjson.dumps(message))
 
         elapsed_ms = (time.monotonic() - t0) * 1000.0
         self._broadcast_count += 1

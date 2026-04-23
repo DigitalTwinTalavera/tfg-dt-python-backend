@@ -348,11 +348,20 @@ class VehicleSpawner:
           - Sin topes por rotonda: el A* con pesos dinámicos ya redistribuye.
           - Búsqueda de hueco libre probando todos los carriles y varios
             progress antes de descartar la ruta.
+
+        Rendimiento: construye UNA sola vez un índice
+        `occupants_by_edge_lane[(u,v)][lane]` con los ocupantes actuales y lo
+        actualiza incrementalmente al spawnear. Esto convierte la búsqueda de
+        hueco en O(ocupantes_de_la_arista) en lugar de O(N_total) por intento.
         """
         spawned: list[SimVehicle] = []
 
-        # Ocupación de aristas a partir de vehículos activos (veh / 100 m).
-        # Se usará para ponderar la selección de nodos de entrada/salida.
+        # Índice unificado: ocupación por arista y carril + conteo por arista.
+        # Recorremos los vehículos activos UNA vez (O(N)) y servimos todas las
+        # consultas de spawn desde este índice.
+        occupants_by_edge_lane: dict[
+            tuple[int, int], dict[int, list[tuple[float, float]]]
+        ] = {}
         edge_occupancy: dict[tuple[int, int], int] = {}
         for v in self._vehicles.values():
             if v.status == VehicleStatus.FINISHED:
@@ -363,6 +372,11 @@ class VehicleSpawner:
                 continue
             edge = (np_[ei], np_[ei + 1])
             edge_occupancy[edge] = edge_occupancy.get(edge, 0) + 1
+            lane_map = occupants_by_edge_lane.setdefault(edge, {})
+            lane_id = int(getattr(v, "lane", 0))
+            lane_map.setdefault(lane_id, []).append(
+                (v.progress_on_edge, v.length_m)
+            )
 
         entry_weights = self._node_spawn_weights(
             entry_nodes, edge_occupancy, outgoing=True
@@ -371,8 +385,8 @@ class VehicleSpawner:
             exit_nodes, edge_occupancy, outgoing=False
         )
 
-        # Safety cap elevado: garantizar N salvo red patológicamente saturada.
-        safety_cap = max(count * 20, 10_000)
+        # Safety cap proporcional al batch: con el índice ya no escala con N.
+        safety_cap = max(count * 4, 2_000)
         attempts = 0
         edges_used: set[tuple[int, int]] = set()
 
@@ -414,7 +428,7 @@ class VehicleSpawner:
                 first_edge_len=first_edge_len,
                 n_lanes=n_lanes,
                 vehicle_length=profile.length_m,
-                spawned=spawned,
+                occupants_by_edge_lane=occupants_by_edge_lane,
             )
             if slot is None:
                 continue
@@ -455,6 +469,11 @@ class VehicleSpawner:
 
             spawned.append(vehicle)
             edges_used.add((first_node, second_node))
+            # Publicar la ocupación del nuevo vehículo para que los siguientes
+            # intentos vean el hueco ya tomado (misma arista y carril).
+            first_edge_key = (first_node, second_node)
+            lane_map = occupants_by_edge_lane.setdefault(first_edge_key, {})
+            lane_map.setdefault(lane, []).append((progress, profile.length_m))
 
         if len(spawned) < count:
             logger.warning(
@@ -476,7 +495,9 @@ class VehicleSpawner:
         first_edge_len: float,
         n_lanes: int,
         vehicle_length: float,
-        spawned: list[SimVehicle],
+        occupants_by_edge_lane: dict[
+            tuple[int, int], dict[int, list[tuple[float, float]]]
+        ],
     ) -> tuple[int, float] | None:
         """
         Busca un par (lane, progress) libre en la primera arista de la ruta.
@@ -484,24 +505,13 @@ class VehicleSpawner:
         Intenta primero la ventana restringida [SPAWN_INITIAL_PROGRESS_MIN,
         SPAWN_INITIAL_PROGRESS_MAX] y, si no hay hueco en ningún carril,
         amplía a [0.0, 0.9]. Devuelve None si ninguna combinación es viable.
+
+        Lee la ocupación del índice `occupants_by_edge_lane` mantenido por el
+        batch: no itera la lista global de vehículos.
         """
-        # Ocupantes actuales de la primera arista (activos + ya spawneados).
-        occupants_by_lane: dict[int, list[tuple[float, float]]] = {}
-        for existing in (*self._vehicles.values(), *spawned):
-            if existing.status == VehicleStatus.FINISHED:
-                continue
-            enp = existing.route.node_path
-            eei = existing.current_edge_index
-            if (
-                eei >= len(enp) - 1
-                or enp[eei] != first_node
-                or enp[eei + 1] != second_node
-            ):
-                continue
-            lane_id = int(getattr(existing, "lane", 0))
-            occupants_by_lane.setdefault(lane_id, []).append(
-                (existing.progress_on_edge, existing.length_m)
-            )
+        occupants_by_lane = occupants_by_edge_lane.get(
+            (first_node, second_node), {}
+        )
 
         lane_order = list(range(n_lanes))
         random.shuffle(lane_order)

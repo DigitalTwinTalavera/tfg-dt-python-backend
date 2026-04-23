@@ -12,6 +12,10 @@ python-dotenv==1.0.1
 # WebSocket Support
 websockets==14.1
 
+# Fast JSON serialization (3-5× stdlib json) para broadcast de ticks con 6000 vehículos.
+# 3.11+ soporta Python 3.14 (PyO3 0.24+).
+orjson==3.11.8
+
 # Database
 sqlalchemy[asyncio]==2.0.46
 asyncpg==0.30.0

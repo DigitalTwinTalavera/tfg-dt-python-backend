@@ -34,6 +34,8 @@ def build_tick_message(
     tick: int,
     sim_time: float,
     vehicles: list[dict[str, Any]],
+    chunk_index: int = 0,
+    chunk_total: int = 1,
 ) -> dict[str, Any]:
     """
     Mensaje de tick con el estado de todos los vehículos activos.
@@ -42,6 +44,12 @@ def build_tick_message(
         tick: Número de tick actual.
         sim_time: Tiempo de simulación en segundos.
         vehicles: Lista de dicts con estado de cada vehículo.
+        chunk_index: Índice (0-based) de este fragmento dentro del tick.
+        chunk_total: Número total de fragmentos que componen el tick.
+
+    El cliente usa `chunk_index` y `chunk_total` para aplicar todos los
+    fragmentos del mismo tick atómicamente, sin jitter visible cuando el
+    tick se divide por tamaño de WebSocket.
     """
     return {
         "type": MSG_TYPE_TICK,
@@ -49,6 +57,8 @@ def build_tick_message(
         "sim_time": round(sim_time, 3),
         "vehicles": vehicles,
         "count": len(vehicles),
+        "chunk_index": chunk_index,
+        "chunk_total": chunk_total,
     }
 
 
