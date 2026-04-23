@@ -123,14 +123,24 @@ class VehicleSpawner:
         self._max_vehicles = max_vehicles or settings.MAX_VEHICLES
         self._vehicles: dict[str, SimVehicle] = {}
         self._counter = 0
-        # Caché de rutas: evita recalcular la misma ruta (start, end) varias veces.
-        # Con pocos nodos de entrada/salida (≤ decenas en Talavera), tras el primer
-        # spawn todos los vehículos siguientes son cache-hits y el coste es O(1).
-        self._route_cache: dict[tuple[int, int], RouteInfo] = {}
+        # Caché de rutas: evita recalcular la misma ruta (start, end, vtype)
+        # varias veces. El vtype entra en la clave porque las zonas ZBE pueden
+        # restringir un tipo (p. ej. trucks) y las rutas penalizadas difieren.
+        self._route_cache: dict[tuple[int, int, str], RouteInfo] = {}
         self._counter_lock = threading.Lock()  # Protege _counter ante acceso concurrente
         # blocked_edges: mapa arista → None (bloqueo permanente, retirada manual).
         # Se usa como penalización en A* (no elimina la arista del grafo).
         self.blocked_edges: dict[tuple[int, int], object | None] = {}
+        # closed_lanes: mapa arista → set de índices de carril cerrados. La
+        # arista sigue siendo pasable mientras quede al menos un carril libre
+        # (MOBIL empuja a los vehículos a salir del cerrado). Si el set cubre
+        # todos los carriles, el IncidentManager además añade la arista a
+        # `blocked_edges` para que A* la evite.
+        self.closed_lanes: dict[tuple[int, int], set[int]] = {}
+        # Referencia al ZoneManager (inyectada desde deps.py). Usada en spawn
+        # para consultar enforcement `deny_spawn` y en routing para penalizar
+        # aristas restringidas por tipo de vehículo.
+        self.zone_manager: object | None = None
 
     @property
     def graph(self) -> RoadNetworkGraph:
@@ -398,20 +408,52 @@ class VehicleSpawner:
             if start == end:
                 continue
 
-            key = (start, end)
-            route = self._route_cache.get(key)
+            # Escoger el perfil (vtype) ANTES que la ruta para aplicar, si
+            # procede, las restricciones ZBE en A* por tipo de vehículo.
+            profile = _pick_vehicle_profile()
+            vtype_str = profile.vtype.value
+            cache_key = (start, end, vtype_str)
+            route = self._route_cache.get(cache_key)
             if route is None:
+                restricted_edges: set[tuple[int, int]] | None = None
+                if self.zone_manager is not None:
+                    restricted_edges = self.zone_manager.restricted_edge_keys_for(
+                        profile.vtype
+                    ) or None
+                # Comprobar políticas deny_spawn: si el origen/destino cae en
+                # una zona con enforcement=deny_spawn para este vtype, rechazar
+                # la pareja y probar otra.
+                if self.zone_manager is not None:
+                    start_edge_attrs = self._graph.get_edge_attributes(start, start)
+                    # No tenemos "edge de origen" como tal; en su lugar miramos
+                    # si el primer edge de una ruta tentativa cae en una zona
+                    # deny_spawn. Lo haremos tras calcular la ruta.
+                    pass
                 route = compute_route(
-                    self._graph, start, end, blocked_edges=self.blocked_edges
+                    self._graph,
+                    start,
+                    end,
+                    blocked_edges=self.blocked_edges,
+                    restricted_edges=restricted_edges,
                 )
                 if route is not None:
-                    self._route_cache[key] = route
+                    # Chequeo deny_spawn: first_edge o last_edge de la ruta.
+                    if self.zone_manager is not None and len(route.edge_ids) > 0:
+                        first_eid = route.edge_ids[0]
+                        last_eid = route.edge_ids[-1]
+                        denied, _zone = self.zone_manager.is_spawn_denied(
+                            start_edge_id=first_eid,
+                            end_edge_id=last_eid,
+                            vtype=profile.vtype,
+                        )
+                        if denied:
+                            continue
+                    self._route_cache[cache_key] = route
 
             if route is None:
                 continue
 
             node_attrs = self._graph.get_node_attributes(start)
-            profile = _pick_vehicle_profile()
             first_node = route.node_path[0]
             second_node = route.node_path[1]
             first_edge_attrs = self._graph.get_edge_attributes(first_node, second_node)
@@ -638,7 +680,19 @@ class VehicleSpawner:
         ei = vehicle.current_edge_index
         start_node = node_path[ei] if ei < len(node_path) else node_path[-1]
 
-        new_route = compute_route(self._graph, start_node, end_node_id)
+        restricted_edges: set[tuple[int, int]] | None = None
+        if self.zone_manager is not None:
+            restricted_edges = self.zone_manager.restricted_edge_keys_for(
+                vehicle.vtype
+            ) or None
+
+        new_route = compute_route(
+            self._graph,
+            start_node,
+            end_node_id,
+            blocked_edges=self.blocked_edges,
+            restricted_edges=restricted_edges,
+        )
         if new_route is None:
             return False
 

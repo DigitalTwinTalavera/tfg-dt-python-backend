@@ -23,6 +23,8 @@ MSG_TYPE_VEHICLE_UPDATE = "vehicle_update"
 MSG_TYPE_MAP_SWITCHED = "map_switched"
 MSG_TYPE_TRAFFIC_LIGHT = "traffic_light"
 MSG_TYPE_VEHICLE_COLLISION = "vehicle_collision"
+MSG_TYPE_INCIDENT = "incident"
+MSG_TYPE_ZONE = "zone"
 
 
 # =============================================================================
@@ -183,6 +185,42 @@ def build_map_switched_message(
         "map": map_name,
         "nodes": nodes,
         "edges": edges,
+    }
+
+
+def build_incident_message(
+    action: str,
+    incident: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Notificación de incidente de tráfico.
+
+    Args:
+        action: "created" | "updated" | "cleared".
+        incident: Dict serializable (IncidentManager.to_public_dict()).
+    """
+    return {
+        "type": MSG_TYPE_INCIDENT,
+        "action": action,
+        "incident": incident,
+    }
+
+
+def build_zone_message(
+    action: str,
+    zone: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Notificación de zona de control (ZBE / restringida / peatonal).
+
+    Args:
+        action: "created" | "updated" | "cleared".
+        zone: Dict con los datos públicos de la zona (ZoneManager.to_public_dict()).
+    """
+    return {
+        "type": MSG_TYPE_ZONE,
+        "action": action,
+        "zone": zone,
     }
 
 

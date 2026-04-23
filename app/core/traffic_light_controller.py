@@ -196,6 +196,16 @@ class TrafficLightController:
     def set_override(self, node_id: int, phase: str) -> None:
         self._overrides[node_id] = phase
 
+    def clear_override_for_node(self, node_id: int) -> bool:
+        """Retira el override de un nodo concreto. Devuelve True si había uno."""
+        return self._overrides.pop(node_id, None) is not None
+
+    def has_override_for_node(self, node_id: int) -> bool:
+        return node_id in self._overrides
+
+    def knows_node(self, node_id: int) -> bool:
+        return node_id in self._lights
+
     def clear_overrides(self) -> None:
         self._overrides.clear()
         self._global_override = None
@@ -203,4 +213,6 @@ class TrafficLightController:
     def get_override_mode(self) -> str:
         if self._global_override is not None:
             return f"global_{self._global_override}"
+        if self._overrides:
+            return f"per_node({len(self._overrides)})"
         return "normal"

@@ -480,3 +480,63 @@ async def tl_normal(
     tl.clear_overrides()
     await broadcaster.broadcast_traffic_lights(tl.get_snapshot())
     return {"mode": tl.get_override_mode(), "count": tl.light_count}
+
+
+class TLNodeOverrideRequest(BaseModel):
+    phase: str = Field(description="Fase forzada: 'red', 'yellow' o 'green'")
+
+
+@router.post("/traffic-lights/{node_id}/override")
+async def tl_node_override(
+    node_id: int,
+    body: TLNodeOverrideRequest,
+    engine: SimulationEngine = Depends(get_simulation_engine),
+    broadcaster: SimulationBroadcaster = Depends(get_broadcaster),
+) -> dict:
+    """
+    Fuerza una fase concreta en el semáforo del nodo indicado.
+
+    Los demás nodos siguen con su ciclo normal (o su propio override previo).
+    """
+    phase = body.phase.lower()
+    if phase not in {"red", "yellow", "green"}:
+        raise HTTPException(
+            status_code=422,
+            detail="phase debe ser 'red', 'yellow' o 'green'",
+        )
+    tl = _get_tl_or_404(engine)
+    if not tl.knows_node(node_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Nodo {node_id} no es un semáforo conocido",
+        )
+    tl.set_override(node_id, phase)
+    await broadcaster.broadcast_traffic_lights(tl.get_snapshot())
+    return {
+        "status": "overridden",
+        "node_id": node_id,
+        "phase": phase,
+        "mode": tl.get_override_mode(),
+    }
+
+
+@router.delete("/traffic-lights/{node_id}/override")
+async def tl_node_override_clear(
+    node_id: int,
+    engine: SimulationEngine = Depends(get_simulation_engine),
+    broadcaster: SimulationBroadcaster = Depends(get_broadcaster),
+) -> dict:
+    """Retira el override del nodo y deja que vuelva a su ciclo."""
+    tl = _get_tl_or_404(engine)
+    if not tl.knows_node(node_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Nodo {node_id} no es un semáforo conocido",
+        )
+    had = tl.clear_override_for_node(node_id)
+    await broadcaster.broadcast_traffic_lights(tl.get_snapshot())
+    return {
+        "status": "cleared" if had else "noop",
+        "node_id": node_id,
+        "mode": tl.get_override_mode(),
+    }

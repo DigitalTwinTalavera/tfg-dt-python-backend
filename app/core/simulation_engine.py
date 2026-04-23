@@ -28,7 +28,9 @@ if TYPE_CHECKING:
     from app.core.broadcaster import SimulationBroadcaster
     from app.core.simulation_config import SimulationConfig
     from app.core.traffic_light_controller import TrafficLightController
+    from app.services.incident_manager import IncidentManager
     from app.services.vehicle_spawner import VehicleSpawner
+    from app.services.zone_manager import ZoneManager
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,8 @@ class SimulationEngine:
         self._spawner: VehicleSpawner | None = None
         self._broadcaster: SimulationBroadcaster | None = None
         self._tl_controller: "TrafficLightController | None" = None
+        self._incident_manager: "IncidentManager | None" = None
+        self._zone_manager: "ZoneManager | None" = None
 
         # Decoupling del broadcast: el tick arranca el broadcast del estado
         # del tick anterior y espera a que termine el actual solo si no
@@ -145,6 +149,20 @@ class SimulationEngine:
     def get_tl_controller(self) -> "TrafficLightController | None":
         """Devuelve el controlador de semáforos activo, o None si no se ha inicializado."""
         return self._tl_controller
+
+    def set_incident_manager(self, manager: "IncidentManager") -> None:
+        """Inyecta el gestor de incidentes."""
+        self._incident_manager = manager
+
+    def get_incident_manager(self) -> "IncidentManager | None":
+        return self._incident_manager
+
+    def set_zone_manager(self, manager: "ZoneManager") -> None:
+        """Inyecta el gestor de zonas (ZBE / restringidas / peatonales)."""
+        self._zone_manager = manager
+
+    def get_zone_manager(self) -> "ZoneManager | None":
+        return self._zone_manager
 
     # -------------------------------------------------------------------------
     # State machine
@@ -329,6 +347,12 @@ class SimulationEngine:
         if self._tl_controller is not None:
             self._tl_controller.tick(dt)
 
+        # 2b. Expirar incidentes con TTL cumplido — se procesa async tras el
+        # tick físico para evitar I/O durante el hot path.
+        expired_incidents: list[int] = []
+        if self._incident_manager is not None:
+            expired_incidents = self._incident_manager.tick(self._simulation_time)
+
         # 3. Auto-spawn
         if (
             self._config is not None
@@ -349,6 +373,7 @@ class SimulationEngine:
         #   update_vehicles_parallel tiene fallback interno a to_thread si el
         #   ProcessPool falla, así que no rompe la simulación.
         finished_ids: list[str] = []
+        pending_collisions: list[tuple[str, str, tuple[int, int]]] = []
         if self._spawner is not None and self._spawner.graph.node_count > 0:
             from app.core.vehicle_physics import update_vehicles_parallel
             try:
@@ -359,9 +384,30 @@ class SimulationEngine:
                     tl_controller=self._tl_controller,
                     blocked_edges=self._spawner.blocked_edges,
                     tick_count=self._tick_count,
+                    closed_lanes=self._spawner.closed_lanes,
+                    pending_collisions=pending_collisions,
                 )
             except Exception:
                 logger.exception("Error inesperado en update_vehicles_parallel; tick ignorado")
+
+        # 4c. Registrar colisiones recién detectadas como incidentes ACCIDENT.
+        if self._incident_manager is not None and pending_collisions:
+            for v1_id, v2_id, edge_key in pending_collisions:
+                try:
+                    self._incident_manager.record_accident(
+                        edge=edge_key,
+                        sim_time=self._simulation_time,
+                        vehicle_ids=(v1_id, v2_id),
+                    )
+                except Exception:
+                    logger.exception("Error registrando accidente como incidente")
+
+        # 4d. Cerrar incidentes expirados — se emite broadcast y se revierte
+        # el estado (best-effort async).
+        if expired_incidents and self._incident_manager is not None:
+            asyncio.create_task(
+                self._incident_manager.process_expired(expired_incidents)
+            )
 
         # 4b. Recálculo periódico de pesos dinámicos por saturación en rotondas
         #     (Fase 6). Penaliza en A* las aristas de anillos con mucha ocupación

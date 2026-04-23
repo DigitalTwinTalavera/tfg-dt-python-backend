@@ -36,6 +36,7 @@ def compute_route(
     end_node_id: int,
     *,
     blocked_edges: dict[tuple[int, int], object | None] | None = None,
+    restricted_edges: set[tuple[int, int]] | None = None,
 ) -> RouteInfo | None:
     """
     Calcula la ruta más corta (por tiempo de viaje) entre dos nodos.
@@ -47,12 +48,18 @@ def compute_route(
         blocked_edges: Aristas con colisión activa; A* las penaliza fuertemente
             en vez de eliminarlas del grafo (preserva conectividad cuando no
             hay alternativa).
+        restricted_edges: Aristas dentro de zonas restringidas para el tipo
+            de vehículo en curso (ZBE). A* las penaliza con
+            ``ZBE_EDGE_PENALTY_FACTOR`` sin llegar a excluirlas.
 
     Returns:
         RouteInfo con la ruta calculada, o None si no existe camino.
     """
     node_path = graph.get_shortest_path_astar_safe(
-        start_node_id, end_node_id, blocked_edges=blocked_edges
+        start_node_id,
+        end_node_id,
+        blocked_edges=blocked_edges,
+        restricted_edges=restricted_edges,
     )
     if node_path is None or len(node_path) < 2:
         return None

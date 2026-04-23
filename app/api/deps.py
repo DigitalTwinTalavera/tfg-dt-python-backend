@@ -6,8 +6,10 @@ from app.api.websocket.manager import connection_manager
 from app.core.broadcaster import SimulationBroadcaster
 from app.core.simulation_config import SimulationConfig
 from app.core.simulation_engine import SimulationEngine, simulation_engine
+from app.services.incident_manager import IncidentManager
 from app.services.network_graph import RoadNetworkGraph
 from app.services.vehicle_spawner import VehicleSpawner
+from app.services.zone_manager import ZoneManager
 
 # Singletons a nivel de aplicación
 _config = SimulationConfig()
@@ -17,11 +19,19 @@ _broadcaster = SimulationBroadcaster(
     connection_manager=connection_manager,
     vehicle_spawner=_spawner,
 )
+_incident_manager = IncidentManager(
+    spawner=_spawner, broadcaster=_broadcaster, graph=_graph
+)
+_zone_manager = ZoneManager(graph=_graph, broadcaster=_broadcaster)
+# El spawner consulta el zone_manager en el hot path de spawn/reroute.
+_spawner.zone_manager = _zone_manager
 
 # Inyectar dependencias en el engine
 simulation_engine.set_config(_config)
 simulation_engine.set_spawner(_spawner)
 simulation_engine.set_broadcaster(_broadcaster)
+simulation_engine.set_incident_manager(_incident_manager)
+simulation_engine.set_zone_manager(_zone_manager)
 
 
 def get_simulation_engine() -> SimulationEngine:
@@ -50,3 +60,13 @@ def get_vehicle_spawner() -> VehicleSpawner:
 def get_broadcaster() -> SimulationBroadcaster:
     """Devuelve la instancia singleton del broadcaster."""
     return _broadcaster
+
+
+def get_incident_manager() -> IncidentManager:
+    """Devuelve la instancia singleton del gestor de incidentes."""
+    return _incident_manager
+
+
+def get_zone_manager() -> ZoneManager:
+    """Devuelve la instancia singleton del gestor de zonas."""
+    return _zone_manager

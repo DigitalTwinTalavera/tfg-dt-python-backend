@@ -56,6 +56,8 @@ class LaneContext:
         gap_back: Distancia al vehículo detrás en el carril objetivo (m).
         v_back: Velocidad del vehículo detrás (m/s), None si no hay.
         v_back_current_accel: Aceleración actual del seguidor en el carril objetivo (m/s²).
+        lane_index: Índice de carril objetivo (0 = derecha). Si está en
+            `closed_lanes_on_edge`, la evaluación se descarta.
     """
 
     gap_front: float | None = None
@@ -63,6 +65,7 @@ class LaneContext:
     gap_back: float | None = None
     v_back: float | None = None
     v_back_current_accel: float = 0.0
+    lane_index: int | None = None
 
 
 class MOBILModel:
@@ -85,6 +88,8 @@ class MOBILModel:
         v_front_current: float | None,
         lane_left: LaneContext | None = None,
         lane_right: LaneContext | None = None,
+        closed_lanes_on_edge: set[int] | None = None,
+        force_change: bool = False,
     ) -> LaneChangeDecision:
         """
         Evalúa si el vehículo debería cambiar de carril.
@@ -97,18 +102,30 @@ class MOBILModel:
             v_front_current: Velocidad del líder actual (m/s), None si libre.
             lane_left: Contexto del carril izquierdo (None si no existe).
             lane_right: Contexto del carril derecho (None si no existe).
+            closed_lanes_on_edge: Índices de carriles cerrados en la arista
+                actual. Los candidatos cuyo lane_index esté aquí se descartan
+                directamente (no se evalúa el incentivo).
+            force_change: Si True, el ego está en un carril cerrado y DEBE
+                salir. Se acepta cualquier candidato que pase el safety check,
+                ignorando el umbral de incentivo.
 
         Returns:
             LaneChangeDecision con la dirección y la ganancia.
         """
         best_direction = LaneChangeDirection.NONE
         best_incentive = 0.0
+        best_direction_safe = LaneChangeDirection.NONE
+        best_incentive_safe = float("-inf")
+        closed = closed_lanes_on_edge or set()
 
         for direction, ctx in [
             (LaneChangeDirection.LEFT, lane_left),
             (LaneChangeDirection.RIGHT, lane_right),
         ]:
             if ctx is None:
+                continue
+            # Descartar candidatos que apunten a un carril cerrado.
+            if ctx.lane_index is not None and ctx.lane_index in closed:
                 continue
 
             incentive = self._evaluate_single_lane(
@@ -120,9 +137,24 @@ class MOBILModel:
                 target=ctx,
             )
 
-            if incentive is not None and incentive > best_incentive:
+            if incentive is None:
+                continue
+
+            if incentive > best_incentive:
                 best_incentive = incentive
                 best_direction = direction
+            if incentive > best_incentive_safe:
+                best_incentive_safe = incentive
+                best_direction_safe = direction
+
+        if force_change and best_direction_safe != LaneChangeDirection.NONE:
+            # Vehículo atrapado en carril cerrado: acepta el mejor candidato
+            # seguro aunque el incentivo sea negativo.
+            return LaneChangeDecision(
+                should_change=True,
+                direction=best_direction_safe,
+                incentive=round(best_incentive_safe, 4),
+            )
 
         should_change = (
             best_direction != LaneChangeDirection.NONE

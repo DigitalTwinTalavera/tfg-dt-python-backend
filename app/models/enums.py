@@ -72,3 +72,36 @@ class VehicleStatus(str, Enum):
     FINISHED = "finished"  # Vehicle has completed its route
     COLLISION = "collision"  # Vehicle is involved in a collision
     PAUSED = "paused"  # Vehicle is manually paused
+
+
+class IncidentType(str, Enum):
+    """Plantilla de tipo de incidente de tráfico."""
+
+    ACCIDENT = "accident"      # Colisión detectada automáticamente
+    ROADWORK = "roadwork"      # Obras programadas
+    BREAKDOWN = "breakdown"    # Avería mecánica puntual
+    EVENT = "event"            # Evento / manifestación / festivo
+
+
+class IncidentStatus(str, Enum):
+    """Estado del ciclo de vida de un incidente."""
+
+    ACTIVE = "active"
+    SCHEDULED = "scheduled"    # Reservado para programaciones futuras
+    CLEARED = "cleared"
+
+
+class ZoneType(str, Enum):
+    """Tipo de zona de control de tráfico."""
+
+    ZBE = "zbe"                    # Zona de Bajas Emisiones
+    RESTRICTED = "restricted"      # Acceso restringido genérico
+    PEDESTRIAN = "pedestrian"      # Peatonalización total
+
+
+class ZoneEnforcement(str, Enum):
+    """Modo de aplicación de las restricciones de una zona."""
+
+    WARN = "warn"                   # Solo visualización, sin efecto en routing
+    DENY_SPAWN = "deny_spawn"       # Rechaza spawnear con origen/destino en zona
+    FORCE_REROUTE = "force_reroute" # Penaliza fuertemente en A*

@@ -744,7 +744,7 @@ def _build_lane_context(
     busca el más cercano por delante y el más cercano por detrás en `target_lane`
     y devuelve sus gaps bumper-to-bumper y velocidades para evaluar MOBIL.
     """
-    ctx = LaneContext()
+    ctx = LaneContext(lane_index=target_lane)
     ego_len = getattr(ego, "length_m", VEHICLE_LENGTH_M)
     best_front_gap = float("inf")
     best_back_gap = float("inf")
@@ -777,6 +777,7 @@ def _evaluate_lane_change(
     edge_index: dict[tuple[int, int], list[SimVehicle]],
     graph: RoadNetworkGraph,
     leader: NeighborInfo | None,
+    closed_lanes: dict[tuple[int, int], set[int]] | None = None,
 ) -> None:
     """
     Evalúa MOBIL para decidir si el vehículo debe cambiar de carril.
@@ -784,20 +785,32 @@ def _evaluate_lane_change(
     - No-op si la arista tiene ≤ 1 carril o el vehículo está cerca del final
       de la arista (donde el lane ya se reasigna al entrar en la siguiente).
     - Modifica `vehicle.lane` in-place si MOBIL decide un cambio seguro.
+    - Si el carril actual del ego figura en ``closed_lanes[edge]``, se evalúa
+      con ``force_change=True`` (bypass de cooldown y del umbral de incentivo)
+      aceptando el mejor candidato seguro.
     """
-    # Early-out barato antes de cualquier lookup de grafo: un vehículo casi
-    # parado no tiene incentivo de aceleración para cambiar de carril y gastar
-    # CPU construyendo contextos y llamando al modelo es puro waste. En tráfico
-    # urbano gran parte del parque está en esta franja cada tick.
-    if vehicle.velocity < MOBIL_MIN_VELOCITY_MS:
-        return
-
+    current_lane = getattr(vehicle, "lane", 0)
     node_path = vehicle.route.node_path
     ei = vehicle.current_edge_index
     if ei >= len(node_path) - 1:
         return
 
     key = (node_path[ei], node_path[ei + 1])
+    closed_set: set[int] = set()
+    if closed_lanes is not None:
+        closed_set = closed_lanes.get(key, set())
+
+    trapped = current_lane in closed_set
+
+    # Early-out barato antes de cualquier lookup de grafo: un vehículo casi
+    # parado no tiene incentivo de aceleración para cambiar de carril y gastar
+    # CPU construyendo contextos y llamando al modelo es puro waste. En tráfico
+    # urbano gran parte del parque está en esta franja cada tick.
+    # Excepción: si está atrapado en un carril cerrado, SÍ evaluamos — la
+    # alternativa es quedarse bloqueando el tráfico y generar backpressure.
+    if not trapped and vehicle.velocity < MOBIL_MIN_VELOCITY_MS:
+        return
+
     edge_attrs = graph.get_edge_attributes(*key)
     # Dentro del anillo de una rotonda no cambiamos de carril: los cambios
     # provocan trayectorias cruzadas y colisiones en la curvatura. MOBIL se
@@ -808,7 +821,8 @@ def _evaluate_lane_change(
     # crea alcances en el nuevo carril cuando el circulante que ya venía por
     # detrás no puede frenar a tiempo — y MOBIL no gana nada, porque el
     # carril destino lo fija _target_roundabout_lane según la ruta.
-    if ei + 1 < len(node_path) - 1:
+    # Excepción: si el ego está atrapado en un carril cerrado, aún debe salir.
+    if not trapped and ei + 1 < len(node_path) - 1:
         next_attrs = graph.get_edge_attributes(node_path[ei + 1], node_path[ei + 2])
         if bool(next_attrs.get(ATTR_IS_ROUNDABOUT)):
             return
@@ -817,12 +831,11 @@ def _evaluate_lane_change(
         return
     edge_len = max(float(edge_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
 
-    # Cerca del fin de arista: no merece la pena cambiar.
+    # Cerca del fin de arista: no merece la pena cambiar salvo que esté atrapado.
     dist_to_end = edge_len - vehicle.progress_on_edge * edge_len
-    if dist_to_end < MOBIL_MIN_DIST_TO_EDGE_END_M:
+    if not trapped and dist_to_end < MOBIL_MIN_DIST_TO_EDGE_END_M:
         return
 
-    current_lane = getattr(vehicle, "lane", 0)
     same_edge = edge_index.get(key, [])
 
     # Construir contextos sólo para carriles existentes. Convención: lane 0 es
@@ -849,6 +862,8 @@ def _evaluate_lane_change(
         v_front_current=leader.velocity_ms if leader is not None else None,
         lane_left=lane_left_ctx,
         lane_right=lane_right_ctx,
+        closed_lanes_on_edge=closed_set or None,
+        force_change=trapped,
     )
     if not decision.should_change:
         return
@@ -1478,6 +1493,7 @@ def _trigger_collision(
     v1: SimVehicle,
     v2: SimVehicle,
     blocked_edges: dict[tuple[int, int], object | None],
+    pending_collisions: list[tuple[str, str, tuple[int, int]]] | None = None,
 ) -> None:
     """
     Marca dos vehículos como colisionados y bloquea el tramo indefinidamente.
@@ -1488,6 +1504,10 @@ def _trigger_collision(
     operador los retire por API (``/simulation/vehicles/{id}/clear-collision``).
     A* los evita multiplicando su peso por BLOCKED_EDGE_PENALTY_FACTOR en vez
     de excluirlas, para no perder conectividad cuando no hay alternativa.
+
+    Si se pasa ``pending_collisions``, se añade una tupla
+    ``(v1_id, v2_id, (u, v))`` para que el engine la transforme en un
+    IncidentModel (tipo ACCIDENT) tras el tick.
     """
     for v in (v1, v2):
         v.status = VehicleStatus.COLLISION
@@ -1499,7 +1519,10 @@ def _trigger_collision(
     np_ = v1.route.node_path
     ei = v1.current_edge_index
     if ei < len(np_) - 1:
-        blocked_edges[(np_[ei], np_[ei + 1])] = None
+        edge_key = (np_[ei], np_[ei + 1])
+        blocked_edges[edge_key] = None
+        if pending_collisions is not None:
+            pending_collisions.append((v1.id, v2.id, edge_key))
 
 
 def update_vehicles(
@@ -1509,6 +1532,8 @@ def update_vehicles(
     tl_controller: object | None = None,
     blocked_edges: dict[tuple[int, int], object | None] | None = None,
     tick_count: int = 0,
+    closed_lanes: dict[tuple[int, int], set[int]] | None = None,
+    pending_collisions: list[tuple[str, str, tuple[int, int]]] | None = None,
 ) -> list[str]:
     """
     Avanza todos los vehículos activos a lo largo de sus rutas usando IDM.
@@ -1524,12 +1549,19 @@ def update_vehicles(
                        ``None`` = bloqueo permanente (retirada manual por API).
         tick_count:    Contador global de ticks. Usado para cadenciar el
                        reroute proactivo periódico (Plan D1).
+        closed_lanes:  Mapa arista → set de carriles cerrados por incidentes.
+                       MOBIL lo usa para descartar carriles cerrados como
+                       destino y para forzar la salida de vehículos atrapados.
 
     Returns:
         Lista de vehicle_ids que terminaron su ruta en este tick.
     """
     if blocked_edges is None:
         blocked_edges = {}
+    if closed_lanes is None:
+        closed_lanes = {}
+    if pending_collisions is None:
+        pending_collisions = []
 
     # Snapshot de bloqueos ANTES del tick para detectar nuevos bloqueos al
     # final y disparar auto-reroute de los vehículos cuya ruta atraviese
@@ -1586,16 +1618,26 @@ def update_vehicles(
 
         # MOBIL: evaluar cambio de carril cada MOBIL_EVAL_INTERVAL_TICKS ticks
         # (el cooldown está escalonado al spawnear para repartir carga).
-        if vehicle.mobil_cooldown_ticks <= 0:
-            _evaluate_lane_change(vehicle, edge_index, graph, leader)
+        # Excepción: si el vehículo está en un carril cerrado por un incidente,
+        # se evalúa inmediatamente (bypass del cooldown) con force_change=True.
+        np_ = vehicle.route.node_path
+        ei = vehicle.current_edge_index
+        trapped_in_closed = False
+        if ei < len(np_) - 1:
+            trapped_in_closed = vehicle.lane in closed_lanes.get(
+                (np_[ei], np_[ei + 1]), set()
+            )
+        if vehicle.mobil_cooldown_ticks <= 0 or trapped_in_closed:
+            _evaluate_lane_change(
+                vehicle, edge_index, graph, leader, closed_lanes=closed_lanes
+            )
             vehicle.mobil_cooldown_ticks = MOBIL_EVAL_INTERVAL_TICKS
         else:
             vehicle.mobil_cooldown_ticks -= 1
 
         # Umbral de gap diferenciado según el tramo: en rotonda toleramos
         # gaps mayores antes de declarar choque (curvatura y waypoints).
-        np_ = vehicle.route.node_path
-        ei = vehicle.current_edge_index
+        # (np_ y ei ya fueron definidos en el bloque MOBIL anterior.)
         in_roundabout = False
         if ei < len(np_) - 1:
             cur_attrs = graph.get_edge_attributes(np_[ei], np_[ei + 1])
@@ -1633,7 +1675,9 @@ def update_vehicles(
             if vehicle.proximity_timer >= COLLISION_PROXIMITY_DURATION_S:
                 other = vehicles.get(leader.leader_id)  # type: ignore[union-attr]
                 if other is not None and other.status == VehicleStatus.MOVING:
-                    _trigger_collision(vehicle, other, blocked_edges)
+                    _trigger_collision(
+                        vehicle, other, blocked_edges, pending_collisions
+                    )
                     vehicle.proximity_timer = 0.0
                     continue  # no avanzar este tick
         else:
@@ -1858,6 +1902,8 @@ async def update_vehicles_parallel(
     tl_controller: object | None = None,
     blocked_edges: "dict[tuple[int, int], object | None] | None" = None,
     tick_count: int = 0,
+    closed_lanes: "dict[tuple[int, int], set[int]] | None" = None,
+    pending_collisions: "list[tuple[str, str, tuple[int, int]]] | None" = None,
 ) -> list[str]:
     """
     Avanza todos los vehículos usando todos los cores disponibles.
@@ -1879,7 +1925,15 @@ async def update_vehicles_parallel(
 
     if n < VEHICLE_PHYSICS_PARALLEL_THRESHOLD:
         return await asyncio.to_thread(
-            update_vehicles, vehicles, graph, dt, tl_controller, blocked_edges, tick_count
+            update_vehicles,
+            vehicles,
+            graph,
+            dt,
+            tl_controller,
+            blocked_edges,
+            tick_count,
+            closed_lanes,
+            pending_collisions,
         )
 
     try:
@@ -1888,6 +1942,10 @@ async def update_vehicles_parallel(
         # por lo que no puede delegarse a workers independientes.
         if blocked_edges is None:
             blocked_edges = {}
+        if closed_lanes is None:
+            closed_lanes = {}
+        if pending_collisions is None:
+            pending_collisions = []
 
         # Snapshot previo: cualquier arista añadida durante este tick activará
         # el auto-reroute de los vehículos cuya ruta pendiente la atraviese.
@@ -1958,7 +2016,9 @@ async def update_vehicles_parallel(
                 if v.proximity_timer >= COLLISION_PROXIMITY_DURATION_S:
                     other = vehicles.get(ldr.leader_id)  # type: ignore[union-attr]
                     if other is not None and other.status == VehicleStatus.MOVING:
-                        _trigger_collision(v, other, blocked_edges)
+                        _trigger_collision(
+                            v, other, blocked_edges, pending_collisions
+                        )
                         v.proximity_timer = 0.0
                         colliding_ids.add(v.id)
                         colliding_ids.add(other.id)
@@ -1967,9 +2027,17 @@ async def update_vehicles_parallel(
 
             # MOBIL en el proceso principal: los workers no tienen acceso al
             # edge_index completo (sólo a su chunk), por lo que el cambio de
-            # carril se decide aquí y se propaga ya decidido.
-            if v.mobil_cooldown_ticks <= 0:
-                _evaluate_lane_change(v, edge_index, graph, ldr)
+            # carril se decide aquí y se propaga ya decidido. Si el vehículo
+            # está en un carril cerrado se fuerza la evaluación (bypass cooldown).
+            np_p = v.route.node_path
+            ei_p = v.current_edge_index
+            trapped_p = False
+            if ei_p < len(np_p) - 1:
+                trapped_p = v.lane in closed_lanes.get((np_p[ei_p], np_p[ei_p + 1]), set())
+            if v.mobil_cooldown_ticks <= 0 or trapped_p:
+                _evaluate_lane_change(
+                    v, edge_index, graph, ldr, closed_lanes=closed_lanes
+                )
                 v.mobil_cooldown_ticks = MOBIL_EVAL_INTERVAL_TICKS
             else:
                 v.mobil_cooldown_ticks -= 1

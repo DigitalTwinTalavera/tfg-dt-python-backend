@@ -40,6 +40,7 @@ from app.core.constants import (
     GRAPH_CACHE_TTL_SECONDS,
     KMH_TO_MS,
     ROAD_TYPE_WEIGHT_FACTORS,
+    ZBE_EDGE_PENALTY_FACTOR,
 )
 from app.models.enums import NodeType
 
@@ -456,6 +457,7 @@ class RoadNetworkGraph:
         end: int,
         *,
         blocked_edges: Optional[dict[tuple[int, int], Any]] = None,
+        restricted_edges: Optional[set[tuple[int, int]]] = None,
     ) -> list[int]:
         """
         Find the shortest path using A* with a geographic heuristic.
@@ -473,6 +475,9 @@ class RoadNetworkGraph:
             blocked_edges: Mapping (u,v) → cualquier valor (None o TTL). Las
                 aristas presentes pagan BLOCKED_EDGE_PENALTY_FACTOR. No se
                 eliminan del grafo para no perder conectividad.
+            restricted_edges: Aristas dentro de zonas restringidas para el
+                vtype solicitante (ZBE force_reroute). Reciben
+                ZBE_EDGE_PENALTY_FACTOR en la función de peso.
 
         Returns:
             List of node IDs forming the shortest path
@@ -498,8 +503,9 @@ class RoadNetworkGraph:
 
         dynamic = self._dynamic_weights
         blocked = blocked_edges or {}
+        restricted = restricted_edges or set()
 
-        if not dynamic and not blocked:
+        if not dynamic and not blocked and not restricted:
             return nx.astar_path(
                 self._graph, start, end, heuristic=_heuristic, weight=ATTR_WEIGHT
             )
@@ -509,6 +515,8 @@ class RoadNetworkGraph:
             mult = dynamic.get((u, v), 1.0)
             if (u, v) in blocked:
                 mult *= BLOCKED_EDGE_PENALTY_FACTOR
+            if (u, v) in restricted:
+                mult *= ZBE_EDGE_PENALTY_FACTOR
             return base * mult
 
         return nx.astar_path(
@@ -521,6 +529,7 @@ class RoadNetworkGraph:
         end: int,
         *,
         blocked_edges: Optional[dict[tuple[int, int], Any]] = None,
+        restricted_edges: Optional[set[tuple[int, int]]] = None,
     ) -> Optional[list[int]]:
         """
         A* shortest path (returns None if no path exists instead of raising).
@@ -531,13 +540,18 @@ class RoadNetworkGraph:
             blocked_edges: Mapping de aristas bloqueadas (valor None o TTL);
                 se penalizan por BLOCKED_EDGE_PENALTY_FACTOR en vez de
                 eliminarlas.
+            restricted_edges: Aristas restringidas por ZBE para el vtype
+                solicitante; pagan ZBE_EDGE_PENALTY_FACTOR.
 
         Returns:
             List of node IDs or None if no path exists
         """
         try:
             return self.get_shortest_path_astar(
-                start, end, blocked_edges=blocked_edges
+                start,
+                end,
+                blocked_edges=blocked_edges,
+                restricted_edges=restricted_edges,
             )
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             return None

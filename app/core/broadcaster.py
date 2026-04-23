@@ -16,6 +16,7 @@ import orjson
 
 from app.api.websocket.manager import ConnectionManager
 from app.api.websocket.messages import (
+    build_incident_message,
     build_sim_state_message,
     build_tick_message,
     build_traffic_lights_message,
@@ -24,6 +25,7 @@ from app.api.websocket.messages import (
     build_vehicle_spawned_message,
     build_vehicle_state,
     build_vehicles_batch_spawned_message,
+    build_zone_message,
 )
 from app.services.vehicle_spawner import SimVehicle, VehicleSpawner
 
@@ -251,3 +253,29 @@ class SimulationBroadcaster:
             vehicle_id_1, vehicle_id_2, node_from, node_to
         )
         await self._manager.broadcast(message)
+
+    async def broadcast_incident(
+        self, *, action: str, payload: dict[str, Any]
+    ) -> None:
+        """Emite alta, actualización o baja de un incidente.
+
+        Args:
+            action: "created" | "updated" | "cleared".
+            payload: Dict público del incidente (IncidentManager.to_public_dict).
+        """
+        if self._manager.connection_count == 0:
+            return
+        await self._manager.broadcast(build_incident_message(action, payload))
+
+    async def broadcast_zone(
+        self, *, action: str, payload: dict[str, Any]
+    ) -> None:
+        """Emite alta, actualización o baja de una zona de control.
+
+        Args:
+            action: "created" | "updated" | "cleared".
+            payload: Dict público de la zona (ZoneManager.to_public_dict).
+        """
+        if self._manager.connection_count == 0:
+            return
+        await self._manager.broadcast(build_zone_message(action, payload))

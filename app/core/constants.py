@@ -370,6 +370,26 @@ MSG_SIMULATION_STARTED = "Simulación iniciada"
 MSG_SIMULATION_STOPPED = "Simulación detenida por shutdown"
 
 # =============================================================================
+# Events & Zones Constants (Módulo 4)
+# =============================================================================
+
+# Duraciones por defecto (s) para cada tipo de incidente. None = permanente
+# (retirada manual por API). Los accidentes detectados automáticamente son
+# permanentes: simulan una intervención de emergencia que el operador cierra.
+INCIDENT_DEFAULT_DURATION_S: dict[str, float | None] = {
+    "accident": None,
+    "roadwork": 3600.0,   # 1 hora
+    "breakdown": 600.0,   # 10 minutos
+    "event": 1800.0,      # 30 minutos
+}
+
+# Factor de penalización aplicado en A* a las aristas dentro de una ZBE con
+# enforcement=force_reroute para los tipos de vehículo restringidos. Elevado
+# para que cualquier alternativa razonable gane, pero no ∞: si no hay
+# alternativa (isleño) el coche entra igualmente.
+ZBE_EDGE_PENALTY_FACTOR: float = 50.0
+
+# =============================================================================
 # Traffic Light Constants
 # =============================================================================
 

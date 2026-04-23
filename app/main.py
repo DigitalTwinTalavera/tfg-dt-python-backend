@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from pathlib import Path
 
-from app.api import health, map, routes, simulation
+from app.api import health, incidents, map, routes, simulation, zones
 from app.config import settings
 from app.core.constants import (
     API_PREFIX,
@@ -37,7 +37,7 @@ from app.core.constants import (
     WS_SIMULATION_PATH,
 )
 from app.core.responses import RootResponse
-from app.api.deps import _graph
+from app.api.deps import _graph, _zone_manager
 from app.core.simulation_engine import simulation_engine
 from app.db.database import async_session_factory, close_db, init_db
 from app.services.osm_loader import OSMLoader
@@ -111,6 +111,13 @@ async def lifespan(app: FastAPI):
                 f"Warning: MAP_FILE '{settings.MAP_FILE}' not found in '{OSM_DATA_DIRECTORY}/'"
             )
 
+    # Cargar zonas (ZBE / restringidas) desde BD; son persistentes entre
+    # reinicios, a diferencia de los incidentes que son estado vivo.
+    try:
+        await _zone_manager.load_from_db()
+    except Exception as exc:
+        print(f"Warning: no se pudieron cargar zonas de BD: {exc}")
+
     yield # Aquí la aplicación está corriendo y puede atender peticiones
 
     # Shutdown
@@ -144,6 +151,8 @@ app.add_middleware(
 app.include_router(health.router, prefix=API_PREFIX, tags=[TAG_HEALTH])
 app.include_router(map.router, prefix=API_PREFIX, tags=[TAG_MAP])
 app.include_router(simulation.router, prefix=API_PREFIX, tags=[TAG_SIMULATION])
+app.include_router(incidents.router, prefix=API_PREFIX)
+app.include_router(zones.router, prefix=API_PREFIX)
 app.include_router(routes.router)
 
 
