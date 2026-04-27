@@ -102,7 +102,7 @@ class TestYieldSign:
         v = _make_vehicle("v1", [1, 2, 3], progress=0.9, velocity=10.0)
         # Otro vehículo aproximándose al mismo nodo 2 por una rama distinta (4→2).
         other = _make_vehicle("v2", [4, 2, 5], progress=0.95, velocity=10.0)
-        edge_index = {(4, 2): [other]}
+        edge_index = {(4, 2): {0: [other]}}
         g = _mock_graph({2: NodeType.YIELD_SIGN.value}, edge_length=50.0)
         leader = _check_stop_yield_sign(v, g, edge_index, dt=0.1)
         assert leader is not None

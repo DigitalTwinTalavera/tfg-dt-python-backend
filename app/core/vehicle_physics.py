@@ -70,6 +70,9 @@ from app.core.constants import (
     MOBIL_MIN_DIST_TO_EDGE_END_M,
     PERIODIC_REROUTE_BATCH_SIZE,
     PERIODIC_REROUTE_TICK_INTERVAL,
+    PERIODIC_REROUTE_ASTAR_CAP_PER_TICK,
+    URGENT_REROUTE_BATCH_SIZE,
+    URGENT_REROUTE_TTL_TICKS,
     SIGN_DETECTION_ZONE_M,
     STOP_SIGN_DWELL_SPEED_MS,
     STOP_SIGN_DWELL_TIME_S,
@@ -290,18 +293,27 @@ def _get_waypoints(
 # Leader detection
 # ---------------------------------------------------------------------------
 
+## Tipo del índice por edge → lane → list[vehicles] (DESC por progreso).
+## Permite que `_find_leader` y MOBIL salten directos al carril que les interesa
+## sin escanear vecinos de otros carriles. Crítico con 4000 veh: evita el peor
+## caso O(N_edge) cuando todos los candidatos por delante están en otro carril.
+EdgeLaneIndex = "dict[tuple[int, int], dict[int, list[SimVehicle]]]"
+
+
 def _build_edge_index(
     vehicles: dict[str, SimVehicle],
-) -> dict[tuple[int, int], list[SimVehicle]]:
+) -> "dict[tuple[int, int], dict[int, list[SimVehicle]]]":
     """
-    Construye un índice {(start_node, end_node): [vehicles sorted by progress desc]}.
+    Construye un índice {(start_node, end_node): {lane: [veh DESC por progress]}}.
 
-    Permite encontrar el líder de cualquier vehículo en O(k) donde k es el
-    número de vehículos en la misma arista (en promedio muy pequeño).
+    Permite encontrar el líder en el mismo carril en O(k_lane), donde
+    k_lane es el número de vehículos del MISMO carril en la arista (típicamente
+    1-3). Antes la lista era plana por edge, así que el peor caso (50 veh en
+    lane=1, ego en lane=0 sin líder) recorría las 50 antes de devolver None.
 
     Solo incluye vehículos activos (no FINISHED).
     """
-    index: dict[tuple[int, int], list[SimVehicle]] = {}
+    index: dict[tuple[int, int], dict[int, list[SimVehicle]]] = {}
     for v in vehicles.values():
         if v.status == VehicleStatus.FINISHED:
             continue
@@ -309,24 +321,26 @@ def _build_edge_index(
         ei = v.current_edge_index
         if ei < len(node_path) - 1:
             key = (node_path[ei], node_path[ei + 1])
-            index.setdefault(key, []).append(v)
-    # Ordenar por progreso descendente → el primero de la lista es el líder
-    for key in index:
-        index[key].sort(key=lambda v: v.progress_on_edge, reverse=True)
+            lane = getattr(v, "lane", 0)
+            index.setdefault(key, {}).setdefault(lane, []).append(v)
+    # Ordenar cada lista de carril por progreso descendente
+    for lanes_dict in index.values():
+        for lane_list in lanes_dict.values():
+            lane_list.sort(key=lambda v: v.progress_on_edge, reverse=True)
     return index
 
 
 def _find_leader(
     vehicle: SimVehicle,
-    edge_index: dict[tuple[int, int], list[SimVehicle]],
+    edge_index: "dict[tuple[int, int], dict[int, list[SimVehicle]]]",
     graph: RoadNetworkGraph,
 ) -> NeighborInfo | None:
     """
-    Busca el vehículo más cercano por delante en la misma arista.
+    Busca el vehículo más cercano por delante en la misma arista y carril.
 
     Returns:
         NeighborInfo con el gap bumper-to-bumper y la velocidad del líder,
-        o None si la arista está libre.
+        o None si la arista/carril están libres.
     """
     node_path = vehicle.route.node_path
     ei = vehicle.current_edge_index
@@ -338,11 +352,9 @@ def _find_leader(
     edge_len = max(float(edge_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
 
     ego_lane = getattr(vehicle, "lane", 0)
-    for candidate in edge_index.get(key, []):
+    same_lane_list = edge_index.get(key, {}).get(ego_lane, [])
+    for candidate in same_lane_list:
         if candidate.id == vehicle.id:
-            continue
-        # Sólo vehículos en el mismo carril bloquean al ego.
-        if getattr(candidate, "lane", 0) != ego_lane:
             continue
         if candidate.progress_on_edge > vehicle.progress_on_edge:
             cand_len = getattr(candidate, "length_m", VEHICLE_LENGTH_M)
@@ -377,7 +389,7 @@ def _find_leader(
         if vehicle.progress_on_edge > 0.70 or distance_gate:
             next_key = (node_path[ei + 1], node_path[ei + 2])
             next_edge_len = max(float(next_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
-            candidates_next = edge_index.get(next_key, [])
+            next_lanes_dict = edge_index.get(next_key, {})
             # Dentro del mismo anillo los carriles están geométricamente alineados
             # entre arcos: un coche en lane=0 del arco A solo es líder de los
             # que vienen detrás en lane=0; los de lane=1 no le afectan. Fuera
@@ -391,15 +403,17 @@ def _find_leader(
                 and edge_attrs.get(ATTR_ROUNDABOUT_ID) is not None
             )
             if same_ring:
-                candidates_next = [
-                    c for c in candidates_next if getattr(c, "lane", 0) == ego_lane
-                ]
+                candidates_next = next_lanes_dict.get(ego_lane, [])
             elif is_entry:
                 # El ego entrará en un carril determinista según su ruta; los
                 # circulantes del anillo en otro carril no le afectan.
                 ego_target_lane = _target_roundabout_lane(vehicle, graph)
+                candidates_next = next_lanes_dict.get(ego_target_lane, [])
+            else:
+                # Sin anillo: cualquier carril del siguiente edge puede afectar
+                # (el lane se reasigna al cruzar). Aplanar las listas por carril.
                 candidates_next = [
-                    c for c in candidates_next if getattr(c, "lane", 0) == ego_target_lane
+                    v for lst in next_lanes_dict.values() for v in lst
                 ]
             if candidates_next:
                 # El que tiene menor progress está más cerca del inicio → el que más molesta.
@@ -734,24 +748,22 @@ def _edge_curvature_vmax(
 def _build_lane_context(
     ego: SimVehicle,
     target_lane: int,
-    same_edge_vehicles: list[SimVehicle],
+    target_lane_vehicles: list[SimVehicle],
     edge_len: float,
 ) -> LaneContext:
     """
     Construye el LaneContext para el carril `target_lane` en la arista del ego.
 
-    Recorre sólo los vehículos en la misma arista (ya filtrados por el caller),
-    busca el más cercano por delante y el más cercano por detrás en `target_lane`
-    y devuelve sus gaps bumper-to-bumper y velocidades para evaluar MOBIL.
+    `target_lane_vehicles` ya viene filtrado por el caller usando el índice
+    per-lane (`edge_index[edge_key][target_lane]`). Aquí solo hace falta
+    encontrar el más cercano por delante y por detrás del ego.
     """
     ctx = LaneContext(lane_index=target_lane)
     ego_len = getattr(ego, "length_m", VEHICLE_LENGTH_M)
     best_front_gap = float("inf")
     best_back_gap = float("inf")
-    for cand in same_edge_vehicles:
+    for cand in target_lane_vehicles:
         if cand.id == ego.id:
-            continue
-        if getattr(cand, "lane", 0) != target_lane:
             continue
         cand_len = getattr(cand, "length_m", VEHICLE_LENGTH_M)
         if cand.progress_on_edge > ego.progress_on_edge:
@@ -774,7 +786,7 @@ def _build_lane_context(
 
 def _evaluate_lane_change(
     vehicle: SimVehicle,
-    edge_index: dict[tuple[int, int], list[SimVehicle]],
+    edge_index: "dict[tuple[int, int], dict[int, list[SimVehicle]]]",
     graph: RoadNetworkGraph,
     leader: NeighborInfo | None,
     closed_lanes: dict[tuple[int, int], set[int]] | None = None,
@@ -836,19 +848,25 @@ def _evaluate_lane_change(
     if not trapped and dist_to_end < MOBIL_MIN_DIST_TO_EDGE_END_M:
         return
 
-    same_edge = edge_index.get(key, [])
+    same_edge_lanes = edge_index.get(key, {})
 
     # Construir contextos sólo para carriles existentes. Convención: lane 0 es
     # el carril derecho (el más cercano al bordillo); lane+1 es el izquierdo.
+    # Con el índice per-lane, MOBIL recibe directamente la lista del carril
+    # destino — sin escanear los demás carriles.
     lane_left_ctx: LaneContext | None = None
     lane_right_ctx: LaneContext | None = None
     if current_lane + 1 < n_lanes:
         lane_left_ctx = _build_lane_context(
-            vehicle, current_lane + 1, same_edge, edge_len
+            vehicle, current_lane + 1,
+            same_edge_lanes.get(current_lane + 1, []),
+            edge_len,
         )
     if current_lane - 1 >= 0:
         lane_right_ctx = _build_lane_context(
-            vehicle, current_lane - 1, same_edge, edge_len
+            vehicle, current_lane - 1,
+            same_edge_lanes.get(current_lane - 1, []),
+            edge_len,
         )
     if lane_left_ctx is None and lane_right_ctx is None:
         return
@@ -979,7 +997,7 @@ def _node_type_of(graph: RoadNetworkGraph, node_id: int) -> str | None:
 def _check_stop_yield_sign(
     vehicle: SimVehicle,
     graph: RoadNetworkGraph,
-    edge_index: dict[tuple[int, int], list[SimVehicle]],
+    edge_index: "dict[tuple[int, int], dict[int, list[SimVehicle]]]",
     dt: float,
 ) -> NeighborInfo | None:
     """Genera un líder virtual ante STOP / YIELD en el end_node de la arista.
@@ -1031,19 +1049,20 @@ def _check_stop_yield_sign(
         return NeighborInfo(gap_m=gap, velocity_ms=0.0)
 
     # YIELD: ceder a tráfico que converge al mismo nodo por otra arista.
-    for (u, w), others in edge_index.items():
+    for (u, w), lanes_dict in edge_index.items():
         if w != end_node or (u == start_node and w == end_node):
             continue
         other_attrs = graph.get_edge_attributes(u, w)
         other_len = max(float(other_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
-        for other in others:
-            if other.id == vehicle.id:
-                continue
-            dist_other_to_node = other_len * (1.0 - other.progress_on_edge)
-            ttc = dist_other_to_node / max(other.velocity, 1.0)
-            if ttc < YIELD_SIGN_TTC_S or dist_other_to_node < YIELD_SIGN_GAP_MIN_M:
-                gap = max(dist_to_sign - VEHICLE_LENGTH_M, 0.2)
-                return NeighborInfo(gap_m=gap, velocity_ms=0.0)
+        for lane_list in lanes_dict.values():
+            for other in lane_list:
+                if other.id == vehicle.id:
+                    continue
+                dist_other_to_node = other_len * (1.0 - other.progress_on_edge)
+                ttc = dist_other_to_node / max(other.velocity, 1.0)
+                if ttc < YIELD_SIGN_TTC_S or dist_other_to_node < YIELD_SIGN_GAP_MIN_M:
+                    gap = max(dist_to_sign - VEHICLE_LENGTH_M, 0.2)
+                    return NeighborInfo(gap_m=gap, velocity_ms=0.0)
 
     return None
 
@@ -1058,6 +1077,8 @@ def _advance_vehicle_idm(
     dt: float,
     leader: NeighborInfo | None,
     tl_ref: object | None = None,
+    blocked_edges_set: set[tuple[int, int]] | None = None,
+    closed_lanes: dict[tuple[int, int], set[int]] | None = None,
 ) -> bool:
     """
     Avanza un vehículo por su ruta durante dt segundos usando el IDM.
@@ -1071,12 +1092,22 @@ def _advance_vehicle_idm(
            amarillo si el vehículo no tiene yellow_runs_light), se detiene
            antes de cruzar aunque el IDM no haya podido frenar a tiempo
            (aristas cortas).
+         → Hard-stop por bloqueo de tramo: si la siguiente arista está en
+           ``blocked_edges_set`` (cierre/incidente activado tras el spawn),
+           se detiene en el borde del tramo actual. La penalización en A*
+           sólo cubre rutas calculadas tras el bloqueo; sin esta validación
+           los vehículos con ruta previa cruzaban el cierre.
       5. Interpola la posición geográfica con los waypoints reales.
 
     Args:
         tl_ref: Objeto con método get_phase_for_edge(node_id, edge) → str,
                 opcional. Cuando se proporciona, activa el hard-stop de
                 seguridad en el bucle de avance de aristas.
+        blocked_edges_set: conjunto de claves (start_n, end_n) bloqueadas.
+                Si se proporciona, el vehículo no entra en ninguna.
+        closed_lanes: mapa edge → set de carriles cerrados; se aplica al
+                clampar el carril en la transición a la nueva arista para
+                aterrizar en un carril abierto siempre que sea posible.
 
     Returns:
         True si el vehículo completó su ruta en este tick.
@@ -1211,6 +1242,23 @@ def _advance_vehicle_idm(
                     vehicle.velocity         = 0.0
                     remaining_dist           = 0.0
                     break
+
+            # Hard-stop si la siguiente arista está bloqueada (cierre/incidente
+            # activado tras calcular la ruta). La penalización en A* solo cubre
+            # rutas nuevas; sin este check el vehículo cruzaba el tramo cerrado
+            # hasta que el reroute periódico lo alcanzaba (3+ s con 1500 veh).
+            if blocked_edges_set is not None and ei + 2 <= len(node_path) - 1:
+                next_key = (node_path[ei + 1], node_path[ei + 2])
+                if next_key in blocked_edges_set:
+                    stop_progress = max(
+                        vehicle.progress_on_edge,
+                        min(1.0 - (VEHICLE_LENGTH_M / edge_len), 0.98),
+                    )
+                    vehicle.progress_on_edge = stop_progress
+                    vehicle.velocity         = 0.0
+                    remaining_dist           = 0.0
+                    break
+
             remaining_dist           -= dist_to_end
             # Guardar la tangente final de la arista saliente antes de avanzar
             # al siguiente tramo: se usa para mezclar con la tangente inicial
@@ -1239,7 +1287,19 @@ def _advance_vehicle_idm(
                 )
                 new_lanes = max(int(new_edge_attrs.get(ATTR_LANES, 1)), 1)
                 cur_lane = getattr(vehicle, "lane", 0)
-                vehicle.lane = min(cur_lane, new_lanes - 1)
+                new_lane = min(cur_lane, new_lanes - 1)
+                # Si el carril destino está cerrado en la nueva arista, aterrizar
+                # en el carril abierto más cercano. Si TODOS están cerrados se
+                # mantiene el clamp original — MOBIL/trapped_in_closed forzará
+                # reroute en el siguiente tick.
+                if closed_lanes is not None:
+                    new_edge_key = (node_path[ei], node_path[ei + 1])
+                    closed_set = closed_lanes.get(new_edge_key, set())
+                    if new_lane in closed_set:
+                        open_lanes = [l for l in range(new_lanes) if l not in closed_set]
+                        if open_lanes:
+                            new_lane = min(open_lanes, key=lambda l: abs(l - cur_lane))
+                vehicle.lane = new_lane
                 # Cruzando la línea de entrada a un anillo: forzar el carril
                 # según la ruta (exterior si sale ya, interior si da ≥1 vuelta
                 # más). Reparte carga entre carriles y evita que todo el
@@ -1317,6 +1377,7 @@ def _maybe_reroute_around_blocks(
     blocked_edges: dict[tuple[int, int], object | None],
     trigger_blocks: set[tuple[int, int]] | None = None,
     restricted_edges_by_vtype: dict[str, set[tuple[int, int]]] | None = None,
+    astar_budget: list[int] | None = None,
 ) -> bool:
     """
     Re-rutea un vehículo individual si su ruta pendiente toca alguna arista
@@ -1348,7 +1409,27 @@ def _maybe_reroute_around_blocks(
     if ei >= len(np_) - 1:
         return False
 
-    check_set = trigger_blocks if trigger_blocks is not None else set(blocked_edges.keys())
+    # Resolución temprana del set restringido del vtype: necesario tanto para
+    # validar el reroute como para AMPLIAR el trigger de detección. Sin esto,
+    # un vehículo con ruta pre-existente que cruza una ZBE jamás dispara
+    # reroute (bloqueos ≠ ZBE) y el cliente lo ve "ignorando" la zona.
+    restricted: set[tuple[int, int]] | None = None
+    if restricted_edges_by_vtype is not None:
+        vt = getattr(vehicle.vtype, "value", None)
+        if vt is not None:
+            r = restricted_edges_by_vtype.get(vt)
+            if r:
+                restricted = r
+
+    # check_set incluye los bloqueos (cierres/colisiones) Y las restricciones
+    # ZBE del vtype del vehículo. Si la ruta pendiente toca cualquiera, vale
+    # la pena recalcular.
+    if trigger_blocks is not None:
+        check_set: set[tuple[int, int]] = set(trigger_blocks)
+    else:
+        check_set = set(blocked_edges.keys())
+    if restricted:
+        check_set = check_set | restricted
     if not check_set:
         return False
 
@@ -1361,18 +1442,20 @@ def _maybe_reroute_around_blocks(
     if not hit:
         return False
 
+    # Cap de A* por tick: si el batch ya consumió su presupuesto, no llamar a
+    # compute_route. El vehículo será revisado en el siguiente tick por el
+    # cursor rotatorio. Sin esto, una activación de ZBE que afecte a muchos
+    # vehículos genera spikes de tick (>200 ms) y tirones visibles.
+    if astar_budget is not None and astar_budget[0] <= 0:
+        return False
+
     from app.core.route import RouteInfo, compute_route
 
     pivot_node = np_[ei + 1]
     end_node = vehicle.route.end_node_id
 
-    restricted: set[tuple[int, int]] | None = None
-    if restricted_edges_by_vtype is not None:
-        vt = getattr(vehicle.vtype, "value", None)
-        if vt is not None:
-            r = restricted_edges_by_vtype.get(vt)
-            if r:
-                restricted = r
+    if astar_budget is not None:
+        astar_budget[0] -= 1
 
     new_route = compute_route(
         graph,
@@ -1445,14 +1528,21 @@ def _reroute_affected_by_new_blocks(
     """
     if not new_blocks:
         return 0
+    # Cap también este pase: con un cierre que afecte a 500+ vehículos, sin
+    # cap el A* fan-out colapsa el tick. Los no servidos los recoge el
+    # periodic batch en los siguientes ticks.
+    astar_budget = [PERIODIC_REROUTE_ASTAR_CAP_PER_TICK]
     rerouted = 0
     for vehicle in vehicles.values():
+        if astar_budget[0] <= 0:
+            break
         if _maybe_reroute_around_blocks(
             vehicle,
             graph,
             blocked_edges,
             trigger_blocks=new_blocks,
             restricted_edges_by_vtype=restricted_edges_by_vtype,
+            astar_budget=astar_budget,
         ):
             rerouted += 1
     return rerouted
@@ -1489,6 +1579,18 @@ def _periodic_reroute_all(
     return rerouted
 
 
+## Tick del último bloqueo nuevo detectado. Mientras `tick_count - _last_new_block_tick`
+## sea menor que URGENT_REROUTE_TTL_TICKS, el batch periódico usa el tamaño urgente.
+## Inicializado a un valor muy negativo para que la primera comprobación falle.
+_last_new_block_tick: int = -10_000_000
+
+
+def _mark_new_blocks_detected(tick_count: int) -> None:
+    """Activa la ventana de reroute urgente durante URGENT_REROUTE_TTL_TICKS."""
+    global _last_new_block_tick
+    _last_new_block_tick = tick_count
+
+
 def _periodic_reroute_batch(
     vehicles: dict[str, SimVehicle],
     graph: "RoadNetworkGraph",  # type: ignore[name-defined]
@@ -1504,13 +1606,27 @@ def _periodic_reroute_batch(
     cada ``ceil(N / batch)`` ticks, cobertura idéntica a la versión all-in-one
     pero con latencia constante por tick (≤ 5-10 ms típicamente).
 
+    Durante la ventana urgente posterior a un nuevo bloqueo (TTL en ticks,
+    ver ``URGENT_REROUTE_TTL_TICKS``) se usa ``URGENT_REROUTE_BATCH_SIZE``
+    para cubrir la flota más rápido — clave con 1500+ vehículos donde la
+    cobertura normal tarda 30 ticks (3 s).
+
     El reroute inmediato cuando aparece un nuevo bloqueo se mantiene vía
     ``_reroute_affected_by_new_blocks`` — esto es el safety net para los
     vehículos que esa pasada no atrapó.
+
+    También dispara cuando hay restricciones ZBE activas aunque no haya
+    aristas bloqueadas: vehículos con ruta pre-existente que cruza una zona
+    recién creada deben ser rerouteados periódicamente (el one-shot de
+    `_reroute_live_vehicles` está capado a 500 → con flotas grandes el
+    resto se queda con la ruta vieja sin esta cobertura).
     """
-    if not blocked_edges:
-        return 0
     if PERIODIC_REROUTE_BATCH_SIZE <= 0:
+        return 0
+    has_zbe = bool(restricted_edges_by_vtype) and any(
+        bool(s) for s in restricted_edges_by_vtype.values()
+    )
+    if not blocked_edges and not has_zbe:
         return 0
     # snapshot del orden: dict.values() en Python 3.7+ es orden de inserción,
     # estable mientras no haya inserciones/borrados dentro del batch.
@@ -1518,20 +1634,34 @@ def _periodic_reroute_batch(
     n = len(vehicles_list)
     if n == 0:
         return 0
-    batch_size = min(PERIODIC_REROUTE_BATCH_SIZE, n)
+    is_urgent = (tick_count - _last_new_block_tick) < URGENT_REROUTE_TTL_TICKS
+    effective_batch = URGENT_REROUTE_BATCH_SIZE if is_urgent else PERIODIC_REROUTE_BATCH_SIZE
+    batch_size = min(effective_batch, n)
     start = (tick_count * batch_size) % n
-    blocked_set = set(blocked_edges.keys())
+    # `trigger_blocks=None` en `_maybe_reroute_around_blocks` hace que use
+    # blocked_edges.keys() ∪ restricted_edges_by_vtype[vtype] internamente.
+    blocked_set = set(blocked_edges.keys()) if blocked_edges else set()
+    # Presupuesto de A* (compute_route) por tick. Lista de un int para mutar
+    # por referencia desde la función auxiliar. Vehículos con hit pero sin
+    # presupuesto vuelven a ser candidatos en el siguiente tick.
+    astar_budget = [PERIODIC_REROUTE_ASTAR_CAP_PER_TICK]
     rerouted = 0
     for i in range(batch_size):
+        if astar_budget[0] <= 0:
+            break  # Presupuesto agotado: parar el batch — el cursor rotatorio
+                   # cubrirá el resto en ticks sucesivos.
         idx = start + i
         if idx >= n:
             idx -= n
+        # trigger_blocks=None deja que `_maybe_reroute_around_blocks` use
+        # blocked_set ∪ restricted_edges del vtype como check_set.
         if _maybe_reroute_around_blocks(
             vehicles_list[idx],
             graph,
             blocked_edges,
-            trigger_blocks=blocked_set,
+            trigger_blocks=blocked_set if blocked_set else None,
             restricted_edges_by_vtype=restricted_edges_by_vtype,
+            astar_budget=astar_budget,
         ):
             rerouted += 1
     return rerouted
@@ -1621,6 +1751,15 @@ def update_vehicles(
     ring_occupancy = _build_ring_occupancy(vehicles, graph)
     entry_arms = _build_entry_arm_index(vehicles, graph)
     finished_ids: list[str] = []
+
+    # Snapshot del lookup de bloqueos para `_advance_vehicle_idm`. Las nuevas
+    # colisiones de este tick añaden entradas a `blocked_edges` durante el
+    # bucle pero no se reflejan aquí: los afectados se cubren con el
+    # `_reroute_affected_by_new_blocks` posterior. Esto sólo previene que
+    # vehículos crucen aristas bloqueadas ANTES de que arrancara este tick.
+    blocked_lookup: set[tuple[int, int]] | None = (
+        set(blocked_edges) if blocked_edges else None
+    )
 
     for vehicle in list(vehicles.values()):
         if vehicle.status == VehicleStatus.FINISHED:
@@ -1737,13 +1876,22 @@ def update_vehicles(
         else:
             vehicle.proximity_timer = 0.0
 
-        if _advance_vehicle_idm(vehicle, graph, dt, leader, tl_ref=tl_controller):
+        if _advance_vehicle_idm(
+            vehicle,
+            graph,
+            dt,
+            leader,
+            tl_ref=tl_controller,
+            blocked_edges_set=blocked_lookup,
+            closed_lanes=closed_lanes,
+        ):
             finished_ids.append(vehicle.id)
 
     # Auto-reroute en bloque: detectar aristas bloqueadas en este tick y
     # re-planificar a los vehículos MOVING cuya ruta pendiente las atraviese.
     new_blocks = set(blocked_edges.keys()) - blocked_before
     if new_blocks:
+        _mark_new_blocks_detected(tick_count)
         _reroute_affected_by_new_blocks(
             vehicles,
             graph,
@@ -1756,14 +1904,15 @@ def update_vehicles(
     # PERIODIC_REROUTE_BATCH_SIZE vehículos desde un cursor rotatorio, cubriendo
     # todos los activos cada ceil(N / batch) ticks. Reemplaza el pase all-in-one
     # cada PERIODIC_REROUTE_TICK_INTERVAL ticks que producía picos de 1-1.5 s.
-    if blocked_edges:
-        _periodic_reroute_batch(
-            vehicles,
-            graph,
-            blocked_edges,
-            tick_count,
-            restricted_edges_by_vtype=restricted_edges_by_vtype,
-        )
+    # Se ejecuta también con ZBE-only (sin blocked_edges) — la función
+    # internamente decide saltarse el pase si no hay nada que mirar.
+    _periodic_reroute_batch(
+        vehicles,
+        graph,
+        blocked_edges,
+        tick_count,
+        restricted_edges_by_vtype=restricted_edges_by_vtype,
+    )
 
     return finished_ids
 
@@ -1841,6 +1990,8 @@ def _vehicle_to_dict(
     v: "SimVehicle",  # type: ignore[name-defined]
     leader: "NeighborInfo | None" = None,
     tl_phases: "dict[int, dict[str, str]] | None" = None,
+    blocked_edges_set: "set[tuple[int, int]] | None" = None,
+    closed_lanes: "dict[tuple[int, int], set[int]] | None" = None,
 ) -> dict:
     """Serializa los campos mutables de un SimVehicle para IPC entre procesos."""
     vtype = getattr(v, "vtype", None)
@@ -1868,6 +2019,10 @@ def _vehicle_to_dict(
         "leader_vel_ms": leader.velocity_ms if leader is not None else None,
         # Snapshot completo de fases de semáforos para _FrozenTL en workers.
         "tl_phases": tl_phases,
+        # Snapshot de bloqueos/carriles cerrados para hard-stop en workers.
+        # Solo el primer dict de cada chunk los lleva; el resto guarda None.
+        "blocked_edges": blocked_edges_set,
+        "closed_lanes": closed_lanes,
     }
 
 
@@ -1895,11 +2050,21 @@ def _process_chunk(
 
     # Reconstruir _FrozenTL desde el primer vehículo del chunk (todos comparten el mismo snapshot)
     frozen_tl: _FrozenTL | None = None
+    blocked_lookup: set[tuple[int, int]] | None = None
+    closed_lanes_chunk: dict[tuple[int, int], set[int]] | None = None
     if vehicle_dicts:
         raw_phases = vehicle_dicts[0].get("tl_phases")
         if raw_phases is not None:
             # node_id keys llegan como int/str según IPC — normalizar a int
             frozen_tl = _FrozenTL({int(k): v for k, v in raw_phases.items()})
+        raw_blocked = vehicle_dicts[0].get("blocked_edges")
+        if raw_blocked:
+            blocked_lookup = {(int(a), int(b)) for (a, b) in raw_blocked}
+        raw_closed = vehicle_dicts[0].get("closed_lanes")
+        if raw_closed:
+            closed_lanes_chunk = {
+                (int(a), int(b)): set(lanes) for (a, b), lanes in raw_closed.items()
+            }
 
     for vd in vehicle_dicts:
         node_path = vd["node_path"]
@@ -1941,7 +2106,15 @@ def _process_chunk(
                 velocity_ms=vd["leader_vel_ms"],
             )
 
-        finished = _advance_vehicle_idm(v, _worker_graph, dt, leader, tl_ref=frozen_tl)  # type: ignore[arg-type]
+        finished = _advance_vehicle_idm(
+            v,
+            _worker_graph,  # type: ignore[arg-type]
+            dt,
+            leader,
+            tl_ref=frozen_tl,
+            blocked_edges_set=blocked_lookup,
+            closed_lanes=closed_lanes_chunk,
+        )
         if finished:
             finished_ids.append(v.id)
         updates.append({
@@ -2140,6 +2313,16 @@ async def update_vehicles_parallel(
         if tl_controller is not None:
             tl_phases_dict = tl_controller.get_snapshot()  # type: ignore[union-attr]
 
+        # Snapshot de bloqueos y carriles cerrados para hard-stop en workers.
+        # `blocked_edges` puede haber crecido por colisiones de este tick: usar
+        # snapshot actualizado para que los workers vean los nuevos bloqueos.
+        blocked_lookup_dispatch: set[tuple[int, int]] | None = (
+            set(blocked_edges) if blocked_edges else None
+        )
+        closed_lanes_dispatch: dict[tuple[int, int], set[int]] | None = (
+            closed_lanes if closed_lanes else None
+        )
+
         # Excluir colisionados de esta iteración: su status ya es COLLISION y
         # el worker no debe reintegrarlos en el IDM ni mover su posición.
         dispatch_list = [v for v in vehicle_list if v.id not in colliding_ids]
@@ -2150,9 +2333,20 @@ async def update_vehicles_parallel(
             executor  = _ensure_executor(graph)
             n_workers = min(os.cpu_count() or 1, n_dispatch)
             chunk_size = max(1, math.ceil(n_dispatch / n_workers))
+            # Solo el primer dict de cada chunk lleva snapshots compartidos
+            # (tl_phases / blocked_edges / closed_lanes); el resto guarda None
+            # para reducir el tamaño del payload IPC.
             chunks = [
-                [_vehicle_to_dict(v, leaders.get(v.id), tl_phases_dict)
-                 for v in dispatch_list[i : i + chunk_size]]
+                [
+                    _vehicle_to_dict(
+                        v,
+                        leaders.get(v.id),
+                        tl_phases_dict if j == 0 else None,
+                        blocked_lookup_dispatch if j == 0 else None,
+                        closed_lanes_dispatch if j == 0 else None,
+                    )
+                    for j, v in enumerate(dispatch_list[i : i + chunk_size])
+                ]
                 for i in range(0, n_dispatch, chunk_size)
             ]
 
@@ -2207,6 +2401,7 @@ async def update_vehicles_parallel(
     # current_edge_index e índices asociados sean los más recientes.
     new_blocks = set(blocked_edges.keys()) - blocked_before
     if new_blocks:
+        _mark_new_blocks_detected(tick_count)
         _reroute_affected_by_new_blocks(
             vehicles,
             graph,
@@ -2217,13 +2412,14 @@ async def update_vehicles_parallel(
 
     # Plan D1: pase proactivo amortizado por tick (ver _periodic_reroute_batch).
     # Sustituye el pase all-in-one cada PERIODIC_REROUTE_TICK_INTERVAL ticks.
-    if blocked_edges:
-        _periodic_reroute_batch(
-            vehicles,
-            graph,
-            blocked_edges,
-            tick_count,
-            restricted_edges_by_vtype=restricted_by_vtype,
-        )
+    # Se ejecuta también con ZBE-only — el helper sale temprano si no hay
+    # ni bloqueos ni restricciones de zona.
+    _periodic_reroute_batch(
+        vehicles,
+        graph,
+        blocked_edges,
+        tick_count,
+        restricted_edges_by_vtype=restricted_by_vtype,
+    )
 
     return finished_ids

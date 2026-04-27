@@ -221,6 +221,24 @@ PERIODIC_REROUTE_TICK_INTERVAL: int = 50
 # sigue disparándose de forma inmediata vía `_reroute_affected_by_new_blocks`.
 PERIODIC_REROUTE_BATCH_SIZE: int = 50
 
+# Tras detectar un nuevo bloqueo (cierre, ZBE, colisión), durante una ventana
+# corta el batch del reroute periódico se incrementa para cubrir la flota
+# rápidamente y minimizar el tiempo en que vehículos siguen rutas inválidas.
+# 200 vehículos × 50 ticks = 10000 visitas en 5 s — cubre flotas de 4000 con
+# margen y mantiene los picos por tick por debajo del presupuesto (cada
+# `_maybe_reroute_around_blocks` es ~0.1 ms cuando la ruta ya es válida).
+URGENT_REROUTE_BATCH_SIZE: int = 200
+URGENT_REROUTE_TTL_TICKS: int = 50
+
+# Cap duro de llamadas a A* (compute_route) por tick desde el periodic batch.
+# Cada A* en un grafo real puede costar 5-50 ms; sin cap, una activación de
+# ZBE que afecte a 100+ vehículos genera spikes catastróficos (tick >> 200 ms,
+# tirones obvios). El cap permite que el batch ESCANEE muchos vehículos baratos
+# (route-intersection check) pero ABORTE más A* cuando el presupuesto se agota.
+# Coverage degrada elegantemente: vehículos no servidos en este tick pasan al
+# siguiente vía el cursor rotatorio.
+PERIODIC_REROUTE_ASTAR_CAP_PER_TICK: int = 20
+
 # Cache settings
 GRAPH_CACHE_TTL_SECONDS = 300  # 5 minutes
 
