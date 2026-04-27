@@ -31,24 +31,43 @@ if TYPE_CHECKING:
     from app.core.broadcaster import SimulationBroadcaster
     from app.core.physics.vehicle_types import VehicleType
     from app.services.network_graph import RoadNetworkGraph
+    from app.services.vehicle_spawner import VehicleSpawner
 
 logger = logging.getLogger(__name__)
+
+# Cap de vehículos rerouteados síncronamente al crear/mutar una zona. El resto
+# los recoge ``_periodic_reroute_batch`` en los siguientes ticks; este límite
+# evita bloquear el endpoint cuando la zona toca a miles de vehículos vivos.
+_LIVE_REROUTE_CAP = 500
 
 
 class ZoneManager:
     """
     Mantiene el catálogo de zonas y la caché (zone_id → set de edge IDs).
+
+    También cachea, por tipo de vehículo, el conjunto de aristas (u,v) que
+    A* debe penalizar (zonas activas con ``enforcement=force_reroute``). Esa
+    caché se expone vía :meth:`restricted_edges_by_vtype` para que el hot
+    path del tick (reroutes durante simulación) la consulte sin re-escanear
+    el grafo.
     """
 
     def __init__(
         self,
         graph: "RoadNetworkGraph",
         broadcaster: "SimulationBroadcaster | None" = None,
+        spawner: "VehicleSpawner | None" = None,
     ) -> None:
         self._graph = graph
         self._broadcaster = broadcaster
+        self._spawner = spawner
         self._zones: dict[int, ZoneModel] = {}
         self._edge_ids_in_zone: dict[int, set[int]] = {}
+        # vtype_str → set de pares (u,v) restringidos para ese vtype. Se
+        # reasigna en bloque desde ``_recompute_restricted_cache`` (no se muta
+        # in-place) para que las lecturas concurrentes desde el tick sean
+        # atómicas bajo GIL.
+        self._restricted_edges_by_vtype: dict[str, set[tuple[int, int]]] = {}
 
     # ------------------------------------------------------------------
     # Carga inicial
@@ -70,6 +89,7 @@ class ZoneManager:
         except Exception:
             logger.exception("No se pudieron cargar zonas desde BD")
             return
+        self._recompute_restricted_cache()
         logger.info(
             "ZoneManager: %d zonas cargadas (%d activas)",
             len(self._zones),
@@ -151,12 +171,17 @@ class ZoneManager:
             self._edge_ids_in_zone[zone.id] = await self._compute_edges_in_zone(
                 session, zone.id
             )
+        added, _removed = self._recompute_restricted_cache()
+        if self._spawner is not None:
+            self._spawner.clear_route_cache()
+        rerouted = self._reroute_live_vehicles(added)
         await self._broadcast("created", zone)
         logger.info(
-            "Zona creada id=%s name=%s edges=%d",
+            "Zona creada id=%s name=%s edges=%d rerouted=%d",
             zone.id,
             zone.name,
             len(self._edge_ids_in_zone.get(zone.id, set())),
+            rerouted,
         )
         return zone
 
@@ -188,7 +213,18 @@ class ZoneManager:
             await session.commit()
             await session.refresh(zone)
             self._zones[zone.id] = zone
+        # Cualquier cambio que afecte a la política (active/enforcement/vtypes)
+        # se proyecta en la caché y dispara invalidación + reroute. ``name`` no
+        # toca routing, pero el coste de recomputar es despreciable.
+        added, removed = self._recompute_restricted_cache()
+        if (added or removed) and self._spawner is not None:
+            self._spawner.clear_route_cache()
+        rerouted = self._reroute_live_vehicles(added) if added else 0
         await self._broadcast("updated", zone)
+        if added or removed:
+            logger.info(
+                "Zona actualizada id=%s rerouted=%d", zone.id, rerouted
+            )
         return zone
 
     async def delete(self, zone_id: int) -> bool:
@@ -200,6 +236,12 @@ class ZoneManager:
             await session.commit()
         removed = self._zones.pop(zone_id, None)
         self._edge_ids_in_zone.pop(zone_id, None)
+        # Relajar restricciones nunca empeora una ruta válida, así que NO
+        # forzamos reroute de vehículos vivos. Sí invalidamos el cache de
+        # rutas de spawn para que los próximos vehículos puedan recalcular.
+        _added, removed_edges = self._recompute_restricted_cache()
+        if removed_edges and self._spawner is not None:
+            self._spawner.clear_route_cache()
         if removed is not None:
             await self._broadcast("cleared", removed)
         return True
@@ -223,29 +265,127 @@ class ZoneManager:
         """
         Aristas (u,v) que deben penalizarse en A* para este ``vtype``.
 
-        Combina todas las zonas activas con ``enforcement=force_reroute`` cuyo
-        ``restricted_vtypes`` incluya el tipo solicitado. Devuelve pares (u,v)
-        (la clave que usa el DiGraph), ya que el weight callback los compara
-        por tupla, no por edge_id.
+        Lee de la caché ``_restricted_edges_by_vtype`` (precomputada en
+        :meth:`_recompute_restricted_cache`). Devuelve un set vacío si no hay
+        restricciones para este tipo.
         """
         vstr = vtype.value if hasattr(vtype, "value") else str(vtype)
-        wanted_edge_ids: set[int] = set()
+        return set(self._restricted_edges_by_vtype.get(vstr, set()))
+
+    def restricted_edges_by_vtype(self) -> dict[str, set[tuple[int, int]]]:
+        """
+        Devuelve la caché completa vtype → set[(u,v)] para el hot path del tick.
+
+        Se devuelve la referencia interna directamente (no se copia) por coste:
+        el llamante no debe mutarla. La caché se reasigna en bloque desde
+        :meth:`_recompute_restricted_cache`, así que las lecturas concurrentes
+        son atómicas bajo GIL.
+        """
+        return self._restricted_edges_by_vtype
+
+    def _recompute_restricted_cache(
+        self,
+    ) -> tuple[dict[str, set[tuple[int, int]]], dict[str, set[tuple[int, int]]]]:
+        """
+        Reconstruye ``_restricted_edges_by_vtype`` desde cero recorriendo las
+        zonas activas con ``enforcement=force_reroute``. Devuelve dos dicts
+        ``vtype → edges`` con los deltas (added, removed) respecto a la caché
+        previa, para que los callers sepan qué propagar al spawner.
+        """
+        old_cache = self._restricted_edges_by_vtype
+
+        # Paso 1: edge_ids restringidos por vtype.
+        wanted_by_vtype: dict[str, set[int]] = {}
         for z in self._zones.values():
             if not z.active:
                 continue
             if z.enforcement != ZoneEnforcement.FORCE_REROUTE.value:
                 continue
-            if vstr not in (z.restricted_vtypes or []):
+            edges = self._edge_ids_in_zone.get(z.id) or set()
+            if not edges:
                 continue
-            wanted_edge_ids |= self._edge_ids_in_zone.get(z.id, set())
-        if not wanted_edge_ids:
-            return set()
-        # Traducir edge_id → (u,v). Hacemos scan del grafo una vez.
-        result: set[tuple[int, int]] = set()
-        for u, v, data in self._graph.graph.edges(data=True):
-            if int(data.get("edge_id", 0)) in wanted_edge_ids:
-                result.add((u, v))
-        return result
+            for vt in z.restricted_vtypes or []:
+                wanted_by_vtype.setdefault(str(vt), set()).update(edges)
+
+        # Paso 2: traducir edge_id → (u,v) con un único scan del grafo.
+        new_cache: dict[str, set[tuple[int, int]]] = {
+            vt: set() for vt in wanted_by_vtype
+        }
+        if wanted_by_vtype:
+            for u, v, data in self._graph.graph.edges(data=True):
+                eid = int(data.get("edge_id", 0))
+                for vt, eids in wanted_by_vtype.items():
+                    if eid in eids:
+                        new_cache[vt].add((u, v))
+
+        # Reasignación atómica.
+        self._restricted_edges_by_vtype = new_cache
+
+        # Calcular deltas vs caché previa.
+        added: dict[str, set[tuple[int, int]]] = {}
+        removed: dict[str, set[tuple[int, int]]] = {}
+        all_vtypes = set(old_cache.keys()) | set(new_cache.keys())
+        for vt in all_vtypes:
+            before = old_cache.get(vt, set())
+            after = new_cache.get(vt, set())
+            diff_added = after - before
+            diff_removed = before - after
+            if diff_added:
+                added[vt] = diff_added
+            if diff_removed:
+                removed[vt] = diff_removed
+        return added, removed
+
+    def _reroute_live_vehicles(
+        self, added: dict[str, set[tuple[int, int]]]
+    ) -> int:
+        """
+        Reroutea vehículos MOVING cuyo vtype acaba de ganar restricciones y
+        cuya ruta pendiente atraviese alguna arista nueva. Patrón análogo al
+        ``_reroute_affected_by_new_blocks`` de incidentes.
+
+        Returns:
+            Número total de vehículos rerouteados.
+        """
+        if not added or self._spawner is None:
+            return 0
+        try:
+            from app.core.vehicle_physics import _maybe_reroute_around_blocks
+        except Exception:
+            logger.exception("No se pudo importar _maybe_reroute_around_blocks")
+            return 0
+
+        graph = self._graph
+        blocked_edges = self._spawner.blocked_edges
+        cache = self._restricted_edges_by_vtype
+        rerouted_total = 0
+        scanned = 0
+        for vehicle in self._spawner.vehicles.values():
+            if scanned >= _LIVE_REROUTE_CAP:
+                break
+            scanned += 1
+            if vehicle.status != VehicleStatus.MOVING:
+                continue
+            vt = getattr(vehicle.vtype, "value", None)
+            if vt is None:
+                continue
+            trigger = added.get(vt)
+            if not trigger:
+                continue
+            try:
+                if _maybe_reroute_around_blocks(
+                    vehicle,
+                    graph,
+                    blocked_edges,
+                    trigger_blocks=trigger,
+                    restricted_edges_by_vtype=cache,
+                ):
+                    rerouted_total += 1
+            except Exception:
+                logger.exception(
+                    "Reroute por zona falló para vehículo %s", vehicle.id
+                )
+        return rerouted_total
 
     def is_spawn_denied(
         self,

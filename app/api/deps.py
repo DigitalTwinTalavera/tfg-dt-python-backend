@@ -22,7 +22,9 @@ _broadcaster = SimulationBroadcaster(
 _incident_manager = IncidentManager(
     spawner=_spawner, broadcaster=_broadcaster, graph=_graph
 )
-_zone_manager = ZoneManager(graph=_graph, broadcaster=_broadcaster)
+_zone_manager = ZoneManager(
+    graph=_graph, broadcaster=_broadcaster, spawner=_spawner
+)
 # El spawner consulta el zone_manager en el hot path de spawn/reroute.
 _spawner.zone_manager = _zone_manager
 

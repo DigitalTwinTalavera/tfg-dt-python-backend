@@ -386,6 +386,7 @@ class SimulationEngine:
                     tick_count=self._tick_count,
                     closed_lanes=self._spawner.closed_lanes,
                     pending_collisions=pending_collisions,
+                    zone_manager=self._zone_manager,
                 )
             except Exception:
                 logger.exception("Error inesperado en update_vehicles_parallel; tick ignorado")

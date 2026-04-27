@@ -1316,6 +1316,7 @@ def _maybe_reroute_around_blocks(
     graph: RoadNetworkGraph,
     blocked_edges: dict[tuple[int, int], object | None],
     trigger_blocks: set[tuple[int, int]] | None = None,
+    restricted_edges_by_vtype: dict[str, set[tuple[int, int]]] | None = None,
 ) -> bool:
     """
     Re-rutea un vehículo individual si su ruta pendiente toca alguna arista
@@ -1331,6 +1332,11 @@ def _maybe_reroute_around_blocks(
     Si A* devuelve una ruta que aún contiene algún bloqueo conocido (no hay
     alternativa real), no se muta: seguir con el camino original penalizado
     es equivalente y evita churn.
+
+    ``restricted_edges_by_vtype`` (vtype_str → set[(u,v)]) se inyecta desde el
+    ``ZoneManager``. Si el vtype del vehículo tiene restricciones, se pasan a
+    A* para que rodee la zona, y se descartan rutas que metan al vehículo en
+    una zona donde su ruta original no entraba (mejora estricta).
 
     Returns:
         True si el vehículo fue re-ruteado; False en cualquier otro caso.
@@ -1359,8 +1365,21 @@ def _maybe_reroute_around_blocks(
 
     pivot_node = np_[ei + 1]
     end_node = vehicle.route.end_node_id
+
+    restricted: set[tuple[int, int]] | None = None
+    if restricted_edges_by_vtype is not None:
+        vt = getattr(vehicle.vtype, "value", None)
+        if vt is not None:
+            r = restricted_edges_by_vtype.get(vt)
+            if r:
+                restricted = r
+
     new_route = compute_route(
-        graph, pivot_node, end_node, blocked_edges=blocked_edges
+        graph,
+        pivot_node,
+        end_node,
+        blocked_edges=blocked_edges,
+        restricted_edges=restricted,
     )
     if new_route is None or len(new_route.node_path) < 2:
         return False
@@ -1370,6 +1389,20 @@ def _maybe_reroute_around_blocks(
     blocked_set = set(blocked_edges.keys())
     if any((nnp[i], nnp[i + 1]) in blocked_set for i in range(len(nnp) - 1)):
         return False
+    # Si la nueva ruta introduce un cruce de zona restringida que la vieja
+    # NO tenía, descartar (no empeorar). Si ambas cruzan, aceptar el reroute
+    # — A* eligió el menos malo dada la penalización ZBE_EDGE_PENALTY_FACTOR.
+    if restricted:
+        new_hits = any(
+            (nnp[i], nnp[i + 1]) in restricted for i in range(len(nnp) - 1)
+        )
+        if new_hits:
+            old_hits = any(
+                (np_[i], np_[i + 1]) in restricted
+                for i in range(ei + 1, len(np_) - 1)
+            )
+            if not old_hits:
+                return False
 
     # Concatenar prefijo [0..ei] + nueva ruta (que empieza en pivot=np_[ei+1]).
     prefix = np_[: ei + 1]
@@ -1400,6 +1433,7 @@ def _reroute_affected_by_new_blocks(
     graph: RoadNetworkGraph,
     new_blocks: set[tuple[int, int]],
     blocked_edges: dict[tuple[int, int], object | None],
+    restricted_edges_by_vtype: dict[str, set[tuple[int, int]]] | None = None,
 ) -> int:
     """
     Re-rutea a todos los vehículos MOVING cuya cola de ruta pase por alguna
@@ -1414,7 +1448,11 @@ def _reroute_affected_by_new_blocks(
     rerouted = 0
     for vehicle in vehicles.values():
         if _maybe_reroute_around_blocks(
-            vehicle, graph, blocked_edges, trigger_blocks=new_blocks
+            vehicle,
+            graph,
+            blocked_edges,
+            trigger_blocks=new_blocks,
+            restricted_edges_by_vtype=restricted_edges_by_vtype,
         ):
             rerouted += 1
     return rerouted
@@ -1424,6 +1462,7 @@ def _periodic_reroute_all(
     vehicles: dict[str, SimVehicle],
     graph: RoadNetworkGraph,
     blocked_edges: dict[tuple[int, int], object | None],
+    restricted_edges_by_vtype: dict[str, set[tuple[int, int]]] | None = None,
 ) -> int:
     """
     Plan D1 — reroute proactivo. Recorre TODOS los MOVING y re-planifica a los
@@ -1440,7 +1479,11 @@ def _periodic_reroute_all(
     rerouted = 0
     for vehicle in vehicles.values():
         if _maybe_reroute_around_blocks(
-            vehicle, graph, blocked_edges, trigger_blocks=blocked_set
+            vehicle,
+            graph,
+            blocked_edges,
+            trigger_blocks=blocked_set,
+            restricted_edges_by_vtype=restricted_edges_by_vtype,
         ):
             rerouted += 1
     return rerouted
@@ -1451,6 +1494,7 @@ def _periodic_reroute_batch(
     graph: "RoadNetworkGraph",  # type: ignore[name-defined]
     blocked_edges: dict[tuple[int, int], object | None],
     tick_count: int,
+    restricted_edges_by_vtype: dict[str, set[tuple[int, int]]] | None = None,
 ) -> int:
     """
     Versión amortizada de ``_periodic_reroute_all``. En lugar de revisar los N
@@ -1483,7 +1527,11 @@ def _periodic_reroute_batch(
         if idx >= n:
             idx -= n
         if _maybe_reroute_around_blocks(
-            vehicles_list[idx], graph, blocked_edges, trigger_blocks=blocked_set
+            vehicles_list[idx],
+            graph,
+            blocked_edges,
+            trigger_blocks=blocked_set,
+            restricted_edges_by_vtype=restricted_edges_by_vtype,
         ):
             rerouted += 1
     return rerouted
@@ -1534,6 +1582,7 @@ def update_vehicles(
     tick_count: int = 0,
     closed_lanes: dict[tuple[int, int], set[int]] | None = None,
     pending_collisions: list[tuple[str, str, tuple[int, int]]] | None = None,
+    restricted_edges_by_vtype: dict[str, set[tuple[int, int]]] | None = None,
 ) -> list[str]:
     """
     Avanza todos los vehículos activos a lo largo de sus rutas usando IDM.
@@ -1614,7 +1663,12 @@ def update_vehicles(
         ):
             ldr_v = vehicles.get(leader.leader_id)
             if ldr_v is not None and ldr_v.status == VehicleStatus.COLLISION:
-                _maybe_reroute_around_blocks(vehicle, graph, blocked_edges)
+                _maybe_reroute_around_blocks(
+                    vehicle,
+                    graph,
+                    blocked_edges,
+                    restricted_edges_by_vtype=restricted_edges_by_vtype,
+                )
 
         # MOBIL: evaluar cambio de carril cada MOBIL_EVAL_INTERVAL_TICKS ticks
         # (el cooldown está escalonado al spawnear para repartir carga).
@@ -1690,14 +1744,26 @@ def update_vehicles(
     # re-planificar a los vehículos MOVING cuya ruta pendiente las atraviese.
     new_blocks = set(blocked_edges.keys()) - blocked_before
     if new_blocks:
-        _reroute_affected_by_new_blocks(vehicles, graph, new_blocks, blocked_edges)
+        _reroute_affected_by_new_blocks(
+            vehicles,
+            graph,
+            new_blocks,
+            blocked_edges,
+            restricted_edges_by_vtype=restricted_edges_by_vtype,
+        )
 
     # Plan D1: reroute proactivo amortizado por tick. Cada tick revisa
     # PERIODIC_REROUTE_BATCH_SIZE vehículos desde un cursor rotatorio, cubriendo
     # todos los activos cada ceil(N / batch) ticks. Reemplaza el pase all-in-one
     # cada PERIODIC_REROUTE_TICK_INTERVAL ticks que producía picos de 1-1.5 s.
     if blocked_edges:
-        _periodic_reroute_batch(vehicles, graph, blocked_edges, tick_count)
+        _periodic_reroute_batch(
+            vehicles,
+            graph,
+            blocked_edges,
+            tick_count,
+            restricted_edges_by_vtype=restricted_edges_by_vtype,
+        )
 
     return finished_ids
 
@@ -1904,6 +1970,7 @@ async def update_vehicles_parallel(
     tick_count: int = 0,
     closed_lanes: "dict[tuple[int, int], set[int]] | None" = None,
     pending_collisions: "list[tuple[str, str, tuple[int, int]]] | None" = None,
+    zone_manager: object | None = None,
 ) -> list[str]:
     """
     Avanza todos los vehículos usando todos los cores disponibles.
@@ -1923,6 +1990,15 @@ async def update_vehicles_parallel(
 
     n = len(vehicles)
 
+    # Snapshot del dict de restricciones por vtype. Reasignado en bloque por
+    # el ZoneManager, así que la referencia es estable durante el tick.
+    restricted_by_vtype: dict[str, set[tuple[int, int]]] | None = None
+    if zone_manager is not None:
+        try:
+            restricted_by_vtype = zone_manager.restricted_edges_by_vtype()  # type: ignore[attr-defined]
+        except Exception:
+            restricted_by_vtype = None
+
     if n < VEHICLE_PHYSICS_PARALLEL_THRESHOLD:
         return await asyncio.to_thread(
             update_vehicles,
@@ -1934,6 +2010,7 @@ async def update_vehicles_parallel(
             tick_count,
             closed_lanes,
             pending_collisions,
+            restricted_by_vtype,
         )
 
     try:
@@ -2049,7 +2126,12 @@ async def update_vehicles_parallel(
             if ldr is not None and ldr.leader_id is not None:
                 ldr_v = vehicles.get(ldr.leader_id)
                 if ldr_v is not None and ldr_v.status == VehicleStatus.COLLISION:
-                    _maybe_reroute_around_blocks(v, graph, blocked_edges)
+                    _maybe_reroute_around_blocks(
+                        v,
+                        graph,
+                        blocked_edges,
+                        restricted_edges_by_vtype=restricted_by_vtype,
+                    )
 
             leaders[v.id] = ldr
 
@@ -2088,7 +2170,16 @@ async def update_vehicles_parallel(
         global _EXECUTOR
         _EXECUTOR = None
         return await asyncio.to_thread(
-            update_vehicles, vehicles, graph, dt, tl_controller, blocked_edges, tick_count
+            update_vehicles,
+            vehicles,
+            graph,
+            dt,
+            tl_controller,
+            blocked_edges,
+            tick_count,
+            closed_lanes,
+            pending_collisions,
+            restricted_by_vtype,
         )
 
     finished_ids: list[str] = list(pre_finished)
@@ -2116,11 +2207,23 @@ async def update_vehicles_parallel(
     # current_edge_index e índices asociados sean los más recientes.
     new_blocks = set(blocked_edges.keys()) - blocked_before
     if new_blocks:
-        _reroute_affected_by_new_blocks(vehicles, graph, new_blocks, blocked_edges)
+        _reroute_affected_by_new_blocks(
+            vehicles,
+            graph,
+            new_blocks,
+            blocked_edges,
+            restricted_edges_by_vtype=restricted_by_vtype,
+        )
 
     # Plan D1: pase proactivo amortizado por tick (ver _periodic_reroute_batch).
     # Sustituye el pase all-in-one cada PERIODIC_REROUTE_TICK_INTERVAL ticks.
     if blocked_edges:
-        _periodic_reroute_batch(vehicles, graph, blocked_edges, tick_count)
+        _periodic_reroute_batch(
+            vehicles,
+            graph,
+            blocked_edges,
+            tick_count,
+            restricted_edges_by_vtype=restricted_by_vtype,
+        )
 
     return finished_ids
