@@ -274,6 +274,13 @@ class SimulationEngine:
         Los slow-ticks se registran en el log para diagnóstico.
         """
         next_deadline = time.monotonic()
+        # Stats de tick: cada PERF_LOG_INTERVAL ticks reportamos tiempos
+        # medios. Útil para identificar el subsistema cuello cuando hay
+        # tirones (compara total vs broadcast.avg_broadcast_time_ms).
+        PERF_LOG_INTERVAL = 100
+        tick_time_sum_ms = 0.0
+        tick_time_max_ms = 0.0
+        tick_samples = 0
         try:
             while self._state == SimulationState.RUNNING:
                 tick_start = time.monotonic()
@@ -285,13 +292,35 @@ class SimulationEngine:
                 self._simulation_time += interval_s
 
                 elapsed = time.monotonic() - tick_start
+                elapsed_ms = elapsed * 1000.0
+                tick_time_sum_ms += elapsed_ms
+                if elapsed_ms > tick_time_max_ms:
+                    tick_time_max_ms = elapsed_ms
+                tick_samples += 1
                 if elapsed > interval_s * 1.2:
                     logger.warning(
                         "Slow tick #%d: %.0f ms (presupuesto %.0f ms)",
                         self._tick_count,
-                        elapsed * 1000.0,
+                        elapsed_ms,
                         interval_s * 1000.0,
                     )
+                if tick_samples >= PERF_LOG_INTERVAL:
+                    avg_ms = tick_time_sum_ms / tick_samples
+                    bcast_avg = (
+                        self._broadcaster.avg_broadcast_time_ms
+                        if self._broadcaster is not None else 0.0
+                    )
+                    logger.info(
+                        "Perf #%d: tick avg=%.1f ms max=%.1f ms | broadcast avg=%.2f ms | active=%d",
+                        self._tick_count,
+                        avg_ms,
+                        tick_time_max_ms,
+                        bcast_avg,
+                        self._vehicles_active,
+                    )
+                    tick_time_sum_ms = 0.0
+                    tick_time_max_ms = 0.0
+                    tick_samples = 0
 
                 next_deadline += interval_s
                 now = time.monotonic()

@@ -8,17 +8,16 @@ Soporta delta updates (solo campos que cambiaron).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
-
-import orjson
 
 from app.api.websocket.manager import ConnectionManager
 from app.api.websocket.messages import (
     build_incident_message,
     build_sim_state_message,
-    build_tick_message,
+    build_tick_binary,
     build_traffic_lights_message,
     build_vehicle_collision_message,
     build_vehicle_finished_message,
@@ -47,9 +46,15 @@ class SimulationBroadcaster:
     ) -> None:
         self._manager = connection_manager
         self._spawner = vehicle_spawner
-        self._last_snapshot: dict[str, dict[str, Any]] = {}
         self._broadcast_count: int = 0
         self._total_broadcast_time_ms: float = 0.0
+        # Tarea de envío en vuelo del tick anterior. Permite solapar el envío
+        # WS con el cómputo del siguiente tick: al inicio de cada
+        # `broadcast_tick` esperamos a que termine la anterior (suele ser
+        # cero porque el envío es ms y el tick son 100 ms) y luego lanzamos
+        # la nueva como fire-and-forget. Si un cliente lento bloquea el send,
+        # solo retrasa UN tick (el siguiente await la espera).
+        self._pending_send: asyncio.Task[None] | None = None
 
     @property
     def broadcast_count(self) -> int:
@@ -63,9 +68,13 @@ class SimulationBroadcaster:
 
     def reset(self) -> None:
         """Reinicia el estado del broadcaster (al iniciar simulación)."""
-        self._last_snapshot.clear()
         self._broadcast_count = 0
         self._total_broadcast_time_ms = 0.0
+        # Cualquier envío en vuelo del estado anterior se descarta — los
+        # clientes recibirán el primer tick de la nueva simulación.
+        if self._pending_send is not None and not self._pending_send.done():
+            self._pending_send.cancel()
+        self._pending_send = None
 
     # Número máximo de vehículos por mensaje tick.
     # Cada vehículo ocupa ~130 bytes de JSON; con 500 vehículos el mensaje
@@ -93,39 +102,49 @@ class SimulationBroadcaster:
 
         t0 = time.monotonic()
 
-        vehicles = self._spawner.get_all_vehicles()
-        vehicle_states = self._build_delta_states(vehicles)
+        # Esperamos a que termine el envío del tick anterior antes de empezar
+        # a serializar el nuevo. En condiciones normales esto es ~cero (el
+        # send WS termina en ms y el tick dura 100 ms). Si hay un cliente
+        # lento, retrasa UN tick — mejor que bloquear todos.
+        if self._pending_send is not None and not self._pending_send.done():
+            try:
+                await self._pending_send
+            except Exception:
+                logger.exception("Error en envío del tick anterior (ignorado)")
+        self._pending_send = None
 
+        vehicles = self._spawner.get_all_vehicles()
+        vehicle_states = self._build_all_states(vehicles)
+
+        # Pre-serializamos todos los chunks como wire format binario
+        # (~4× menos bytes y ~5× más rápido que orjson). Snapshot consistente
+        # con el sim_time del tick. El envío se delega a una tarea
+        # fire-and-forget.
+        chunk_size = self._TICK_CHUNK_SIZE
+        payloads: list[bytes] = []
         if vehicle_states or tick == 0:
-            # orjson + broadcast_bytes: serializamos cada chunk UNA vez aquí y
-            # enviamos los bytes pre-codificados a todas las conexiones, en
-            # lugar de que send_json re-serialice N veces (una por cliente).
-            # orjson es 3-5× más rápido que stdlib json para payloads grandes.
-            chunk_size = self._TICK_CHUNK_SIZE
             if len(vehicle_states) <= chunk_size:
-                message = build_tick_message(
+                payloads.append(build_tick_binary(
                     tick=tick,
                     sim_time=sim_time,
                     vehicles=vehicle_states,
                     chunk_index=0,
                     chunk_total=1,
-                )
-                await self._manager.broadcast_bytes(orjson.dumps(message))
+                ))
             else:
-                # Enviar en múltiples mensajes para no superar el límite de tamaño.
-                # `chunk_index` y `chunk_total` permiten al cliente re-ensamblar
-                # el tick de forma atómica antes de aplicarlo al renderer.
                 total = (len(vehicle_states) + chunk_size - 1) // chunk_size
                 for idx, i in enumerate(range(0, len(vehicle_states), chunk_size)):
                     chunk = vehicle_states[i : i + chunk_size]
-                    message = build_tick_message(
+                    payloads.append(build_tick_binary(
                         tick=tick,
                         sim_time=sim_time,
                         vehicles=chunk,
                         chunk_index=idx,
                         chunk_total=total,
-                    )
-                    await self._manager.broadcast_bytes(orjson.dumps(message))
+                    ))
+
+        if payloads:
+            self._pending_send = asyncio.create_task(self._send_payloads(payloads))
 
         elapsed_ms = (time.monotonic() - t0) * 1000.0
         self._broadcast_count += 1
@@ -139,25 +158,29 @@ class SimulationBroadcaster:
                 elapsed_ms,
             )
 
-    def _build_delta_states(
+    async def _send_payloads(self, payloads: list[bytes]) -> None:
+        """
+        Envía secuencialmente todos los chunks de un tick. Se ejecuta como
+        tarea fire-and-forget para que el bucle de simulación pueda iniciar
+        el siguiente tick sin esperar a que el WS complete el envío.
+        """
+        for payload in payloads:
+            await self._manager.broadcast_bytes(payload)
+
+    def _build_all_states(
         self, vehicles: list[SimVehicle]
     ) -> list[dict[str, Any]]:
         """
-        Construye la lista de estados de vehículos con delta updates.
+        Construye la lista de estados de TODOS los vehículos activos.
 
-        Un vehículo se incluye si:
-        - Es nuevo (no estaba en el snapshot anterior).
-        - Alguno de sus campos ha cambiado.
-
-        Returns:
-            Lista de dicts con el estado de cada vehículo que cambió.
+        Antes había una optimización de delta (`_build_delta_states`) que
+        comparaba con el snapshot anterior y omitía vehículos sin cambios,
+        pero a 10 Hz casi todos cambian (lon/lat/v/a se mueven cada tick),
+        de modo que el delta no ahorraba bytes y sí costaba un dict-deep
+        compare por vehículo en O(N) cada tick. Eliminada para reducir CPU.
         """
-        new_snapshot: dict[str, dict[str, Any]] = {}
-        changed: list[dict[str, Any]] = []
-
-        for v in vehicles:
-            vtype = getattr(v, "vtype", None)
-            state = build_vehicle_state(
+        return [
+            build_vehicle_state(
                 vehicle_id=v.id,
                 longitude=v.longitude,
                 latitude=v.latitude,
@@ -168,16 +191,10 @@ class SimulationBroadcaster:
                 current_edge_index=v.current_edge_index,
                 progress_on_edge=getattr(v, "progress_on_edge", 0.0),
                 lane=getattr(v, "lane", 0),
-                vtype=vtype.value if vtype is not None else "car",
+                vtype=v.vtype.value if getattr(v, "vtype", None) is not None else "car",
             )
-            new_snapshot[v.id] = state
-
-            prev = self._last_snapshot.get(v.id)
-            if prev is None or prev != state:
-                changed.append(state)
-
-        self._last_snapshot = new_snapshot
-        return changed
+            for v in vehicles
+        ]
 
     async def broadcast_sim_state(self, state: str) -> None:
         """Emite un cambio de estado de la simulación."""

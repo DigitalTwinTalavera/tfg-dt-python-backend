@@ -19,6 +19,7 @@ import networkx as nx
 
 from app.config import settings
 from app.core.constants import (
+    ATTR_IS_ROUNDABOUT,
     ATTR_LANES,
     ATTR_LATITUDE,
     ATTR_LENGTH,
@@ -197,6 +198,53 @@ class VehicleSpawner:
             nodes = list(self._graph.graph.nodes())
         return nodes
 
+    def _filter_out_roundabout_nodes(
+        self,
+        entry_nodes: list[int],
+        exit_nodes: list[int],
+    ) -> tuple[list[int], list[int]]:
+        """
+        Excluye nodos cuyas aristas salientes/entrantes son TODAS rotonda.
+
+        Spawnear con `first_edge` dentro de una rotonda provoca colisiones
+        inmediatas que bloquean el anillo (poco espacio + tráfico circular).
+        Aquí filtramos los orígenes/destinos donde es imposible elegir una
+        primera arista no-rotonda. El chequeo per-attempt en
+        `_spawn_sync_batch` cubre los casos mixtos (nodo con aristas rotonda
+        + no-rotonda): rechaza la ruta si la elegida cae en rotonda.
+        """
+        g = self._graph.graph
+
+        def all_outgoing_are_roundabout(n: int) -> bool:
+            out_edges = list(g.out_edges(n, data=True))
+            if not out_edges:
+                return True  # sin salidas → inservible como entry
+            return all(attrs.get(ATTR_IS_ROUNDABOUT) for _, _, attrs in out_edges)
+
+        def all_incoming_are_roundabout(n: int) -> bool:
+            in_edges = list(g.in_edges(n, data=True))
+            if not in_edges:
+                return True  # sin entradas → inservible como exit
+            return all(attrs.get(ATTR_IS_ROUNDABOUT) for _, _, attrs in in_edges)
+
+        filtered_entries = [n for n in entry_nodes if not all_outgoing_are_roundabout(n)]
+        filtered_exits = [n for n in exit_nodes if not all_incoming_are_roundabout(n)]
+
+        if not filtered_entries or not filtered_exits:
+            logger.warning(
+                "Roundabout filter dejaría las listas vacías "
+                "(entries=%d, exits=%d) — devolviendo originales",
+                len(filtered_entries), len(filtered_exits),
+            )
+            return entry_nodes, exit_nodes
+
+        logger.debug(
+            "Roundabout filter: %d/%d entry, %d/%d exit nodos válidos",
+            len(filtered_entries), len(entry_nodes),
+            len(filtered_exits), len(exit_nodes),
+        )
+        return filtered_entries, filtered_exits
+
     def _filter_to_scc(
         self,
         entry_nodes: list[int],
@@ -284,6 +332,9 @@ class VehicleSpawner:
             raise ValueError("El grafo no tiene nodos navegables para destinos")
 
         entry_nodes, exit_nodes = self._filter_to_scc(entry_nodes, exit_nodes)
+        entry_nodes, exit_nodes = self._filter_out_roundabout_nodes(
+            entry_nodes, exit_nodes
+        )
 
         if count <= 0:
             return 0
@@ -457,6 +508,11 @@ class VehicleSpawner:
             first_node = route.node_path[0]
             second_node = route.node_path[1]
             first_edge_attrs = self._graph.get_edge_attributes(first_node, second_node)
+            # Rechazo estricto: nunca spawnear con first_edge en una rotonda.
+            # El espacio del anillo es corto y los vehículos circulando llegan
+            # con prioridad → spawnear ahí casi siempre acaba en colisión.
+            if first_edge_attrs.get(ATTR_IS_ROUNDABOUT):
+                continue
             n_lanes = max(int(first_edge_attrs.get(ATTR_LANES, 1)), 1)
             first_edge_len = max(
                 float(first_edge_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M
@@ -629,6 +685,9 @@ class VehicleSpawner:
             raise ValueError("El grafo no tiene nodos navegables para destinos")
 
         entry_nodes, exit_nodes = self._filter_to_scc(entry_nodes, exit_nodes)
+        entry_nodes, exit_nodes = self._filter_out_roundabout_nodes(
+            entry_nodes, exit_nodes
+        )
 
         if count <= 0:
             return []
