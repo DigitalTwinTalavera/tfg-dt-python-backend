@@ -121,25 +121,35 @@ class TrafficLightController:
         return TL_PHASE_RED
 
     def get_phase(self, node_id: int) -> str:
-        """Fase del grupo 0 del nodo (compatibilidad con APIs legadas)."""
+        """Fase del grupo 0 del nodo (compatibilidad con APIs legadas).
+
+        Devuelve verde para nodos que no son semáforo: ni el override global ni
+        los overrides por nodo deben afectar a intersecciones simples — si lo
+        hicieran, `set_all_override("red")` haría parar vehículos en CADA cruce
+        de la red, no sólo en los TLs reales.
+        """
+        if node_id not in self._lights:
+            return TL_PHASE_GREEN
         if self._global_override is not None:
             return self._global_override
         if node_id in self._overrides:
             return self._overrides[node_id]
-        return self._phase_from_time(self._lights.get(node_id, 0.0))
+        return self._phase_from_time(self._lights[node_id])
 
     def get_phase_for_edge(self, node_id: int, incoming_edge: tuple[int, int]) -> str:
         """Fase que ve un vehículo aproximándose a `node_id` por `incoming_edge`.
 
-        Si la arista no está registrada (p. ej. nodo sin semáforo), devuelve 'green'
-        — el llamador ya filtra nodos TL antes de usar esta API.
+        Si el nodo no es un semáforo registrado, devuelve 'green' — los
+        vehículos consultan esta API en el end_node de toda arista, así que
+        no debe responder rojo para intersecciones sin TL aunque haya un
+        override global activo.
         """
+        if node_id not in self._lights:
+            return TL_PHASE_GREEN
         if self._global_override is not None:
             return self._global_override
         if node_id in self._overrides:
             return self._overrides[node_id]
-        if node_id not in self._lights:
-            return TL_PHASE_GREEN
 
         group = self._edge_groups.get(node_id, {}).get(incoming_edge, 0)
         offset = group * _GROUP_OFFSET_S

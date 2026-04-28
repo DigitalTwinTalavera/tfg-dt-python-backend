@@ -29,8 +29,10 @@ from app.core.constants import (
     OSM_JUNCTION_ROUNDABOUT,
     OSM_NODE_GIVE_WAY,
     OSM_NODE_STOP,
+    OSM_NODE_CROSSING,
     OSM_NODE_TRAFFIC_SIGNALS,
     OSM_TAG_CROSSING,
+    OSM_TAG_CROSSING_SIGNALS,
     OSM_ONEWAY_REVERSE,
     OSM_ONEWAY_YES,
     OSM_PBF_EXTENSION,
@@ -190,13 +192,19 @@ class OSMLoader:
         self._report_progress("Filtering roads", stats.ways_parsed)
         filtered_ways, referenced_node_ids = self._filter_ways(stats)
 
+        # Compute split points (intersections + traffic_signals) so a single
+        # OSM way produces one edge per segment between any two split nodes.
+        # This makes traffic_signals real graph endpoints and lets the
+        # TrafficLightController gestionarlos.
+        split_nodes = self._compute_split_nodes(filtered_ways)
+
         # Save nodes to database
         self._report_progress("Saving nodes", len(referenced_node_ids))
         await self._save_nodes(referenced_node_ids, stats)
 
         # Save edges to database
         self._report_progress("Saving edges", len(filtered_ways))
-        await self._save_edges(filtered_ways, stats)
+        await self._save_edges(filtered_ways, split_nodes, stats)
 
         # Asignar roundabout_id a todas las aristas del mismo anillo físico.
         # Se hace tras guardar las aristas porque trabajamos con IDs de BD.
@@ -367,6 +375,16 @@ class OSMLoader:
             return NodeType.TRAFFIC_LIGHT
         if tags.get(OSM_TAG_CROSSING) == OSM_NODE_TRAFFIC_SIGNALS:
             return NodeType.TRAFFIC_LIGHT
+        # Etiqueta moderna de OSM para pasos peatonales semaforizados
+        # (`highway=crossing` + `crossing:signals=yes`). Sin esto se pierden
+        # los pasos peatonales con semáforo más recientes (post-2017).
+        if tags.get(OSM_TAG_CROSSING_SIGNALS) == OSM_VALUE_YES:
+            return NodeType.TRAFFIC_LIGHT
+        # `highway=crossing` (paso peatonal sobre vía motorizada). Lo tratamos
+        # como semáforo aunque no esté explícitamente semaforizado, porque en
+        # el modelo de simulación los vehículos deben ceder/parar ahí.
+        if tags.get(OSM_TAG_HIGHWAY) == OSM_NODE_CROSSING:
+            return NodeType.TRAFFIC_LIGHT
         if tags.get(OSM_TAG_HIGHWAY) == OSM_NODE_STOP:
             return NodeType.STOP_SIGN
         if tags.get(OSM_TAG_HIGHWAY) == OSM_NODE_GIVE_WAY:
@@ -378,17 +396,53 @@ class OSMLoader:
 
         return NodeType.INTERSECTION
 
+    def _compute_split_nodes(
+        self, filtered_ways: list[OSMWay]
+    ) -> set[int]:
+        """
+        Compute the set of OSM node IDs at which ways must be split.
+
+        A node is a split point if either:
+        - It is referenced by ≥2 filtered ways (a real intersection
+          between motorized roads).
+        - Its OSM tags mark it as a traffic light (so it becomes a real
+          graph endpoint and the TrafficLightController can manage it).
+        """
+        way_count: dict[int, int] = defaultdict(int)
+        for way in filtered_ways:
+            for ref in set(way.node_refs):
+                way_count[ref] += 1
+
+        split_nodes: set[int] = {
+            nid for nid, count in way_count.items() if count >= 2
+        }
+
+        for nid in way_count:
+            osm_node = self._osm_nodes.get(nid)
+            if (
+                osm_node is not None
+                and self._determine_node_type(osm_node) == NodeType.TRAFFIC_LIGHT
+            ):
+                split_nodes.add(nid)
+
+        return split_nodes
+
     async def _save_edges(
-        self, ways: list[OSMWay], stats: OSMLoadStats
+        self,
+        ways: list[OSMWay],
+        split_nodes: set[int],
+        stats: OSMLoadStats,
     ) -> None:
         """
         Save edges to database in batches.
 
-        Each OSM way is converted to one edge connecting the first
-        and last nodes, with the full geometry preserved.
+        Each OSM way is converted to one or more edges, splitting the
+        way at every node in ``split_nodes`` so intersections and
+        traffic_signals become real edge endpoints.
 
         Args:
             ways: List of filtered OSM ways
+            split_nodes: OSM node IDs at which to split ways
             stats: Statistics object to update
         """
         for i in range(0, len(ways), self._batch_size):
@@ -396,9 +450,7 @@ class OSMLoader:
             batch_models: list[EdgeModel] = []
 
             for way in batch_ways:
-                edge_model = self._way_to_edge_model(way)
-                if edge_model:
-                    batch_models.append(edge_model)
+                batch_models.extend(self._way_to_edge_models(way, split_nodes))
 
             if batch_models:
                 await self._edge_repo.bulk_create(batch_models)
@@ -407,54 +459,47 @@ class OSMLoader:
             if stats.edges_imported % OSM_PROGRESS_INTERVAL == 0:
                 self._report_progress("Edges imported", stats.edges_imported)
 
-    def _way_to_edge_model(self, way: OSMWay) -> Optional[EdgeModel]:
+    def _way_to_edge_models(
+        self, way: OSMWay, split_nodes: set[int]
+    ) -> list[EdgeModel]:
         """
-        Convert an OSM way to an EdgeModel.
+        Convert an OSM way to one or more EdgeModels.
+
+        The way is split at any interior node present in ``split_nodes``
+        (intersections and traffic_signals). Each segment becomes its
+        own edge with its portion of the way's polyline as geometry.
+        Attributes derived from the way (road_type, max_speed, lanes,
+        one_way, is_roundabout, name, lane-granular metadata) are
+        replicated on every sub-edge.
 
         Args:
             way: OSM way data
+            split_nodes: OSM node IDs at which to split this way
 
         Returns:
-            EdgeModel or None if conversion fails
+            List of EdgeModels (possibly empty if the way is malformed)
         """
         tags = way.tags
         node_refs = way.node_refs
 
-        # Get database node IDs
-        start_osm_id = node_refs[0]
-        end_osm_id = node_refs[-1]
+        if len(node_refs) < 2:
+            return []
 
-        start_db_id = self._osm_to_db_node_id.get(start_osm_id)
-        end_db_id = self._osm_to_db_node_id.get(end_osm_id)
+        split_indices: list[int] = [0]
+        for i in range(1, len(node_refs) - 1):
+            if node_refs[i] in split_nodes:
+                split_indices.append(i)
+        split_indices.append(len(node_refs) - 1)
 
-        if start_db_id is None or end_db_id is None:
-            return None
-
-        # Build geometry from all node coordinates
-        coords = []
-        for ref in node_refs:
-            osm_node = self._osm_nodes.get(ref)
-            if osm_node:
-                coords.append((osm_node.lon, osm_node.lat))
-
-        if len(coords) < 2:
-            return None
-
-        # Create LineString geometry
-        geometry = self._make_linestring(coords)
-
-        # Calculate length
-        length = self._calculate_length(coords)
-
-        # Get road properties
         highway = tags.get(OSM_TAG_HIGHWAY, "unclassified")
         road_type = RoadType.from_osm_highway(highway)
         max_speed = self._parse_maxspeed(tags.get(OSM_TAG_MAXSPEED), highway)
         lanes = self._parse_lanes(tags.get(OSM_TAG_LANES))
         one_way = self._is_one_way(tags)
         is_roundabout = tags.get(OSM_TAG_JUNCTION) == OSM_JUNCTION_ROUNDABOUT
+        name = tags.get(OSM_TAG_NAME)
 
-        meta = {"osm_id": way.osm_id}
+        meta: dict = {"osm_id": way.osm_id}
         # Preservar tags de granularidad por carril para fases posteriores
         # (giros permitidos, velocidades por carril, tránsito por carriles).
         for key, tag_name in (
@@ -466,21 +511,46 @@ class OSMLoader:
             v = tags.get(tag_name)
             if v:
                 meta[key] = v
+        meta_json = json.dumps(meta)
 
-        return EdgeModel(
-            name=tags.get(OSM_TAG_NAME),
-            start_node_id=start_db_id,
-            end_node_id=end_db_id,
-            road_type=road_type.value,
-            geometry=geometry,
-            length=length,
-            max_speed=max_speed,
-            lanes=lanes,
-            one_way=one_way,
-            is_roundabout=is_roundabout,
-            is_active=True,
-            metadata_json=json.dumps(meta),
-        )
+        edges: list[EdgeModel] = []
+        for seg_idx in range(len(split_indices) - 1):
+            i_start = split_indices[seg_idx]
+            i_end = split_indices[seg_idx + 1]
+            segment_refs = node_refs[i_start : i_end + 1]
+
+            start_db_id = self._osm_to_db_node_id.get(segment_refs[0])
+            end_db_id = self._osm_to_db_node_id.get(segment_refs[-1])
+            if start_db_id is None or end_db_id is None:
+                continue
+
+            coords: list[tuple[float, float]] = []
+            for ref in segment_refs:
+                osm_node = self._osm_nodes.get(ref)
+                if osm_node is not None:
+                    coords.append((osm_node.lon, osm_node.lat))
+
+            if len(coords) < 2:
+                continue
+
+            edges.append(
+                EdgeModel(
+                    name=name,
+                    start_node_id=start_db_id,
+                    end_node_id=end_db_id,
+                    road_type=road_type.value,
+                    geometry=self._make_linestring(coords),
+                    length=self._calculate_length(coords),
+                    max_speed=max_speed,
+                    lanes=lanes,
+                    one_way=one_way,
+                    is_roundabout=is_roundabout,
+                    is_active=True,
+                    metadata_json=meta_json,
+                )
+            )
+
+        return edges
 
     def _make_linestring(self, coords: list[tuple[float, float]]) -> str:
         """

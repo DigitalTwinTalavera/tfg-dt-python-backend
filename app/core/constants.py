@@ -371,7 +371,9 @@ OSM_JUNCTION_ROUNDABOUT = "roundabout"
 
 # Node type detection values
 OSM_NODE_TRAFFIC_SIGNALS = "traffic_signals"
+OSM_NODE_CROSSING = "crossing"
 OSM_TAG_CROSSING = "crossing"
+OSM_TAG_CROSSING_SIGNALS = "crossing:signals"
 OSM_TAG_NOEXIT = "noexit"
 OSM_VALUE_YES = "yes"
 
