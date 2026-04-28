@@ -94,31 +94,22 @@ _EARTH_RADIUS_M: float = 6_371_000.0
 _IDM_BY_TYPE: dict[VehicleType, IDMModel] = {
     vtype: IDMModel(profile.idm) for vtype, profile in PROFILES.items()
 }
-# Fallback para vehículos sin vtype explícito (tests legacy, serialización vieja).
-_IDM_FALLBACK = IDMModel()
 
 # MOBILModel por tipo de vehículo (usa los mismos IDMParameters que el IDM).
 # Stateless tras construcción → seguro para multiprocessing.
 _MOBIL_BY_TYPE: dict[VehicleType, MOBILModel] = {
     vtype: MOBILModel(idm_params=profile.idm) for vtype, profile in PROFILES.items()
 }
-_MOBIL_FALLBACK = MOBILModel()
 
 
 def _mobil_for(vehicle: SimVehicle) -> MOBILModel:
     """Devuelve el MOBILModel correspondiente al tipo del vehículo."""
-    vtype = getattr(vehicle, "vtype", None)
-    if vtype is None:
-        return _MOBIL_FALLBACK
-    return _MOBIL_BY_TYPE.get(vtype, _MOBIL_FALLBACK)
+    return _MOBIL_BY_TYPE[vehicle.vtype]
 
 
 def _idm_for(vehicle: SimVehicle) -> IDMModel:
     """Devuelve el IDMModel correspondiente al tipo del vehículo."""
-    vtype = getattr(vehicle, "vtype", None)
-    if vtype is None:
-        return _IDM_FALLBACK
-    return _IDM_BY_TYPE.get(vtype, _IDM_FALLBACK)
+    return _IDM_BY_TYPE[vehicle.vtype]
 
 # Caché de longitudes de segmentos por arista (start_node, end_node).
 _SEG_CACHE: dict[tuple[int, int], tuple[list[float], float]] = {}
@@ -1522,7 +1513,6 @@ def _vehicle_to_dict(
     closed_lanes: "dict[tuple[int, int], set[int]] | None" = None,
 ) -> dict:
     """Serializa los campos mutables de un SimVehicle para IPC entre procesos."""
-    vtype = getattr(v, "vtype", None)
     return {
         "id": v.id,
         "status": v.status.value,
@@ -1537,7 +1527,7 @@ def _vehicle_to_dict(
         "heading": v.heading,
         "desired_speed_ms": getattr(v, "desired_speed_ms", 13.89),
         "yellow_runs_light": getattr(v, "yellow_runs_light", False),
-        "vtype": vtype.value if vtype is not None else None,
+        "vtype": v.vtype.value,
         "lane": getattr(v, "lane", 0),
         "length_m": getattr(v, "length_m", VEHICLE_LENGTH_M),
         "prev_edge_end_heading": getattr(v, "prev_edge_end_heading", -1.0),

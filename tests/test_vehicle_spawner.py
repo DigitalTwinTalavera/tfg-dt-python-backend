@@ -2,10 +2,28 @@
 Tests para VehicleSpawner y endpoints de vehículos.
 """
 
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
+
+
+def _wait_for_vehicle_count(client: TestClient, expected: int, timeout: float = 2.0) -> dict:
+    """Poll GET /vehicles hasta que active_count == expected o timeout.
+
+    El endpoint POST /vehicles/spawn dispara un task de background; los tests
+    necesitan esperar a que el spawn termine antes de verificar estado.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        data = client.get("/api/simulation/vehicles").json()
+        if data["count"] == expected:
+            return data
+        time.sleep(0.02)
+    raise AssertionError(
+        f"Timeout esperando {expected} vehículos; última lectura: {data['count']}"
+    )
 
 from app.api.deps import get_simulation_engine, get_vehicle_spawner
 from app.core.constants import (
@@ -275,8 +293,9 @@ class TestVehicleEndpoints:
             json={"count": 2},
         )
         assert response.status_code == 200
-        data = response.json()
-        assert data["spawned"] == 2
+        assert response.json() == {"status": "spawning", "requested": 2}
+
+        data = _wait_for_vehicle_count(client, expected=2)
         assert len(data["vehicles"]) == 2
         v = data["vehicles"][0]
         assert "id" in v
@@ -293,24 +312,20 @@ class TestVehicleEndpoints:
             json={},
         )
         assert response.status_code == 200
-        assert response.json()["spawned"] == 1
+        assert response.json() == {"status": "spawning", "requested": 1}
+        _wait_for_vehicle_count(client, expected=1)
 
     @pytest.mark.integration
     def test_list_vehicles(self, client):
         client.post("/api/simulation/vehicles/spawn", json={"count": 3})
-        response = client.get("/api/simulation/vehicles")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["count"] == 3
+        data = _wait_for_vehicle_count(client, expected=3)
         assert len(data["vehicles"]) == 3
 
     @pytest.mark.integration
     def test_get_vehicle_by_id(self, client):
-        spawn_resp = client.post(
-            "/api/simulation/vehicles/spawn",
-            json={"count": 1},
-        )
-        vehicle_id = spawn_resp.json()["vehicles"][0]["id"]
+        client.post("/api/simulation/vehicles/spawn", json={"count": 1})
+        data = _wait_for_vehicle_count(client, expected=1)
+        vehicle_id = data["vehicles"][0]["id"]
 
         response = client.get(f"/api/simulation/vehicles/{vehicle_id}")
         assert response.status_code == 200
@@ -323,11 +338,9 @@ class TestVehicleEndpoints:
 
     @pytest.mark.integration
     def test_delete_vehicle(self, client):
-        spawn_resp = client.post(
-            "/api/simulation/vehicles/spawn",
-            json={"count": 1},
-        )
-        vehicle_id = spawn_resp.json()["vehicles"][0]["id"]
+        client.post("/api/simulation/vehicles/spawn", json={"count": 1})
+        data = _wait_for_vehicle_count(client, expected=1)
+        vehicle_id = data["vehicles"][0]["id"]
 
         response = client.delete(f"/api/simulation/vehicles/{vehicle_id}")
         assert response.status_code == 200
@@ -351,12 +364,16 @@ class TestVehicleEndpoints:
         assert response.status_code == 422
 
     @pytest.mark.integration
-    def test_spawn_respects_max_vehicles(self, client):
-        # Spawner has max_vehicles=10
+    def test_spawn_over_max_vehicles_is_accepted(self, client):
+        # max_vehicles=10 es ahora un soft-limit: el spawner avisa por log
+        # pero acepta el spawn completo (ver test_spawn_allows_unlimited_active).
         client.post("/api/simulation/vehicles/spawn", json={"count": 10})
+        _wait_for_vehicle_count(client, expected=10)
+
         response = client.post(
             "/api/simulation/vehicles/spawn",
             json={"count": 5},
         )
         assert response.status_code == 200
-        assert response.json()["spawned"] == 0
+        assert response.json() == {"status": "spawning", "requested": 5}
+        _wait_for_vehicle_count(client, expected=15)
