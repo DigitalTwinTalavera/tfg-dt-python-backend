@@ -23,8 +23,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import select
-
 from app.core.constants import INCIDENT_DEFAULT_DURATION_S
 from app.db.database import async_session_factory
 from app.models.enums import IncidentStatus, IncidentType

@@ -84,9 +84,11 @@ class TestSimulationEngineInit:
 
     @pytest.mark.unit
     def test_default_tick_interval(self):
+        # Default del SimulationEngine: 5 Hz (200 ms por tick) — coherente con
+        # SimulationConfig.tick_rate=5 (200 ms presupuesto a 6000 vehículos).
         default_engine = SimulationEngine()
-        assert default_engine.tick_interval_ms == 100.0
-        assert default_engine.tick_rate == 10.0
+        assert default_engine.tick_interval_ms == 200.0
+        assert default_engine.tick_rate == 5.0
 
 
 # =============================================================================

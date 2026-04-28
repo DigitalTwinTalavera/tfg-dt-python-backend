@@ -4,7 +4,6 @@ API endpoints for map operations, including OSM data import and data retrieval.
 
 import json
 from pathlib import Path
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from geoalchemy2.functions import ST_AsGeoJSON, ST_X, ST_Y
@@ -31,8 +30,7 @@ from app.core.schemas.network_schema import (
 )
 from app.db.database import async_session_factory, get_db_session
 from app.models.road_network import EdgeModel, NodeModel
-from app.services.network_graph import RoadNetworkGraph
-from app.services.osm_loader import OSMLoader, OSMLoadStats
+from app.services.osm_loader import OSMLoader
 
 router = APIRouter(prefix="/map", tags=[TAG_MAP])
 

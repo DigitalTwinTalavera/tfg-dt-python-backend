@@ -13,7 +13,7 @@ import logging
 import random
 import threading
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import networkx as nx
 
@@ -39,7 +39,6 @@ from app.core.physics.vehicle_types import (
     PROFILES,
     VehicleType,
     VehicleTypeProfile,
-    get_profile,
 )
 from app.core.route import RouteInfo, compute_route
 from app.models.enums import NodeType, VehicleStatus
@@ -473,13 +472,9 @@ class VehicleSpawner:
                     ) or None
                 # Comprobar políticas deny_spawn: si el origen/destino cae en
                 # una zona con enforcement=deny_spawn para este vtype, rechazar
-                # la pareja y probar otra.
-                if self.zone_manager is not None:
-                    start_edge_attrs = self._graph.get_edge_attributes(start, start)
-                    # No tenemos "edge de origen" como tal; en su lugar miramos
-                    # si el primer edge de una ruta tentativa cae en una zona
-                    # deny_spawn. Lo haremos tras calcular la ruta.
-                    pass
+                # la pareja y probar otra. No tenemos "edge de origen" como tal;
+                # en su lugar miramos si el primer edge de una ruta tentativa
+                # cae en una zona deny_spawn — eso se hace tras compute_route.
                 route = compute_route(
                     self._graph,
                     start,

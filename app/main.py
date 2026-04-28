@@ -3,6 +3,7 @@ Punto de entrada principal de la aplicación FastAPI.
 Configura el servidor web, middlewares y rutas.
 """
 
+import logging
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -34,6 +35,7 @@ from app.core.constants import (
     TAG_MAP,
     TAG_ROOT,
     TAG_SIMULATION,
+    WS_MAX_MESSAGE_SIZE,
     WS_SIMULATION_PATH,
 )
 from app.core.responses import RootResponse
@@ -42,31 +44,30 @@ from app.core.simulation_engine import simulation_engine
 from app.db.database import async_session_factory, close_db, init_db
 from app.services.osm_loader import OSMLoader
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Gestión del ciclo de vida de la aplicación"""
     # Startup
-    print(
+    logger.info(
         MSG_STARTUP_SERVER.format(
             app_name=settings.APP_NAME,
             version=settings.APP_VERSION,
         )
     )
-    print(
-        MSG_SERVER_URL.format(
-            host=settings.HOST,
-            port=settings.PORT,
-        )
+    logger.info(
+        MSG_SERVER_URL.format(host=settings.HOST, port=settings.PORT)
     )
-    print(
+    logger.info(
         MSG_DOCS_URL.format(
             host=settings.HOST,
             port=settings.PORT,
             docs_url=DOCS_URL,
         )
     )
-    print(
+    logger.info(
         MSG_WS_URL.format(
             host=settings.HOST,
             port=settings.PORT,
@@ -75,56 +76,63 @@ async def lifespan(app: FastAPI):
     )
 
     await init_db()
-    print(MSG_DB_CONNECTED)
+    logger.info(MSG_DB_CONNECTED)
 
     # Build in-memory road network graph from database
     async with async_session_factory() as session:
         stats = await _graph.build_from_database(session)
-        print(
-            f"Road network graph built: {stats.node_count} nodes, "
-            f"{stats.edge_count} edges "
-            f"(connected={stats.is_connected}, {stats.build_time_ms:.0f} ms)"
+        logger.info(
+            "Road network graph built: %d nodes, %d edges (connected=%s, %.0f ms)",
+            stats.node_count,
+            stats.edge_count,
+            stats.is_connected,
+            stats.build_time_ms,
         )
 
     # Auto-import MAP_FILE if DB is empty and MAP_FILE is configured
     if stats.node_count == 0 and settings.MAP_FILE:
         map_path = Path(OSM_DATA_DIRECTORY) / settings.MAP_FILE
         if map_path.exists():
-            print(f"DB empty – auto-importing '{settings.MAP_FILE}'...")
+            logger.info("DB empty — auto-importing '%s'...", settings.MAP_FILE)
             async with async_session_factory() as session:
                 loader = OSMLoader(session)
                 import_stats = await loader.load_from_file(
                     str(map_path), clear_existing=True
                 )
-            print(
-                f"Auto-import done: {import_stats.nodes_imported} nodes, "
-                f"{import_stats.edges_imported} edges "
-                f"({import_stats.duration_seconds:.1f}s)"
+            logger.info(
+                "Auto-import done: %d nodes, %d edges (%.1fs)",
+                import_stats.nodes_imported,
+                import_stats.edges_imported,
+                import_stats.duration_seconds,
             )
             async with async_session_factory() as session:
                 stats = await _graph.build_from_database(session)
-            print(
-                f"Graph rebuilt: {stats.node_count} nodes, {stats.edge_count} edges"
+            logger.info(
+                "Graph rebuilt: %d nodes, %d edges",
+                stats.node_count,
+                stats.edge_count,
             )
         else:
-            print(
-                f"Warning: MAP_FILE '{settings.MAP_FILE}' not found in '{OSM_DATA_DIRECTORY}/'"
+            logger.warning(
+                "MAP_FILE '%s' not found in '%s/'",
+                settings.MAP_FILE,
+                OSM_DATA_DIRECTORY,
             )
 
     # Cargar zonas (ZBE / restringidas) desde BD; son persistentes entre
     # reinicios, a diferencia de los incidentes que son estado vivo.
     try:
         await _zone_manager.load_from_db()
-    except Exception as exc:
-        print(f"Warning: no se pudieron cargar zonas de BD: {exc}")
+    except Exception:
+        logger.exception("No se pudieron cargar zonas de BD")
 
-    yield # Aquí la aplicación está corriendo y puede atender peticiones
+    yield  # Aquí la aplicación está corriendo y puede atender peticiones
 
     # Shutdown
     await simulation_engine.shutdown()
     await close_db()
-    print(MSG_DB_DISCONNECTED)
-    print(MSG_SHUTDOWN)
+    logger.info(MSG_DB_DISCONNECTED)
+    logger.info(MSG_SHUTDOWN)
 
 
 # Crear instancia de FastAPI
@@ -174,5 +182,5 @@ if __name__ == "__main__":
         port=settings.PORT,
         reload=settings.DEBUG,
         log_level=settings.LOG_LEVEL.lower(),
-        ws_max_size=4 * 1024 * 1024,  # 4 MB — soporta tick messages con miles de vehículos
+        ws_max_size=WS_MAX_MESSAGE_SIZE,
     )
