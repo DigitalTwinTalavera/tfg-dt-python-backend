@@ -26,6 +26,7 @@ from app.api.websocket.messages import (
     build_vehicles_batch_spawned_message,
     build_zone_message,
 )
+from app.core.constants import BROADCAST_CHUNK_SIZE
 from app.services.vehicle_spawner import SimVehicle, VehicleSpawner
 
 logger = logging.getLogger(__name__)
@@ -76,12 +77,10 @@ class SimulationBroadcaster:
             self._pending_send.cancel()
         self._pending_send = None
 
-    # Número máximo de vehículos por mensaje tick.
-    # Cada vehículo ocupa ~130 bytes de JSON; con 500 vehículos el mensaje
-    # ronda los 65 KB, por debajo del límite de 4 MB configurado en Godot.
-    # Dividir en chunks también reduce la latencia de renderizado: el cliente
-    # puede procesar el primer chunk antes de que llegue el siguiente.
-    _TICK_CHUNK_SIZE: int = 500
+    # Dividir en chunks reduce la latencia de renderizado: el cliente puede
+    # procesar el primer chunk antes de que llegue el siguiente. Tamaño en
+    # `BROADCAST_CHUNK_SIZE` (constants.py).
+    _TICK_CHUNK_SIZE: int = BROADCAST_CHUNK_SIZE
 
     async def broadcast_tick(self, tick: int, sim_time: float) -> None:
         """

@@ -298,9 +298,13 @@ class TestBuildFromDatabase:
             # Get edge weight
             attrs = graph.get_edge_attributes(node1.id, node2.id)
 
-            # weight = length / (max_speed * KMH_TO_MS)
-            # weight = 1000 / (36 * 0.2778) = 1000 / 10 = 100 seconds
-            assert abs(attrs["weight"] - 100.0) < 1.0
+            # weight = travel_time × ROAD_TYPE_WEIGHT_FACTORS[road_type]
+            # travel_time = length / (max_speed × KMH_TO_MS) = 1000 / 10 = 100 s
+            # primary factor = 0.8 → expected weight = 80 s
+            from app.core.constants import ROAD_TYPE_WEIGHT_FACTORS
+
+            expected = 100.0 * ROAD_TYPE_WEIGHT_FACTORS["primary"]
+            assert attrs["weight"] == pytest.approx(expected, abs=1.0)
 
             # Cleanup
             await session.delete(edge)

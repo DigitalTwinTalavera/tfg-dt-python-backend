@@ -183,16 +183,18 @@ class TestMOBILConfig:
 class TestSimulationConfigDefaults:
     @pytest.mark.unit
     def test_default_values(self, default_config):
-        assert default_config.tick_rate == 10
+        assert default_config.tick_rate == 5
         assert default_config.auto_spawn is True
         assert default_config.spawn_rate == 10
-        assert default_config.max_vehicles == 100
+        # Default es ilimitado (1e9): el cap real sale de settings.MAX_VEHICLES.
+        assert default_config.max_vehicles >= 1_000_000_000
         assert isinstance(default_config.idm, IDMConfig)
         assert isinstance(default_config.mobil, MOBILConfig)
 
     @pytest.mark.unit
     def test_tick_interval_ms_property(self, default_config):
-        assert default_config.tick_interval_ms == 100.0
+        # Default tick_rate=5 → 1000/5 = 200 ms por tick.
+        assert default_config.tick_interval_ms == 200.0
 
     @pytest.mark.unit
     def test_tick_interval_ms_custom(self):
@@ -237,8 +239,8 @@ class TestSimulationConfigDefaults:
 class TestTicksBetweenSpawns:
     @pytest.mark.unit
     def test_default_config(self, default_config):
-        # tick_rate=10, spawn_rate=10 => ceil(10*60/10) = 60
-        assert default_config.ticks_between_spawns == 60
+        # tick_rate=5, spawn_rate=10 => ceil(5*60/10) = 30
+        assert default_config.ticks_between_spawns == 30
 
     @pytest.mark.unit
     def test_high_spawn_rate(self):
@@ -306,8 +308,8 @@ class TestConfigConversion:
     @pytest.mark.unit
     def test_to_dict_computed_values(self, default_config):
         d = default_config.to_dict()
-        assert d["tick_interval_ms"] == 100.0
-        assert d["ticks_between_spawns"] == 60
+        assert d["tick_interval_ms"] == 200.0
+        assert d["ticks_between_spawns"] == 30
 
     @pytest.mark.unit
     def test_idm_params_are_frozen(self, default_config):
@@ -374,6 +376,10 @@ class TestAutoSpawn:
     def spawner(self):
         s = MagicMock(spec=VehicleSpawner)
         s.spawn.return_value = []
+        # SimulationEngine._tick consulta `_spawner.graph.node_count` para
+        # decidir si lazy-init del controller de semáforos. Con grafo vacío
+        # se salta esa rama y nos centramos en la lógica de auto-spawn.
+        s.graph.node_count = 0
         return s
 
     @pytest.mark.unit
@@ -484,7 +490,7 @@ class TestGetConfigEndpoint:
     @pytest.mark.unit
     def test_get_config_default_tick_rate(self, client):
         data = client.get("/api/simulation/config").json()
-        assert data["tick_rate"] == 10
+        assert data["tick_rate"] == 5
 
     @pytest.mark.unit
     def test_get_config_idm_sub_fields(self, client):

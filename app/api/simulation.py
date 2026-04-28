@@ -2,8 +2,9 @@
 Endpoints de control de la simulación y gestión de vehículos.
 """
 
-import asyncio
 import logging
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -20,6 +21,23 @@ from app.services.vehicle_spawner import VehicleSpawner
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/simulation")
+
+
+@asynccontextmanager
+async def _state_error_to_409() -> AsyncIterator[None]:
+    """Convierte un SimulationStateError en HTTP 409 (Conflict)."""
+    try:
+        yield
+    except SimulationStateError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+def _vehicle_or_404(spawner: VehicleSpawner, vehicle_id: str):
+    """Devuelve el SimVehicle o lanza HTTP 404."""
+    vehicle = spawner.get_vehicle(vehicle_id)
+    if vehicle is None:
+        raise HTTPException(status_code=404, detail=f"Vehículo '{vehicle_id}' no encontrado")
+    return vehicle
 
 
 # =========================================================================
@@ -49,10 +67,8 @@ async def start_simulation(
     engine: SimulationEngine = Depends(get_simulation_engine),
 ) -> dict:
     """Inicia la simulación."""
-    try:
+    async with _state_error_to_409():
         await engine.start()
-    except SimulationStateError as e:
-        raise HTTPException(status_code=409, detail=str(e))
     return {
         "status": "started",
         "tick_rate": engine.tick_rate,
@@ -65,10 +81,8 @@ async def stop_simulation(
     engine: SimulationEngine = Depends(get_simulation_engine),
 ) -> dict:
     """Detiene la simulación."""
-    try:
+    async with _state_error_to_409():
         await engine.stop()
-    except SimulationStateError as e:
-        raise HTTPException(status_code=409, detail=str(e))
     return {"status": "stopped"}
 
 
@@ -77,10 +91,8 @@ async def pause_simulation(
     engine: SimulationEngine = Depends(get_simulation_engine),
 ) -> dict:
     """Pausa la simulación."""
-    try:
+    async with _state_error_to_409():
         await engine.pause()
-    except SimulationStateError as e:
-        raise HTTPException(status_code=409, detail=str(e))
     return {"status": "paused"}
 
 
@@ -89,10 +101,8 @@ async def resume_simulation(
     engine: SimulationEngine = Depends(get_simulation_engine),
 ) -> dict:
     """Reanuda la simulación pausada."""
-    try:
+    async with _state_error_to_409():
         await engine.resume()
-    except SimulationStateError as e:
-        raise HTTPException(status_code=409, detail=str(e))
     return {"status": "resumed"}
 
 
@@ -184,10 +194,7 @@ async def get_vehicle(
     spawner: VehicleSpawner = Depends(get_vehicle_spawner),
 ) -> dict:
     """Obtiene un vehículo por su ID."""
-    vehicle = spawner.get_vehicle(vehicle_id)
-    if vehicle is None:
-        raise HTTPException(status_code=404, detail=f"Vehículo '{vehicle_id}' no encontrado")
-    return vehicle.to_dict()
+    return _vehicle_or_404(spawner, vehicle_id).to_dict()
 
 
 @router.delete("/vehicles/{vehicle_id}")
@@ -208,9 +215,7 @@ async def pause_vehicle(
     spawner: VehicleSpawner = Depends(get_vehicle_spawner),
 ) -> dict:
     """Pausa manualmente un vehículo (deja de moverse)."""
-    vehicle = spawner.get_vehicle(vehicle_id)
-    if vehicle is None:
-        raise HTTPException(status_code=404, detail=f"Vehículo '{vehicle_id}' no encontrado")
+    vehicle = _vehicle_or_404(spawner, vehicle_id)
     vehicle.status = VehicleStatus.PAUSED
     vehicle.velocity = 0.0
     return {"status": "paused", "vehicle_id": vehicle_id}
@@ -222,9 +227,7 @@ async def resume_vehicle(
     spawner: VehicleSpawner = Depends(get_vehicle_spawner),
 ) -> dict:
     """Reanuda un vehículo pausado manualmente."""
-    vehicle = spawner.get_vehicle(vehicle_id)
-    if vehicle is None:
-        raise HTTPException(status_code=404, detail=f"Vehículo '{vehicle_id}' no encontrado")
+    vehicle = _vehicle_or_404(spawner, vehicle_id)
     if vehicle.status != VehicleStatus.PAUSED:
         raise HTTPException(status_code=409, detail=f"Vehículo '{vehicle_id}' no está pausado")
     vehicle.status = VehicleStatus.MOVING
@@ -238,9 +241,7 @@ async def set_vehicle_speed(
     spawner: VehicleSpawner = Depends(get_vehicle_spawner),
 ) -> dict:
     """Cambia la velocidad deseada de un vehículo."""
-    vehicle = spawner.get_vehicle(vehicle_id)
-    if vehicle is None:
-        raise HTTPException(status_code=404, detail=f"Vehículo '{vehicle_id}' no encontrado")
+    vehicle = _vehicle_or_404(spawner, vehicle_id)
     vehicle.desired_speed_ms = body.desired_speed_kmh * KMH_TO_MS
     return {
         "status": "updated",
@@ -259,9 +260,8 @@ async def reroute_vehicle(
     """Reasigna la ruta de un vehículo hacia un nuevo nodo destino."""
     success = spawner.reroute_vehicle(vehicle_id, body.end_node_id)
     if not success:
-        vehicle = spawner.get_vehicle(vehicle_id)
-        if vehicle is None:
-            raise HTTPException(status_code=404, detail=f"Vehículo '{vehicle_id}' no encontrado")
+        # Si el vehículo no existe → 404; si existe pero no hay ruta → 422.
+        _vehicle_or_404(spawner, vehicle_id)
         raise HTTPException(
             status_code=422,
             detail=f"No se pudo calcular ruta desde vehículo '{vehicle_id}' a nodo {body.end_node_id}",
@@ -325,11 +325,7 @@ async def clear_vehicle_collision(
     colisión comparte la misma arista, se libera el bloqueo → A* vuelve a
     usarla sin penalización.
     """
-    vehicle = spawner.get_vehicle(vehicle_id)
-    if vehicle is None:
-        raise HTTPException(
-            status_code=404, detail=f"Vehículo '{vehicle_id}' no encontrado"
-        )
+    vehicle = _vehicle_or_404(spawner, vehicle_id)
     if vehicle.status != VehicleStatus.COLLISION:
         raise HTTPException(
             status_code=409,

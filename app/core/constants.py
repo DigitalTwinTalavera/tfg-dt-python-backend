@@ -20,6 +20,15 @@ TAG_WEBSOCKET = "WebSocket"
 # WebSocket Routes
 WS_SIMULATION_PATH = "/ws/simulation"
 
+# Tamaño máximo de mensaje WebSocket. Necesario porque cada tick puede llevar
+# cientos de vehículos. Si se cambia, mantener en sincronía con `--ws-max-size`
+# del CMD del Dockerfile.
+WS_MAX_MESSAGE_SIZE: int = 4 * 1024 * 1024  # 4 MB
+
+# Vehículos máximos por mensaje tick. Cada vehículo ocupa ~130 bytes JSON;
+# 500 vehículos → ~65 KB por mensaje, holgado bajo WS_MAX_MESSAGE_SIZE.
+BROADCAST_CHUNK_SIZE: int = 500
+
 # Status Messages
 STATUS_OK = "ok"
 STATUS_RUNNING = "running"
