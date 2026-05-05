@@ -32,16 +32,26 @@ from app.core.constants import (
     ATTR_NODE_TYPE,
     ATTR_ONE_WAY,
     ATTR_ROAD_TYPE,
+    ATTR_RING_RADIUS_M,
     ATTR_ROUNDABOUT_ID,
+    ATTR_SPLINE_LENGTH,
+    ATTR_SPLINE_SAMPLES,
+    ATTR_USE_SPLINE,
     ATTR_WAYPOINTS,
     ATTR_WEIGHT,
     BLOCKED_EDGE_PENALTY_FACTOR,
     DEFAULT_EDGE_WEIGHT,
     GRAPH_CACHE_TTL_SECONDS,
     KMH_TO_MS,
+    RDP_MIN_POINTS,
+    RDP_TOLERANCE_MAX_M,
+    RDP_TOLERANCE_MIN_M,
+    RDP_TOLERANCE_PER_RADIUS,
     ROAD_TYPE_WEIGHT_FACTORS,
+    SPLINE_SAMPLES_PER_SEGMENT,
     ZBE_EDGE_PENALTY_FACTOR,
 )
+from app.core.spline import build_spline_table, rdp
 from app.models.enums import NodeType
 
 # Heurística A*: cota inferior admisible basada en distancia geográfica.
@@ -340,8 +350,359 @@ class RoadNetworkGraph:
                 }
                 self._graph.add_edge(row.end_node_id, row.start_node_id, **reverse_attrs)
 
-        # Reconstruir índices por rotonda tras cargar aristas.
+        # Reconstruir índices por rotonda tras cargar aristas. Necesario antes
+        # de la fusión para saber qué nodos pertenecen al ring.
         self._rebuild_roundabout_indices()
+
+        # Fusión de nodos del ring: cada anillo OSM viene partido en varias
+        # ways → tras la carga aparecen 4-10 nodos donde topológicamente sólo
+        # debería haber entradas/salidas. Fusionamos los degree-2 internos
+        # SIN tocar la BD (los nodos físicos siguen existiendo, simplemente no
+        # entran en el DiGraph del simulador).
+        try:
+            fused = self._fuse_ring_nodes()
+            if fused:
+                logger.info(
+                    "Fused %d ring-internal node(s) across roundabouts", fused
+                )
+        except Exception:  # pragma: no cover — fusion errors must not break boot
+            logger.exception("Ring-node fusion failed; continuing without fusion")
+
+        # RDP + Catmull-Rom centrípeto sobre las aristas con is_roundabout.
+        # Sustituye la geometría poligonal por una curva muestreada — los
+        # vehículos siguen la curva en arc-length (vehicle_physics) y el
+        # cliente la dibuja como malla curva (edge_renderer).
+        try:
+            spline_count = self._splinify_roundabout_edges()
+            if spline_count:
+                logger.info(
+                    "Splinified %d roundabout edge(s) with centripetal Catmull-Rom",
+                    spline_count,
+                )
+        except Exception:  # pragma: no cover
+            logger.exception(
+                "Roundabout splinification failed; falling back to polyline geometry"
+            )
+
+        # Reconstrucción final tras fusión + spline (longitudes cambian).
+        self._rebuild_roundabout_indices()
+
+    # ------------------------------------------------------------------
+    # Fase 1: fusión de nodos internos del ring
+    # ------------------------------------------------------------------
+    def _fuse_ring_nodes(self) -> int:
+        """
+        Fusiona nodos degree-2 internos de cada rotonda.
+
+        Un nodo es **fusible** si:
+          - Pertenece al ring (`is_roundabout=True` en sus aristas).
+          - No es TRAFFIC_LIGHT.
+          - Sus únicas aristas son las del ring (no tiene entradas/salidas
+            externas, ni siquiera bidireccionales).
+          - Dentro del ring tiene exactamente 1 in y 1 out (anillo direccional).
+
+        Las cadenas maximales de fusibles entre dos no-fusibles (anchors) se
+        colapsan en una única arista con geometría concatenada y `mid_tls`
+        re-mapeados con offset de longitud.
+
+        Las fusiones que cerrarían el ring sobre el mismo anchor (self-loop)
+        se cortan justo antes — preferimos un edge corto suelto a un self-loop
+        que rompería el cálculo de gap del IDM.
+
+        Returns:
+            Número de nodos eliminados del grafo (≥ 0).
+        """
+        # Snapshot determinista — ordenar rids permite reproducir el orden de
+        # fusiones entre runs.
+        rids = sorted(self._roundabout_edges.keys())
+        removed_total = 0
+
+        for rid in rids:
+            ring_edges = list(self._roundabout_edges.get(rid, ()))
+            if not ring_edges:
+                continue
+
+            ring_edge_set: set[tuple[int, int]] = set(ring_edges)
+            ring_node_set: set[int] = set()
+            ring_in: dict[int, list[tuple[int, int]]] = {}
+            ring_out: dict[int, list[tuple[int, int]]] = {}
+            for u, v in ring_edges:
+                ring_node_set.add(u)
+                ring_node_set.add(v)
+                ring_in.setdefault(v, []).append((u, v))
+                ring_out.setdefault(u, []).append((u, v))
+
+            def _is_fusible(n: int) -> bool:
+                attrs = self._graph.nodes.get(n)
+                if attrs is None:
+                    return False
+                if attrs.get(ATTR_NODE_TYPE) == NodeType.TRAFFIC_LIGHT.value:
+                    return False
+                if n not in ring_node_set:
+                    return False
+                in_ring = len(ring_in.get(n, ()))
+                out_ring = len(ring_out.get(n, ()))
+                if in_ring != 1 or out_ring != 1:
+                    return False
+                # Cualquier arista hacia/desde fuera del ring → no fusible.
+                if self._graph.in_degree(n) != in_ring:
+                    return False
+                if self._graph.out_degree(n) != out_ring:
+                    return False
+                return True
+
+            anchors = sorted(n for n in ring_node_set if not _is_fusible(n))
+            if not anchors:
+                # Anillo cerrado sin entradas — dejar como está para no crear
+                # un self-loop con TODA la rotonda.
+                continue
+
+            for anchor in anchors:
+                for (u_out, v_out) in list(ring_out.get(anchor, ())):
+                    if (u_out, v_out) not in ring_edge_set:
+                        continue  # ya fusionado en otra cadena
+                    chain: list[tuple[int, int]] = [(u_out, v_out)]
+                    cur = v_out
+                    while _is_fusible(cur):
+                        nxt_list = ring_out.get(cur, [])
+                        if len(nxt_list) != 1:
+                            break
+                        nxt = nxt_list[0]
+                        if nxt[1] == anchor:
+                            # Cortar antes de cerrar el ring sobre el mismo
+                            # anchor — un edge corto suelto es preferible al
+                            # self-loop.
+                            break
+                        chain.append(nxt)
+                        cur = nxt[1]
+
+                    if len(chain) <= 1:
+                        continue  # nada que fusionar
+
+                    merged_attrs, merged_intermediates = self._merge_edge_chain(chain)
+                    new_end = chain[-1][1]
+
+                    # Eliminar las aristas originales del grafo (y del set de
+                    # control para no reprocesarlas) antes de añadir la fusionada.
+                    for e in chain:
+                        if self._graph.has_edge(*e):
+                            self._graph.remove_edge(*e)
+                        ring_edge_set.discard(e)
+
+                    # Eliminar nodos intermedios fusibles si quedaron sin aristas.
+                    for n in merged_intermediates:
+                        if n in self._graph and self._graph.degree(n) == 0:
+                            self._graph.remove_node(n)
+                            removed_total += 1
+
+                    self._graph.add_edge(anchor, new_end, **merged_attrs)
+
+        return removed_total
+
+    def _merge_edge_chain(
+        self,
+        chain: list[tuple[int, int]],
+    ) -> tuple[dict[str, Any], list[int]]:
+        """
+        Construye los atributos de la arista fusionada a partir de una cadena
+        de aristas consecutivas del ring.
+
+        Los waypoints se concatenan eliminando el punto duplicado en cada
+        empalme (`wps[:-1] + next_wps`). Los `mid_tls` se desplazan por la
+        longitud acumulada de las aristas anteriores. El resto de atributos
+        (lanes, max_speed, road_type, is_roundabout, roundabout_id, one_way)
+        se copian de la primera arista — son uniformes dentro de un anillo
+        OSM por construcción.
+
+        Returns:
+            (merged_attrs, intermediate_node_ids) — los nodos intermedios de
+            la cadena que pueden eliminarse del grafo.
+        """
+        first_u, first_v = chain[0]
+        first_attrs = self._graph.edges[first_u, first_v]
+
+        merged_waypoints: list[tuple[float, float]] = list(
+            first_attrs.get(ATTR_WAYPOINTS, [])
+        )
+        merged_mid_tls: list[tuple[int, float]] = list(
+            first_attrs.get(ATTR_MID_TLS, [])
+        )
+        merged_length: float = float(first_attrs.get(ATTR_LENGTH, 0.0))
+
+        for (u, v) in chain[1:]:
+            attrs = self._graph.edges[u, v]
+            wps = list(attrs.get(ATTR_WAYPOINTS, []))
+            if merged_waypoints and wps and merged_waypoints[-1] == wps[0]:
+                merged_waypoints.extend(wps[1:])
+            else:
+                merged_waypoints.extend(wps)
+            offset = merged_length
+            for tl_id, dist in attrs.get(ATTR_MID_TLS, []):
+                merged_mid_tls.append((tl_id, offset + float(dist)))
+            merged_length += float(attrs.get(ATTR_LENGTH, 0.0))
+
+        max_speed_kmh = float(first_attrs.get(ATTR_MAX_SPEED, 50.0))
+        max_speed_ms = max_speed_kmh * KMH_TO_MS
+        travel_time = (
+            merged_length / max_speed_ms if max_speed_ms > 0 else DEFAULT_EDGE_WEIGHT
+        )
+        road_factor = ROAD_TYPE_WEIGHT_FACTORS.get(
+            first_attrs.get(ATTR_ROAD_TYPE), 1.0
+        )
+        weight = travel_time * road_factor
+
+        merged_attrs: dict[str, Any] = {
+            **first_attrs,  # preserva edge_id, road_type, max_speed, lanes, ...
+            ATTR_LENGTH: merged_length,
+            ATTR_WEIGHT: weight,
+            ATTR_WAYPOINTS: merged_waypoints,
+            ATTR_MID_TLS: merged_mid_tls,
+        }
+        # El edge_id de la fusión se queda con el de la primera arista — sirve
+        # como hint para overlays/incident manager. No se usa como FK contra BD.
+
+        intermediates = [v for (_, v) in chain[:-1]]
+        return merged_attrs, intermediates
+
+    # ------------------------------------------------------------------
+    # Fase 2: RDP + spline samples para aristas del ring
+    # ------------------------------------------------------------------
+    def _splinify_roundabout_edges(self) -> int:
+        """
+        Sustituye la poligonal de cada arista con `is_roundabout=True` por un
+        muestreo arc-length de una spline Catmull-Rom centrípeta.
+
+        Pasos por arista:
+          1. Aplicar RDP con tolerancia adaptativa al radio del anillo
+             (`ε = clamp(0.012·R, 0.20, 0.50) m`); preservar los waypoints
+             que sostienen un mid_tl como índices protegidos.
+          2. Construir la tabla de muestras `(s_m, lon, lat)`.
+          3. Sobrescribir `ATTR_LENGTH` y recalcular `ATTR_WEIGHT`.
+          4. Re-mapear cada `mid_tl` a su `s_m` correspondiente en la spline,
+             buscando el waypoint asociado en la tabla.
+          5. Marcar `ATTR_USE_SPLINE=True`.
+
+        Returns:
+            Número de aristas convertidas a spline.
+        """
+        count = 0
+        for u, v, attrs in list(self._graph.edges(data=True)):
+            if not attrs.get(ATTR_IS_ROUNDABOUT):
+                continue
+            wps: list[tuple[float, float]] = list(attrs.get(ATTR_WAYPOINTS, []))
+            if len(wps) < 2:
+                continue
+            mid_tls: list[tuple[int, float]] = list(attrs.get(ATTR_MID_TLS, []))
+
+            # Indexar TLs por waypoint para protegerlos en RDP.
+            #   waypoint_idx → tl_id
+            tl_at_idx: dict[int, int] = {}
+            for tl_id, _dist in mid_tls:
+                # Buscar el waypoint cuyo (lon, lat) coincide con el TL. Sólo
+                # los nodos del grafo tienen lon/lat exactos; si no encontramos
+                # el tl_id por coordenadas dejamos al TL en su distancia
+                # original (será re-mapeada por interpolación, ver paso 4).
+                tl_attrs = self._graph.nodes.get(tl_id)
+                if tl_attrs is None:
+                    continue
+                tl_lon = round(float(tl_attrs.get(ATTR_LONGITUDE, 0.0)), 6)
+                tl_lat = round(float(tl_attrs.get(ATTR_LATITUDE, 0.0)), 6)
+                for i, (wlon, wlat) in enumerate(wps):
+                    if round(wlon, 6) == tl_lon and round(wlat, 6) == tl_lat:
+                        tl_at_idx[i] = tl_id
+                        break
+
+            # Tolerancia RDP adaptativa al radio del anillo. Si la rotonda no
+            # tiene roundabout_length (caso degenerado), usar el límite
+            # inferior — más seguro que descartar.
+            rid = attrs.get(ATTR_ROUNDABOUT_ID)
+            ring_len = self._roundabout_length.get(rid, 0.0) if rid is not None else 0.0
+            if ring_len > 0:
+                R_ring = ring_len / (2.0 * math.pi)
+                eps = max(
+                    RDP_TOLERANCE_MIN_M,
+                    min(RDP_TOLERANCE_MAX_M, RDP_TOLERANCE_PER_RADIUS * R_ring),
+                )
+            else:
+                eps = RDP_TOLERANCE_MIN_M
+
+            simplified = rdp(wps, eps, protected_indices=tl_at_idx.keys())
+
+            # Cota dura: nunca colapsar por debajo de RDP_MIN_POINTS.
+            if len(simplified) < RDP_MIN_POINTS and len(wps) >= RDP_MIN_POINTS:
+                # Insertar puntos intermedios uniformemente del original hasta
+                # alcanzar el mínimo.
+                step = max(1, len(wps) // RDP_MIN_POINTS)
+                simplified = [wps[i] for i in range(0, len(wps), step)]
+                if simplified[-1] != wps[-1]:
+                    simplified.append(wps[-1])
+
+            # Construir spline samples sobre los waypoints simplificados. Las
+            # phantom points se dejan en reflexión por defecto — un kink
+            # imperceptible en el empalme de aristas del ring queda en los
+            # nodos de entrada/salida, donde el ramal externo crea un cambio
+            # de dirección visible que disimula el efecto.
+            table, total_length = build_spline_table(
+                simplified, samples_per_segment=SPLINE_SAMPLES_PER_SEGMENT,
+            )
+            if not table or total_length <= 0:
+                continue
+
+            # Re-mapear cada mid_tl a su arc-length en la spline.
+            # 1) Localizar la muestra cuyo waypoint coincide con el TL.
+            # 2) Como la spline pasa por todos los waypoints, sus muestras a
+            #    índice (rdp_idx * SPLINE_SAMPLES_PER_SEGMENT) son exactamente
+            #    los waypoints. Para TLs supervivientes a RDP esto es exacto;
+            #    para los que cayeran fuera (no debería pasar al estar
+            #    protegidos), usamos su distancia original escalada.
+            rdp_idx_by_tl: dict[int, int] = {}
+            for i, p in enumerate(simplified):
+                key6 = (round(p[0], 6), round(p[1], 6))
+                for orig_i, tl_id in tl_at_idx.items():
+                    if (round(wps[orig_i][0], 6), round(wps[orig_i][1], 6)) == key6:
+                        rdp_idx_by_tl[tl_id] = i
+                        break
+
+            new_mid_tls: list[tuple[int, float]] = []
+            old_total = float(attrs.get(ATTR_LENGTH, 0.0)) or total_length
+            for tl_id, dist in mid_tls:
+                rdp_i = rdp_idx_by_tl.get(tl_id)
+                if rdp_i is not None:
+                    sample_i = rdp_i * SPLINE_SAMPLES_PER_SEGMENT
+                    if 0 <= sample_i < len(table):
+                        new_mid_tls.append((tl_id, table[sample_i][0]))
+                        continue
+                # Fallback: escalar proporcionalmente (preserva orden y
+                # posición relativa aunque la spline haya cambiado el length
+                # total un epsilon).
+                scaled = (dist / old_total) * total_length if old_total > 0 else dist
+                new_mid_tls.append((tl_id, scaled))
+
+            max_speed_kmh = float(attrs.get(ATTR_MAX_SPEED, 50.0))
+            max_speed_ms = max_speed_kmh * KMH_TO_MS
+            travel_time = (
+                total_length / max_speed_ms if max_speed_ms > 0 else DEFAULT_EDGE_WEIGHT
+            )
+            road_factor = ROAD_TYPE_WEIGHT_FACTORS.get(
+                attrs.get(ATTR_ROAD_TYPE), 1.0
+            )
+
+            attrs[ATTR_WAYPOINTS] = simplified
+            attrs[ATTR_LENGTH] = total_length
+            attrs[ATTR_WEIGHT] = travel_time * road_factor
+            attrs[ATTR_USE_SPLINE] = True
+            attrs[ATTR_SPLINE_SAMPLES] = table
+            attrs[ATTR_SPLINE_LENGTH] = total_length
+            attrs[ATTR_MID_TLS] = new_mid_tls
+            if ring_len > 0:
+                # Cacheamos el radio circular del anillo para que
+                # vehicle_physics._edge_curvature_vmax aplique un cap de
+                # velocidad consistente — el cálculo por 3 waypoints pierde
+                # precisión cuando la spline tiene pocos puntos de control.
+                attrs[ATTR_RING_RADIUS_M] = ring_len / (2.0 * math.pi)
+            count += 1
+
+        return count
 
     def _rebuild_roundabout_indices(self) -> None:
         """

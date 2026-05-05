@@ -41,7 +41,11 @@ from app.core.constants import (
     ATTR_LONGITUDE,
     ATTR_MAX_SPEED,
     ATTR_MID_TLS,
+    ATTR_RING_RADIUS_M,
     ATTR_ROUNDABOUT_ID,
+    ATTR_SPLINE_LENGTH,
+    ATTR_SPLINE_SAMPLES,
+    ATTR_USE_SPLINE,
     ATTR_WAYPOINTS,
     COLLISION_GAP_THRESHOLD_ROUNDABOUT_M,
     COLLISION_GAP_THRESHOLD_STRAIGHT_M,
@@ -80,6 +84,7 @@ from app.core.physics.mobil import (
     MOBILModel,
 )
 from app.core.physics.vehicle_types import PROFILES, VehicleType
+from app.core.spline import position_at_arc_length
 from app.models.enums import VehicleStatus
 from app.services.network_graph import RoadNetworkGraph
 from app.services.vehicle_spawner import SimVehicle
@@ -252,6 +257,28 @@ def _get_waypoints(
     end_lon   = float(end_node_attrs.get(ATTR_LONGITUDE,   0.0))
     end_lat   = float(end_node_attrs.get(ATTR_LATITUDE,    0.0))
     return [(start_lon, start_lat), (end_lon, end_lat)]
+
+
+def _edge_position(
+    edge_attrs: dict,
+    progress: float,
+    waypoints: list[tuple[float, float]],
+    _cache_key: tuple[int, int] | None = None,
+) -> tuple[float, float, float]:
+    """
+    Devuelve (lon, lat, heading) en una arista a `progress` ∈ [0, 1].
+
+    Si la arista trae una tabla de muestreo de spline (rotondas tras F2 en
+    network_graph), interpolamos en arc-length sobre la curva. En caso
+    contrario, lerp lineal entre waypoints (path histórico).
+    """
+    if edge_attrs.get(ATTR_USE_SPLINE):
+        table = edge_attrs.get(ATTR_SPLINE_SAMPLES)
+        spline_length = float(edge_attrs.get(ATTR_SPLINE_LENGTH, 0.0))
+        if table and spline_length > 0.0:
+            s_target = max(0.0, min(1.0, progress)) * spline_length
+            return position_at_arc_length(table, s_target)
+    return _position_along_waypoints(waypoints, progress, _cache_key=_cache_key)
 
 
 # ---------------------------------------------------------------------------
@@ -696,16 +723,27 @@ def _edge_curvature_vmax(
 
     Se cachea en `edge_attrs[ATTR_CURVE_VMAX]` porque la geometría de la arista
     es inmutable tras cargarla al grafo. Los tramos rectos devuelven inf.
+
+    Para aristas de rotonda con `ATTR_RING_RADIUS_M` precomputado (tras la
+    splinificación en network_graph) usamos el radio circular del anillo
+    completo en vez del estimador por 3 waypoints — es más estable cuando la
+    spline tiene pocos puntos de control y refleja mejor la dinámica real
+    del giro continuo dentro del ring.
     """
     cached = edge_attrs.get(ATTR_CURVE_VMAX)
     if cached is not None:
         return float(cached)
-    waypoints = edge_attrs.get(ATTR_WAYPOINTS) or []
-    R = _curvature_radius_m(waypoints)
-    if math.isinf(R):
-        v_max = float("inf")
-    else:
+    ring_radius = edge_attrs.get(ATTR_RING_RADIUS_M)
+    if ring_radius is not None:
+        R = max(float(ring_radius), MIN_ROUNDABOUT_RADIUS_M)
         v_max = math.sqrt(lateral_accel_max_ms2 * R)
+    else:
+        waypoints = edge_attrs.get(ATTR_WAYPOINTS) or []
+        R = _curvature_radius_m(waypoints)
+        if math.isinf(R):
+            v_max = float("inf")
+        else:
+            v_max = math.sqrt(lateral_accel_max_ms2 * R)
     edge_attrs[ATTR_CURVE_VMAX] = v_max
     return v_max
 
@@ -1072,8 +1110,8 @@ def _advance_vehicle_idm(
             outgoing_wps = _get_waypoints(
                 edge_attrs, outgoing_start_attrs, outgoing_end_attrs
             )
-            _, _, end_heading = _position_along_waypoints(
-                outgoing_wps, 1.0, _cache_key=(start_n, end_n)
+            _, _, end_heading = _edge_position(
+                edge_attrs, 1.0, outgoing_wps, _cache_key=(start_n, end_n)
             )
             vehicle.prev_edge_end_heading = end_heading
             vehicle.prev_edge_was_roundabout = bool(
@@ -1138,8 +1176,8 @@ def _advance_vehicle_idm(
     end_attrs   = graph.get_node_attributes(end_n)
 
     waypoints = _get_waypoints(edge_attrs, start_attrs, end_attrs)
-    lon, lat, heading = _position_along_waypoints(
-        waypoints, vehicle.progress_on_edge, _cache_key=(start_n, end_n)
+    lon, lat, heading = _edge_position(
+        edge_attrs, vehicle.progress_on_edge, waypoints, _cache_key=(start_n, end_n)
     )
 
     # ── Blend de tangentes entre aristas ──────────────────────────────────────

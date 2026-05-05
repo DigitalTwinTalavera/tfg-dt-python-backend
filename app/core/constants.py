@@ -206,6 +206,31 @@ ATTR_MID_TLS = "mid_tls"
 ATTR_IS_ROUNDABOUT = "is_roundabout"   # bool — the edge is part of a roundabout ring
 ATTR_ROUNDABOUT_ID = "roundabout_id"   # int|None — identifies a connected ring component
 ATTR_CURVE_VMAX = "curve_vmax"         # float m/s — cached curvature speed cap for the edge
+# Set on roundabout edges that have been resampled with a centripetal
+# Catmull-Rom spline. When True, vehicle_physics reads ATTR_SPLINE_SAMPLES /
+# ATTR_SPLINE_LENGTH instead of running the polyline lerp.
+ATTR_USE_SPLINE = "use_spline"
+# list[tuple[float, float, float]] — precomputed sample table for the spline:
+# each entry is (s_m, lon, lat) where s_m is cumulative arc length (haversine)
+# from the start of the edge. Dense enough that bisect+lerp gives sub-mm
+# error at runtime.
+ATTR_SPLINE_SAMPLES = "spline_samples"
+ATTR_SPLINE_LENGTH = "spline_length"   # float m — total arc length of the spline
+# Radio circular del anillo (m) cacheado en cada arista de rotonda. Lo usa
+# vehicle_physics._edge_curvature_vmax para imponer un cap de velocidad
+# coherente con la geometría del ring entero, en vez de estimarlo con 3
+# waypoints (poco fiable tras RDP).
+ATTR_RING_RADIUS_M = "ring_radius_m"
+# Roundabout RDP tolerance bounds. ε scales with the ring radius so small
+# glorietas (Tres Olivos R≈10 m) keep more detail than large ones, but never
+# exceeds 0.5 m and never collapses an edge below RDP_MIN_POINTS waypoints.
+RDP_TOLERANCE_PER_RADIUS: float = 0.012
+RDP_TOLERANCE_MIN_M: float = 0.20
+RDP_TOLERANCE_MAX_M: float = 0.50
+RDP_MIN_POINTS: int = 4
+# Spline sample density. With segments shortened by RDP, 8 samples per segment
+# give ≤0.5 m spacing along the curve for typical roundabout edges.
+SPLINE_SAMPLES_PER_SEGMENT: int = 8
 
 # Routing penalties
 # Plan D3: exclusión efectiva de aristas bloqueadas en A*. Con el factor
