@@ -555,13 +555,31 @@ MOBIL_MIN_SAFE_GAP_M: float = 3.0
 # =============================================================================
 
 # Distancia desde la línea de entrada a la rotonda en la que el vehículo empieza
-# a mirar hacia dentro del anillo para ceder el paso.
-YIELD_DETECTION_ZONE_M: float = 15.0
+# a mirar hacia dentro del anillo para ceder el paso. 30 m permite frenar
+# cómodamente desde 50 km/h (v²/2b ≈ 32 m con b=3) sin entrar en pánico al
+# borde mismo. Alineada con LOOKAHEAD_ENTRY_TRIGGER_M.
+YIELD_DETECTION_ZONE_M: float = 30.0
 # Time-to-conflict: si un vehículo circulando llega antes de este tiempo a la
-# entrada del ego, el ego debe ceder.
-YIELD_TTC_THRESHOLD_S: float = 3.5
-# Gap mínimo en arco (m) dentro del anillo para aceptar la entrada.
-YIELD_GAP_MIN_M: float = 10.0
+# entrada del ego, el ego debe ceder. 3.0 s es un margen realista — un coche
+# del anillo a velocidad típica (4-5 m/s) será conflicto si está dentro de
+# 12-15 m de la línea de entrada.
+YIELD_TTC_THRESHOLD_S: float = 3.0
+# Gap mínimo en arco (m) dentro del anillo para aceptar la entrada. Equivale
+# a la holgura mínima requerida con un coche del anillo aunque esté parado
+# o muy lento (TTC alto): si está físicamente más cerca de 8 m del entry
+# node, hay conflicto y se cede.
+YIELD_GAP_MIN_M: float = 8.0
+# Gap mínimo (m) que `_find_leader` reporta cuando el ego está en la última
+# arista del anillo y el líder está en la arista de salida (ring → non-ring).
+# Sin clamp, una cola en el borde de la salida con v_lead=0 lleva el IDM a
+# v=0 dentro del ring (viola el principio "ceder fuera, no dentro"). Con 8 m
+# el IDM frena gradualmente sin parar, y al cruzar al exit el `_find_leader`
+# normal toma el control y para correctamente fuera del ring.
+RING_EXIT_MIN_GAP_M: float = 8.0
+# Velocidad mínima (m/s ≈ 5 km/h) que `_find_leader` reporta del líder en la
+# salida del anillo. Evita que el IDM calcule s* infinito por v_lead=0 con
+# Δv grande, lo que produce frenado catastrófico.
+RING_EXIT_MIN_LEADER_V_MS: float = 1.5
 # Distancia restante (m) en la arista actual por debajo de la cual se activa
 # el look-ahead cross-edge cuando la siguiente arista es anillo de rotonda.
 # Cubre ~5 ticks a 50 km/h (13.9 m/s · 0.1 s ≈ 1.39 m), evitando que entradas

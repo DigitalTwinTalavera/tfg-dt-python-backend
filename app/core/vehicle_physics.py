@@ -74,6 +74,8 @@ from app.core.constants import (
     VEHICLE_LENGTH_M,
     VEHICLE_PHYSICS_PARALLEL_THRESHOLD,
     YIELD_DETECTION_ZONE_M,
+    RING_EXIT_MIN_GAP_M,
+    RING_EXIT_MIN_LEADER_V_MS,
     YIELD_GAP_MIN_M,
     YIELD_TTC_THRESHOLD_S,
 )
@@ -378,6 +380,13 @@ def _find_leader(
             distance_gate = remaining_current_m < threshold
         else:
             distance_gate = False
+        # Salida de anillo (cur=ring, next=non-ring): la cola del exit edge no
+        # debe llevar al ego a v=0 dentro del ring (principio: ceder fuera del
+        # ring, nunca dentro). Hacemos lookahead normalmente, pero clampamos el
+        # gap_m y el velocity_ms del líder para que el IDM frene de forma
+        # gradual sin alcanzar v=0; al cruzar al exit, el `_find_leader` normal
+        # toma el relevo con datos reales y para correctamente fuera del ring.
+        is_ring_exit = cur_is_roundabout and not next_is_roundabout
         if vehicle.progress_on_edge > 0.70 or distance_gate:
             next_key = (node_path[ei + 1], node_path[ei + 2])
             next_edge_len = max(float(next_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
@@ -414,9 +423,20 @@ def _find_leader(
                     dist_on_next = first_on_next.progress_on_edge * next_edge_len
                     leader_len = getattr(first_on_next, "length_m", VEHICLE_LENGTH_M)
                     total_gap = remaining_current_m + dist_on_next - leader_len
+                    if is_ring_exit:
+                        # Clamp para impedir que el IDM lleve al ego a v=0
+                        # dentro del ring cuando hay cola en el borde de la
+                        # salida (v_lead=0, gap≈0). El ego desacelera pero no
+                        # para; al cruzar al exit, el _find_leader same-edge
+                        # toma el control con datos reales.
+                        gap_m = max(total_gap, RING_EXIT_MIN_GAP_M)
+                        v_lead = max(first_on_next.velocity, RING_EXIT_MIN_LEADER_V_MS)
+                    else:
+                        gap_m = max(total_gap, 0.01)
+                        v_lead = first_on_next.velocity
                     return NeighborInfo(
-                        gap_m=max(total_gap, 0.01),
-                        velocity_ms=first_on_next.velocity,
+                        gap_m=gap_m,
+                        velocity_ms=v_lead,
                         leader_id=first_on_next.id,
                     )
 
@@ -667,9 +687,14 @@ def _find_roundabout_yield_leader(
     if not must_yield:
         return None
 
-    # Líder virtual: parado en la línea de entrada. El IDM frenará para no
-    # cruzarlo. Gap = distancia a la línea menos un margen de seguridad.
-    gap = max(dist_to_ring - 0.5, 0.2)
+    # Líder virtual posicionado s0 metros DETRÁS de la línea de entrada para
+    # que el IDM, manteniendo `gap = s0` en reposo, deje al ego con su frontal
+    # AL FINAL del carril (justo en la línea), no varios metros antes.
+    # Si reportásemos `gap = dist_to_ring`, el IDM mantendría s0 de holgura y
+    # el ego se pararía s0 = 8 m ANTES de la línea: visualmente no parece un
+    # yield correcto. `IDM_S0_DEFAULT_M` (parameters.py: IDMParameters().s0)
+    # es 8 m; se usa el valor numérico aquí para evitar dependencia circular.
+    gap = max(dist_to_ring + 8.0, 0.2)
     return NeighborInfo(gap_m=gap, velocity_ms=0.0, leader_id=None)
 
 
@@ -1039,8 +1064,12 @@ def _advance_vehicle_idm(
         # Si el IDM no frenó lo bastante, bloqueamos manualmente antes del
         # cruce peatonal / semáforo interno. mid_tls está ordenada por
         # distancia creciente desde start_node.
+        # Excepción: dentro del anillo no se aplica — `highway=crossing` y
+        # similares dentro de la rotonda no deben parar al circulante (ver
+        # _check_traffic_light para la lógica equivalente sobre el líder IDM).
+        cur_is_ring_hard = bool(edge_attrs.get(ATTR_IS_ROUNDABOUT))
         mid_stop_hit = False
-        if tl_ref is not None:
+        if tl_ref is not None and not cur_is_ring_hard:
             mid_tls: list[tuple[int, float]] = edge_attrs.get(ATTR_MID_TLS, []) or []
             for tl_nid, dist_from_start in mid_tls:
                 if dist_from_start <= pos_on_edge:
@@ -1068,7 +1097,10 @@ def _advance_vehicle_idm(
             # Aunque el IDM ya debería haber frenado (via _check_traffic_light),
             # en aristas muy cortas puede que la distancia no haya sido suficiente.
             # ROJO → siempre frena; AMARILLO → frena si yellow_runs_light es False.
-            if tl_ref is not None:
+            # Excepción: si la arista actual es de anillo, el end_node es
+            # interno o de salida del ring; los crossings internos no deben
+            # parar al circulante.
+            if tl_ref is not None and not cur_is_ring_hard:
                 phase = tl_ref.get_phase_for_edge(end_n, (start_n, end_n))  # type: ignore[union-attr]
                 blocks = phase == TL_PHASE_RED or (
                     phase == TL_PHASE_YELLOW
@@ -1088,7 +1120,17 @@ def _advance_vehicle_idm(
             # activado tras calcular la ruta). La penalización en A* solo cubre
             # rutas nuevas; sin este check el vehículo cruzaba el tramo cerrado
             # hasta que el reroute periódico lo alcanzaba (3+ s con 1500 veh).
-            if blocked_edges_set is not None and ei + 2 <= len(node_path) - 1:
+            # Excepción: si la arista actual es de anillo, no se aplica — un
+            # coche dentro del ring no debe pararse por una salida bloqueada
+            # (principio: ceder fuera del ring, nunca dentro). Cuando cruce al
+            # exit edge, el `_find_leader` y la lógica normal de fuera del ring
+            # lo gestionarán; el reroute urgente lo desviará si la salida sigue
+            # bloqueada en ticks posteriores.
+            if (
+                blocked_edges_set is not None
+                and ei + 2 <= len(node_path) - 1
+                and not cur_is_ring_hard
+            ):
                 next_key = (node_path[ei + 1], node_path[ei + 2])
                 if next_key in blocked_edges_set:
                     stop_progress = max(

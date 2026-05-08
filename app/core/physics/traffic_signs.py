@@ -18,6 +18,7 @@ Tres fuentes de TL en orden de cercanía:
 from __future__ import annotations
 
 from app.core.constants import (
+    ATTR_IS_ROUNDABOUT,
     ATTR_LENGTH,
     ATTR_MID_TLS,
     ATTR_NODE_TYPE,
@@ -85,6 +86,7 @@ def _check_traffic_light(
     start_node = node_path[ei]
     end_node = node_path[ei + 1]
     edge_attrs = graph.get_edge_attributes(start_node, end_node)
+    cur_is_ring = bool(edge_attrs.get(ATTR_IS_ROUNDABOUT))
     edge_len = max(float(edge_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
     pos_on_edge_m = edge_len * vehicle.progress_on_edge
     dist_to_end = edge_len - pos_on_edge_m
@@ -92,37 +94,52 @@ def _check_traffic_light(
     # 1) TLs mid-way en la arista actual (ordenados por distancia ascendente
     # desde start_node). El primero con fase bloqueante que esté por delante
     # del vehículo define la línea de stop.
-    mid_tls: list[tuple[int, float]] = edge_attrs.get(ATTR_MID_TLS, []) or []
-    for tl_nid, dist_from_start in mid_tls:
-        if dist_from_start <= pos_on_edge_m:
-            continue  # ya lo pasó
-        dist_to_tl = dist_from_start - pos_on_edge_m
-        phase = tl_controller.get_phase(tl_nid)  # type: ignore[union-attr]
-        if _phase_blocks(phase, vehicle, dist_to_tl):
-            return NeighborInfo(gap_m=max(dist_to_tl - VEHICLE_LENGTH_M, 0.01), velocity_ms=0.0)
+    # Dentro del anillo no se aplican: `highway=crossing` se mapea a TL en el
+    # loader y suele caer sobre nodos compartidos con brazos de salida —
+    # pararían a los coches que circulan, contra la prioridad de rotonda.
+    if not cur_is_ring:
+        mid_tls: list[tuple[int, float]] = edge_attrs.get(ATTR_MID_TLS, []) or []
+        for tl_nid, dist_from_start in mid_tls:
+            if dist_from_start <= pos_on_edge_m:
+                continue  # ya lo pasó
+            dist_to_tl = dist_from_start - pos_on_edge_m
+            phase = tl_controller.get_phase(tl_nid)  # type: ignore[union-attr]
+            if _phase_blocks(phase, vehicle, dist_to_tl):
+                return NeighborInfo(gap_m=max(dist_to_tl - VEHICLE_LENGTH_M, 0.01), velocity_ms=0.0)
 
     # 2) TL en el end_node (cruce clásico): consulta por arista entrante.
-    end_phase = tl_controller.get_phase_for_edge(end_node, (start_node, end_node))  # type: ignore[union-attr]
-    if _phase_blocks(end_phase, vehicle, dist_to_end):
-        return NeighborInfo(gap_m=max(dist_to_end - VEHICLE_LENGTH_M, 0.01), velocity_ms=0.0)
+    # Si la arista actual es de anillo, el end_node es interno al ring (o el
+    # punto exacto de salida) — no debe parar al circulante.
+    if not cur_is_ring:
+        end_phase = tl_controller.get_phase_for_edge(end_node, (start_node, end_node))  # type: ignore[union-attr]
+        if _phase_blocks(end_phase, vehicle, dist_to_end):
+            return NeighborInfo(gap_m=max(dist_to_end - VEHICLE_LENGTH_M, 0.01), velocity_ms=0.0)
 
     # 3) Look-ahead a la arista siguiente (mid-TLs + end_node).
-    if ei + 2 < len(node_path):
+    # Si la actual es de anillo, NO se hace lookahead: aunque la salida tenga
+    # un TL, frenar ya en el anillo bloquea la circulación. El vehículo verá
+    # el TL al cruzar a la arista de salida y frenará entonces.
+    # Si la siguiente arista es de anillo, los TLs internos del ring no deben
+    # frenar a quien aún no ha entrado: la prioridad la gestiona el yield de
+    # entrada.
+    if not cur_is_ring and ei + 2 < len(node_path):
         next_end = node_path[ei + 2]
         next_attrs = graph.get_edge_attributes(end_node, next_end)
-        next_len = max(float(next_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
+        next_is_ring = bool(next_attrs.get(ATTR_IS_ROUNDABOUT))
+        if not next_is_ring:
+            next_len = max(float(next_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
 
-        next_mid_tls: list[tuple[int, float]] = next_attrs.get(ATTR_MID_TLS, []) or []
-        for tl_nid, dist_from_start in next_mid_tls:
-            total_dist = dist_to_end + dist_from_start
-            phase = tl_controller.get_phase(tl_nid)  # type: ignore[union-attr]
-            if _phase_blocks(phase, vehicle, total_dist):
+            next_mid_tls: list[tuple[int, float]] = next_attrs.get(ATTR_MID_TLS, []) or []
+            for tl_nid, dist_from_start in next_mid_tls:
+                total_dist = dist_to_end + dist_from_start
+                phase = tl_controller.get_phase(tl_nid)  # type: ignore[union-attr]
+                if _phase_blocks(phase, vehicle, total_dist):
+                    return NeighborInfo(gap_m=max(total_dist - VEHICLE_LENGTH_M, 0.01), velocity_ms=0.0)
+
+            next_end_phase = tl_controller.get_phase_for_edge(next_end, (end_node, next_end))  # type: ignore[union-attr]
+            total_dist = dist_to_end + next_len
+            if _phase_blocks(next_end_phase, vehicle, total_dist):
                 return NeighborInfo(gap_m=max(total_dist - VEHICLE_LENGTH_M, 0.01), velocity_ms=0.0)
-
-        next_end_phase = tl_controller.get_phase_for_edge(next_end, (end_node, next_end))  # type: ignore[union-attr]
-        total_dist = dist_to_end + next_len
-        if _phase_blocks(next_end_phase, vehicle, total_dist):
-            return NeighborInfo(gap_m=max(total_dist - VEHICLE_LENGTH_M, 0.01), velocity_ms=0.0)
 
     return None
 
@@ -165,6 +182,13 @@ def _check_stop_yield_sign(
     start_node = node_path[ei]
     end_node = node_path[ei + 1]
 
+    edge_attrs = graph.get_edge_attributes(start_node, end_node)
+    # Dentro del anillo no se cede el paso: la prioridad de rotonda la gestiona
+    # `_find_roundabout_yield_leader` en la entrada. Nodos internos del anillo
+    # suelen heredar `highway=give_way` del brazo de entrada que los toca.
+    if edge_attrs.get(ATTR_IS_ROUNDABOUT):
+        return None
+
     # Reset del flag de STOP cumplido cuando cambiamos de arista objetivo.
     if vehicle.stop_sign_cleared_node != -1 and vehicle.stop_sign_cleared_node != end_node:
         vehicle.stop_sign_cleared_node = -1
@@ -174,7 +198,18 @@ def _check_stop_yield_sign(
     if node_kind not in (NodeType.STOP_SIGN.value, NodeType.YIELD_SIGN.value):
         return None
 
-    edge_attrs = graph.get_edge_attributes(start_node, end_node)
+    # Si la siguiente arista es de rotonda, el end_node es la línea de entrada
+    # al ring. La prioridad la gestiona `_find_roundabout_yield_leader`, que es
+    # lane-aware (no cede a coches del anillo en otro carril) y respeta la
+    # direccionalidad del ring. Aplicar también el YIELD genérico aquí escanea
+    # toda arista convergente sin distinguir carril ni dirección, lo que
+    # bloquea perpetuamente la entrada en ring saturado. STOP sí se mantiene
+    # (es una norma OSM explícita rara, no la entrada estándar).
+    if node_kind == NodeType.YIELD_SIGN.value and ei + 2 <= len(node_path) - 1:
+        nxt_attrs = graph.get_edge_attributes(node_path[ei + 1], node_path[ei + 2])
+        if nxt_attrs.get(ATTR_IS_ROUNDABOUT):
+            return None
+
     edge_len = max(float(edge_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
     dist_to_sign = edge_len * (1.0 - vehicle.progress_on_edge)
     if dist_to_sign > SIGN_DETECTION_ZONE_M:
