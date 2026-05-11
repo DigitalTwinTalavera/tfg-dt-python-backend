@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from pathlib import Path
 
-from app.api import health, incidents, map, routes, simulation, zones
+from app.api import health, incidents, map, metrics, routes, simulation, zones
 from app.config import settings
 from app.core.constants import (
     API_PREFIX,
@@ -50,6 +50,17 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Gestión del ciclo de vida de la aplicación"""
+    # Detección automática de bloqueos del event loop: si una callback dura
+    # más de 50 ms, asyncio loguea un warning con el repr del callback. Es
+    # complementario al timing por subsistema — delata IO sincrónico u
+    # operaciones CPU-bound dentro del event loop sin necesidad de profiler
+    # externo.
+    import asyncio as _asyncio
+    try:
+        _asyncio.get_running_loop().slow_callback_duration = 0.05
+    except RuntimeError:
+        pass
+
     # Startup
     logger.info(
         MSG_STARTUP_SERVER.format(
@@ -162,6 +173,10 @@ app.include_router(simulation.router, prefix=API_PREFIX, tags=[TAG_SIMULATION])
 app.include_router(incidents.router, prefix=API_PREFIX)
 app.include_router(zones.router, prefix=API_PREFIX)
 app.include_router(routes.router)
+# `/metrics` (Prometheus, scrap-able) en raíz;
+# `/api/simulation/metrics` (JSON legible) bajo el prefijo de la API.
+app.include_router(metrics.prometheus_router)
+app.include_router(metrics.json_router, prefix=API_PREFIX)
 
 
 @app.get(ROOT_PATH, response_model=RootResponse, tags=[TAG_ROOT])

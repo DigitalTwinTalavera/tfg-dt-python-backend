@@ -83,6 +83,11 @@ class SimVehicle:
     # se resetea a MOBIL_EVAL_INTERVAL_TICKS. Inicializado vía hash(id) para
     # repartir la carga computacional entre ticks.
     mobil_cooldown_ticks: int = 0
+    # Tick en el que MOBIL ejecutó el último cambio de carril (lane ± 1). Usado
+    # por el clasificador de colisiones para atribuir choques a cambios de
+    # carril recientes (ventana ~3 ticks). Inicializado a un valor muy negativo
+    # para que el primer tick no se considere "post-cambio".
+    last_lane_change_tick: int = -10_000
     # Runtime STOP/YIELD sign tracking.
     # `stop_sign_cleared_node` guarda el ID del nodo STOP cuya parada obligatoria
     # ya se ha cumplido; mientras coincida con el end_node actual, el vehículo

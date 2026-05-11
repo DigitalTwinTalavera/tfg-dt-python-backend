@@ -39,3 +39,8 @@ httpx==0.28.1
 # Code Quality
 black==24.10.0
 flake8==7.1.1
+
+# Observability — Prometheus exposition (/metrics endpoint).
+# Si está ausente, el módulo `app/core/instrumentation.py` cae a un
+# formateador propio mínimo (sin labels), suficiente para inspección manual.
+prometheus-client==0.21.1

@@ -516,6 +516,41 @@ COLLISION_PROXIMITY_DURATION_S: float = 1.0      # sostenido > este tiempo → c
 # parados juntos (p. ej. en cola de semáforo) se marquen como choque.
 COLLISION_RELATIVE_SPEED_MIN_MS: float = 1.0
 
+# Margen bumper-to-bumper que el clamp duro garantiza tras avanzar el IDM.
+# Aplica como límite superior a la distancia recorrida en un tick, calculado
+# contra el gap reportado por el líder (real o virtual). Evita que el IDM
+# "atraviese" al vehículo de delante en aristas cortas o ante caídas bruscas
+# de gap. Pensado como red de seguridad final, no como sustituto del IDM.
+HARD_CLAMP_MARGIN_M: float = 0.2
+
+# Distancia máxima desde el final de la arista actual a la que disparar el
+# look-ahead a la siguiente arista cuando ninguna de las dos es de rotonda.
+# Cubre el caso en el que un tick saltaría la línea entre aristas cortas
+# antes de que `progress > 0.70` se cumpla. La lookahead de rotonda se mantiene
+# con LOOKAHEAD_*_TRIGGER_M arriba.
+LOOKAHEAD_NON_ROUND_TRIGGER_M: float = 8.0
+
+# =============================================================================
+# Intersection Arbitration (priority-to-the-right + TTC tiebreak)
+# =============================================================================
+
+# Distancia desde el final de la arista a la que un vehículo entra en zona
+# de arbitraje del nodo. Solo se evalúa por debajo de este umbral para
+# acotar el coste por tick.
+INTERSECTION_DETECTION_ZONE_M: float = 30.0
+
+# Diferencia mínima entre los TTC (tiempo a la línea de stop) de dos
+# contendientes para resolver la prioridad por orden de llegada. Si las TTCs
+# difieren más de este delta, gana el más cercano y los demás ceden.
+INTERSECTION_TTC_PRIORITY_DELTA_S: float = 0.5
+
+# Ventana angular [min, max] grados para considerar que un contendiente
+# se aproxima por la derecha del ego. Bearing relativo en sentido horario:
+# 90° es estrictamente perpendicular a la derecha; 45-135° cubre cruces
+# realistas (incluyendo conexiones algo oblicuas).
+INTERSECTION_RIGHT_BEARING_MIN_DEG: float = 45.0
+INTERSECTION_RIGHT_BEARING_MAX_DEG: float = 135.0
+
 # =============================================================================
 # Emergency Brake (Plan C)
 # =============================================================================

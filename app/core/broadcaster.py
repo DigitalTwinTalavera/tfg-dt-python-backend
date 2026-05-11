@@ -27,6 +27,7 @@ from app.api.websocket.messages import (
     build_zone_message,
 )
 from app.core.constants import BROADCAST_CHUNK_SIZE
+from app.core.instrumentation import registry
 from app.services.vehicle_spawner import SimVehicle, VehicleSpawner
 
 logger = logging.getLogger(__name__)
@@ -96,10 +97,11 @@ class SimulationBroadcaster:
             tick: Número de tick actual.
             sim_time: Tiempo de simulación acumulado (s).
         """
+        registry.gauge("ws.clients", self._manager.connection_count)
         if self._manager.connection_count == 0:
             return
 
-        t0 = time.monotonic()
+        t0 = time.perf_counter_ns()
 
         # Esperamos a que termine el envío del tick anterior antes de empezar
         # a serializar el nuevo. En condiciones normales esto es ~cero (el
@@ -145,9 +147,18 @@ class SimulationBroadcaster:
         if payloads:
             self._pending_send = asyncio.create_task(self._send_payloads(payloads))
 
-        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        elapsed_ms = (time.perf_counter_ns() - t0) / 1_000_000.0
         self._broadcast_count += 1
         self._total_broadcast_time_ms += elapsed_ms
+
+        # Métricas WS: tamaño del payload por tick + bytes acumulados (counter
+        # monotónico, deriva bytes/s al dividir por uptime). Chunks/tick
+        # también histograma para detectar saltos al pasar de 1 a múltiples.
+        bytes_this_tick = sum(len(p) for p in payloads)
+        registry.record("ws.bytes_per_tick", bytes_this_tick)
+        registry.inc("ws.bytes", bytes_this_tick)
+        registry.record("ws.chunks_per_tick", len(payloads))
+        registry.record("ws.serialize_ms", elapsed_ms)
 
         if self._broadcast_count % 100 == 0:
             logger.debug(
@@ -163,8 +174,10 @@ class SimulationBroadcaster:
         tarea fire-and-forget para que el bucle de simulación pueda iniciar
         el siguiente tick sin esperar a que el WS complete el envío.
         """
+        t0 = time.perf_counter_ns()
         for payload in payloads:
             await self._manager.broadcast_bytes(payload)
+        registry.record("ws.send_ms", (time.perf_counter_ns() - t0) / 1_000_000.0)
 
     def _build_all_states(
         self, vehicles: list[SimVehicle]

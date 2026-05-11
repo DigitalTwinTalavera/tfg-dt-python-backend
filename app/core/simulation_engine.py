@@ -4,6 +4,7 @@ Ejecuta como tarea asíncrona en background dentro del event loop de FastAPI.
 """
 
 import asyncio
+import json
 import logging
 import time
 from enum import Enum
@@ -22,6 +23,7 @@ from app.core.exceptions import (
     SimulationNotPausedError,
     SimulationNotRunningError,
 )
+from app.core.instrumentation import SplitTimer, registry
 from app.models.enums import VehicleStatus
 
 if TYPE_CHECKING:
@@ -274,16 +276,12 @@ class SimulationEngine:
         Los slow-ticks se registran en el log para diagnóstico.
         """
         next_deadline = time.monotonic()
-        # Stats de tick: cada PERF_LOG_INTERVAL ticks reportamos tiempos
-        # medios. Útil para identificar el subsistema cuello cuando hay
-        # tirones (compara total vs broadcast.avg_broadcast_time_ms).
+        # Cada PERF_LOG_INTERVAL ticks volcamos snapshot del registry como
+        # JSON-line para análisis offline (jq, pandas) sin scrapear Prometheus.
         PERF_LOG_INTERVAL = 100
-        tick_time_sum_ms = 0.0
-        tick_time_max_ms = 0.0
-        tick_samples = 0
         try:
             while self._state == SimulationState.RUNNING:
-                tick_start = time.monotonic()
+                tick_start_ns = time.perf_counter_ns()
                 interval_s = self._tick_interval_ms / 1000.0
 
                 await self._tick(interval_s)
@@ -291,36 +289,36 @@ class SimulationEngine:
                 self._tick_count += 1
                 self._simulation_time += interval_s
 
-                elapsed = time.monotonic() - tick_start
-                elapsed_ms = elapsed * 1000.0
-                tick_time_sum_ms += elapsed_ms
-                if elapsed_ms > tick_time_max_ms:
-                    tick_time_max_ms = elapsed_ms
-                tick_samples += 1
-                if elapsed > interval_s * 1.2:
+                elapsed_ns = time.perf_counter_ns() - tick_start_ns
+                elapsed_ms = elapsed_ns / 1_000_000.0
+                registry.record("tick_total_ms", elapsed_ms)
+                registry.gauge("vehicles_active", self._vehicles_active)
+                registry.gauge("tick_count", self._tick_count)
+                registry.gauge("sim_time_seconds", self._simulation_time)
+
+                if elapsed_ms > interval_s * 1000.0 * 1.2:
+                    registry.inc("slow_tick_count")
                     logger.warning(
                         "Slow tick #%d: %.0f ms (presupuesto %.0f ms)",
                         self._tick_count,
                         elapsed_ms,
                         interval_s * 1000.0,
                     )
-                if tick_samples >= PERF_LOG_INTERVAL:
-                    avg_ms = tick_time_sum_ms / tick_samples
-                    bcast_avg = (
-                        self._broadcaster.avg_broadcast_time_ms
-                        if self._broadcaster is not None else 0.0
-                    )
+
+                if self._tick_count % PERF_LOG_INTERVAL == 0:
+                    snap = registry.snapshot()
                     logger.info(
-                        "Perf #%d: tick avg=%.1f ms max=%.1f ms | broadcast avg=%.2f ms | active=%d",
-                        self._tick_count,
-                        avg_ms,
-                        tick_time_max_ms,
-                        bcast_avg,
-                        self._vehicles_active,
+                        "perf %s",
+                        json.dumps(
+                            {
+                                "tick": self._tick_count,
+                                "active": self._vehicles_active,
+                                "sim_time_s": round(self._simulation_time, 3),
+                                "metrics": snap,
+                            },
+                            default=str,
+                        ),
                     )
-                    tick_time_sum_ms = 0.0
-                    tick_time_max_ms = 0.0
-                    tick_samples = 0
 
                 next_deadline += interval_s
                 now = time.monotonic()
@@ -359,6 +357,8 @@ class SimulationEngine:
         """
         from app.core.constants import TL_BROADCAST_INTERVAL_TICKS
 
+        st = SplitTimer()
+
         # 1. Lazy-init del controlador de semáforos (primera vez que el grafo está listo)
         if (
             self._tl_controller is None
@@ -375,12 +375,14 @@ class SimulationEngine:
         # 2. Avanzar ciclos de semáforos
         if self._tl_controller is not None:
             self._tl_controller.tick(dt)
+        st.split("tl_advance_ms")
 
         # 2b. Expirar incidentes con TTL cumplido — se procesa async tras el
         # tick físico para evitar I/O durante el hot path.
         expired_incidents: list[int] = []
         if self._incident_manager is not None:
             expired_incidents = self._incident_manager.tick(self._simulation_time)
+        st.split("incident_tick_ms")
 
         # 3. Auto-spawn
         if (
@@ -395,6 +397,7 @@ class SimulationEngine:
                     self._spawner.spawn(count=1)
                 except ValueError:
                     pass  # sin nodos de entrada/salida -> ignorar silenciosamente
+        st.split("auto_spawn_ms")
 
         # 4. Física de vehículos con IDM.
         #   - Con < 500 vehículos: asyncio.to_thread (libera el event loop).
@@ -419,6 +422,7 @@ class SimulationEngine:
                 )
             except Exception:
                 logger.exception("Error inesperado en update_vehicles_parallel; tick ignorado")
+        st.split("physics_total_ms")
 
         # 4c. Registrar colisiones recién detectadas como incidentes ACCIDENT.
         if self._incident_manager is not None and pending_collisions:
@@ -438,6 +442,7 @@ class SimulationEngine:
             asyncio.create_task(
                 self._incident_manager.process_expired(expired_incidents)
             )
+        st.split("incident_post_ms")
 
         # 4b. Recálculo periódico de pesos dinámicos por saturación en rotondas
         #     (Fase 6). Penaliza en A* las aristas de anillos con mucha ocupación
@@ -449,6 +454,7 @@ class SimulationEngine:
             and self._tick_count % DYNAMIC_WEIGHTS_TICK_INTERVAL == 0
         ):
             self._recompute_dynamic_weights()
+        st.split("dynamic_weights_ms")
 
         # 5. Broadcast vehicle_finished + eliminar vehículos completados
         for vid in finished_ids:
@@ -458,6 +464,7 @@ class SimulationEngine:
                 self._spawner.remove_vehicle(vid)
 
         self._vehicles_active = self._spawner.active_count if self._spawner else 0
+        st.split("vehicle_finished_ms")
 
         # Broadcast tick — decoupleado del critical path. Esperamos a que el
         # broadcast del tick ANTERIOR termine (si aún está en marcha) y después
@@ -481,6 +488,7 @@ class SimulationEngine:
                     sim_time=self._simulation_time,
                 )
             )
+        st.split("broadcast_schedule_ms")
 
         # 6. Broadcast estados de semáforos (a menor frecuencia que los ticks)
         if (
@@ -491,6 +499,9 @@ class SimulationEngine:
             await self._broadcaster.broadcast_traffic_lights(
                 self._tl_controller.get_snapshot()
             )
+        st.split("tl_broadcast_ms")
+
+        st.emit()
 
     def _recompute_dynamic_weights(self) -> None:
         """
