@@ -1689,6 +1689,7 @@ def update_vehicles(
                     _trigger_collision(
                         vehicle, other, blocked_edges, pending_collisions
                     )
+                    registry.inc("phys.collisions")
                     registry.inc(
                         f"phys.collision.{_classify_collision_segment(vehicle, graph, tick_count)}"
                     )
@@ -2143,6 +2144,7 @@ async def update_vehicles_parallel(
                 if ego.status != VehicleStatus.MOVING or other.status != VehicleStatus.MOVING:
                     continue
                 _trigger_collision(ego, other, blocked_edges, pending_collisions)
+                registry.inc("phys.collisions")
                 registry.inc(
                     f"phys.collision.{_classify_collision_segment(ego, graph, tick_count)}"
                 )

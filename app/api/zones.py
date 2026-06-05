@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.api.deps import get_zone_manager
@@ -54,7 +54,7 @@ class ZoneUpdateRequest(BaseModel):
 # =========================================================================
 
 
-@router.post("")
+@router.post("", status_code=status.HTTP_201_CREATED)
 async def create_zone(
     body: ZoneCreateRequest,
     mgr: ZoneManager = Depends(get_zone_manager),
