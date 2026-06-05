@@ -1,0 +1,38 @@
+{
+  "centroid": [
+    -4.83163,
+    39.96125
+  ],
+  "zbe": {
+    "M": 3000,
+    "rutas_validas": 2999,
+    "area_km2": 0.609,
+    "aristas_zona": 457,
+    "pct_base_cruzan_casco": 64.6,
+    "pct_truck_cruzan_casco": 28.7,
+    "trucks_reencaminados": 1077,
+    "trucks_sin_alternativa": 860,
+    "pct_evitan_de_los_que_cruzaban": 55.6,
+    "rodeo_medio_m": 888.5,
+    "rodeo_mediana_m": 930.4,
+    "long_media_base_m": 2173.9,
+    "rodeo_pct": 40.9
+  },
+  "flood": {
+    "M": 3000,
+    "arterias_cortadas": 6,
+    "flujo_base_en_arterias_rutas": 3162,
+    "rutas_afectadas": 1389,
+    "pct_afectadas": 46.3,
+    "reencaminadas_ok": 1389,
+    "sin_ruta_alternativa": 0,
+    "siguen_usando_corte_penalizado": 4,
+    "rodeo_medio_m": 90.6,
+    "rodeo_mediana_m": 105.1,
+    "rodeo_pct": 4.2
+  },
+  "graph": {
+    "nodes": 5879,
+    "edges": 3388
+  }
+}
