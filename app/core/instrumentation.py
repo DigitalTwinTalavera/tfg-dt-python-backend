@@ -10,14 +10,20 @@ Centraliza:
     a 4000 vehículos × 5 Hz.
   - time_block: context manager para medir bloques fuera del hot path.
 
-Sin locks: el tick es single-thread async; los reportes se generan bajo
-demanda desde el mismo event loop. Si prometheus_client está instalado,
-las observaciones se duplican ahí para soporte nativo de scraping.
+Thread-safety: bajo el path paralelo de física, los workers (uno por celda
+espacial) llaman ``inc``/``record``/``gauge`` concurrentemente desde hilos
+distintos al main. Un único ``_REGISTRY_LOCK`` protege las mutaciones — las
+llamadas son frecuentes pero la sección crítica es trivial (un dict update),
+así que la contention es despreciable frente al coste IDM. Si
+prometheus_client está instalado, sus primitivas son internamente
+thread-safe y no requieren protección adicional.
 """
 
 from __future__ import annotations
 
 import math
+import os
+import threading
 import time
 from collections import deque
 from contextlib import contextmanager
@@ -30,12 +36,36 @@ except ImportError:
     _prom = None  # type: ignore[assignment]
     _PROM_AVAILABLE = False
 
+# Opt-out a las llamadas a prometheus_client en el hot path. El registry sigue
+# guardando muestras en memoria para `/api/simulation/metrics`, pero los
+# observe/inc/set de prometheus_client (que toman su propio lock interno y
+# añaden coste medible a 2000+ veh × 5 Hz) se cortocircuitan. El endpoint
+# `/metrics` sigue funcionando vacío. Útil cuando no se exporta a Prometheus.
+_PROM_EMIT = _PROM_AVAILABLE and os.getenv("SIM_PROM_DISABLED", "").lower() not in (
+    "1", "true", "yes", "on",
+)
+
+# Sampling de SplitTimer per-vehicle. Cuando > 1, sólo se mide 1 de cada N
+# vehículos en el bucket y los splits se ESCALAN por N al emitir, manteniendo
+# la magnitud cross-veh estimada. Reduce el overhead de `perf_counter_ns()`
+# (7 calls × 6000 veh × 5 Hz = 210k/s) cuando la instrumentación domina.
+# Default 1 = sin sampling, splits exactos.
+try:
+    _SPLIT_SAMPLE_EVERY = max(1, int(os.getenv("SIM_SPLIT_SAMPLE_EVERY", "1")))
+except ValueError:
+    _SPLIT_SAMPLE_EVERY = 1
+
 
 _DEFAULT_BUFFER_SIZE = 2048
 
 _PROM_BUCKETS_SECONDS: tuple[float, ...] = (
     0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0,
 )
+
+# Lock global para todas las mutaciones de MetricsRegistry. Una sola instancia
+# de registry vive a nivel de módulo y los workers del path paralelo escriben
+# en ella concurrentemente.
+_REGISTRY_LOCK = threading.Lock()
 
 
 _PROM_NAME_TRANS = str.maketrans({".": "_", "-": "_"})
@@ -81,21 +111,22 @@ class MetricsRegistry:
 
     # ---- Histograms (record en ms) ----
     def record(self, name: str, value_ms: float) -> None:
-        d = self._hist.get(name)
-        if d is None:
-            d = deque(maxlen=self._buffer_size)
-            self._hist[name] = d
-        d.append(value_ms)
-        if _PROM_AVAILABLE:
-            h = self._prom_hists.get(name)
-            if h is None:
-                h = _prom.Histogram(  # type: ignore[union-attr]
-                    f"sim_{_prom_name(name)}_seconds",
-                    f"Histogram for {name} (seconds).",
-                    buckets=_PROM_BUCKETS_SECONDS,
-                )
-                self._prom_hists[name] = h
-            h.observe(value_ms / 1000.0)  # type: ignore[attr-defined]
+        with _REGISTRY_LOCK:
+            d = self._hist.get(name)
+            if d is None:
+                d = deque(maxlen=self._buffer_size)
+                self._hist[name] = d
+            d.append(value_ms)
+            if _PROM_EMIT:
+                h = self._prom_hists.get(name)
+                if h is None:
+                    h = _prom.Histogram(  # type: ignore[union-attr]
+                        f"sim_{_prom_name(name)}_seconds",
+                        f"Histogram for {name} (seconds).",
+                        buckets=_PROM_BUCKETS_SECONDS,
+                    )
+                    self._prom_hists[name] = h
+                h.observe(value_ms / 1000.0)  # type: ignore[attr-defined]
 
     def record_many(self, samples_ms: dict[str, float]) -> None:
         for name, v in samples_ms.items():
@@ -103,29 +134,31 @@ class MetricsRegistry:
 
     # ---- Counters (monotónicos) ----
     def inc(self, name: str, by: float = 1.0) -> None:
-        self._counters[name] = self._counters.get(name, 0.0) + by
-        if _PROM_AVAILABLE:
-            c = self._prom_counters.get(name)
-            if c is None:
-                c = _prom.Counter(  # type: ignore[union-attr]
-                    f"sim_{_prom_name(name)}_total",
-                    f"Counter for {name}.",
-                )
-                self._prom_counters[name] = c
-            c.inc(by)  # type: ignore[attr-defined]
+        with _REGISTRY_LOCK:
+            self._counters[name] = self._counters.get(name, 0.0) + by
+            if _PROM_EMIT:
+                c = self._prom_counters.get(name)
+                if c is None:
+                    c = _prom.Counter(  # type: ignore[union-attr]
+                        f"sim_{_prom_name(name)}_total",
+                        f"Counter for {name}.",
+                    )
+                    self._prom_counters[name] = c
+                c.inc(by)  # type: ignore[attr-defined]
 
     # ---- Gauges (último valor) ----
     def gauge(self, name: str, value: float) -> None:
-        self._gauges[name] = value
-        if _PROM_AVAILABLE:
-            g = self._prom_gauges.get(name)
-            if g is None:
-                g = _prom.Gauge(  # type: ignore[union-attr]
-                    f"sim_{_prom_name(name)}",
-                    f"Gauge for {name}.",
-                )
-                self._prom_gauges[name] = g
-            g.set(value)  # type: ignore[attr-defined]
+        with _REGISTRY_LOCK:
+            self._gauges[name] = value
+            if _PROM_EMIT:
+                g = self._prom_gauges.get(name)
+                if g is None:
+                    g = _prom.Gauge(  # type: ignore[union-attr]
+                        f"sim_{_prom_name(name)}",
+                        f"Gauge for {name}.",
+                    )
+                    self._prom_gauges[name] = g
+                g.set(value)  # type: ignore[attr-defined]
 
     # ---- Snapshot ----
     def snapshot(self) -> dict:
@@ -199,13 +232,17 @@ class SplitTimer:
         st.emit("phys.")    # registry.record("phys.a", ms), ...
     """
 
-    __slots__ = ("_t", "acc")
+    __slots__ = ("_t", "acc", "_iter", "_active")
 
     def __init__(self) -> None:
         self._t = time.perf_counter_ns()
         self.acc: dict[str, int] = {}
+        self._iter = 0
+        self._active = _SPLIT_SAMPLE_EVERY == 1
 
     def split(self, name: str) -> None:
+        if not self._active:
+            return
         now = time.perf_counter_ns()
         self.acc[name] = self.acc.get(name, 0) + (now - self._t)
         self._t = now
@@ -214,20 +251,30 @@ class SplitTimer:
         """
         Resetea solo el cronómetro sin tocar acumuladores. Útil al inicio de
         cada iteración para que el overhead de control de flujo entre splits
-        no se atribuya al primer subsistema medido.
+        no se atribuya al primer subsistema medido. Si `SIM_SPLIT_SAMPLE_EVERY`
+        > 1, decide aquí si este iteración se muestrea.
         """
+        if _SPLIT_SAMPLE_EVERY > 1:
+            self._iter += 1
+            self._active = (self._iter % _SPLIT_SAMPLE_EVERY) == 0
+            if not self._active:
+                return
         self._t = time.perf_counter_ns()
 
     def restart(self) -> None:
         """Resetea cronómetro y acumulador (para reciclar entre ticks)."""
         self._t = time.perf_counter_ns()
         self.acc = {}
+        self._iter = 0
 
     def emit(self, prefix: str = "") -> None:
+        # Escalar por el factor de sampling para preservar magnitud cross-veh.
+        scale = _SPLIT_SAMPLE_EVERY
         for name, ns in self.acc.items():
-            registry.record(f"{prefix}{name}", ns / 1_000_000.0)
+            registry.record(f"{prefix}{name}", (ns * scale) / 1_000_000.0)
         self.acc = {}
         self._t = time.perf_counter_ns()
+        self._iter = 0
 
 
 @contextmanager

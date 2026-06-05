@@ -105,6 +105,14 @@ class RoadNetworkGraph:
         self._roundabout_length: dict[int, float] = {}
         # Pesos dinámicos (Fase 6): multiplicador aplicado a edge_weight en A*.
         self._dynamic_weights: dict[tuple[int, int], float] = {}
+        # Cache de edge attributes para evitar `dict(self._graph.edges[u, v])`
+        # repetido — el hot path de física llama 10-15 veces por veh por tick.
+        # Las attrs son inmutables tras `build_from_database`, así que cacheamos
+        # la MISMA referencia (todos los consumers leen, ninguno muta). Bajo
+        # free-threading: writes y reads del dict son atómicos, peor caso =
+        # rebuild doble del mismo key, correctness OK.
+        self._edge_attrs_cache: dict[tuple[int, int], dict[str, Any]] = {}
+        self._node_attrs_cache: dict[int, dict[str, Any]] = {}
 
     @property
     def graph(self) -> nx.DiGraph:
@@ -157,12 +165,23 @@ class RoadNetworkGraph:
 
         # Clear existing graph
         self._graph.clear()
+        self._edge_attrs_cache.clear()
+        self._node_attrs_cache.clear()
 
         # Load nodes
         await self._load_nodes(session, active_only)
 
         # Load edges
         await self._load_edges(session, active_only)
+
+        # Pre-poblar la caché de segmentos por arista antes de que los workers
+        # del path paralelo la consulten. Bajo free-threading, escrituras
+        # concurrentes a un dict global durante un resize pueden corromperlo,
+        # así que llenamos toda la caché en main thread aquí.
+        from app.core.vehicle_physics import prewarm_segment_cache
+
+        n_cached = prewarm_segment_cache(self)
+        logger.info("Pre-warmed segment cache: %d edges", n_cached)
 
         # Diagnóstico: cobertura de TLs (endpoint vs mid-way). Un porcentaje
         # alto de mid-way TLs sin detectar en edges indica mismatch de coordenadas.
@@ -1095,32 +1114,39 @@ class RoadNetworkGraph:
 
     def get_node_attributes(self, node_id: int) -> dict[str, Any]:
         """
-        Get all attributes of a node.
-
-        Args:
-            node_id: The node ID
-
-        Returns:
-            Dictionary of node attributes, empty dict if node not found
+        Cached lookup — devuelve la MISMA referencia (los consumers leen, no
+        mutan). Cacheado permanentemente: los attrs son inmutables tras
+        `build_from_database`.
         """
+        cached = self._node_attrs_cache.get(node_id)
+        if cached is not None:
+            return cached
         if node_id not in self._graph:
-            return {}
-        return dict(self._graph.nodes[node_id])
+            empty: dict[str, Any] = {}
+            self._node_attrs_cache[node_id] = empty
+            return empty
+        attrs = dict(self._graph.nodes[node_id])
+        self._node_attrs_cache[node_id] = attrs
+        return attrs
 
     def get_edge_attributes(self, start_id: int, end_id: int) -> dict[str, Any]:
         """
-        Get all attributes of an edge.
-
-        Args:
-            start_id: Start node ID
-            end_id: End node ID
-
-        Returns:
-            Dictionary of edge attributes, empty dict if edge not found
+        Cached lookup de attrs por arista. Devuelve la MISMA referencia
+        cacheada en cada llamada (los consumers leen, no mutan). Empty dict
+        para aristas inexistentes también se cachea, así que llamadas
+        repetidas a aristas inválidas tampoco hacen `has_edge` cada vez.
         """
+        key = (start_id, end_id)
+        cached = self._edge_attrs_cache.get(key)
+        if cached is not None:
+            return cached
         if not self._graph.has_edge(start_id, end_id):
-            return {}
-        return dict(self._graph.edges[start_id, end_id])
+            empty: dict[str, Any] = {}
+            self._edge_attrs_cache[key] = empty
+            return empty
+        attrs = dict(self._graph.edges[start_id, end_id])
+        self._edge_attrs_cache[key] = attrs
+        return attrs
 
     def get_all_node_ids(self) -> list[int]:
         """Get all node IDs in the graph."""

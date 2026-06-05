@@ -261,17 +261,15 @@ PERIODIC_REROUTE_BATCH_SIZE: int = 50
 # 200 vehículos × 50 ticks = 10000 visitas en 5 s — cubre flotas de 4000 con
 # margen y mantiene los picos por tick por debajo del presupuesto (cada
 # `_maybe_reroute_around_blocks` es ~0.1 ms cuando la ruta ya es válida).
-URGENT_REROUTE_BATCH_SIZE: int = 200
+URGENT_REROUTE_BATCH_SIZE: int = 100
 URGENT_REROUTE_TTL_TICKS: int = 50
 
 # Cap duro de llamadas a A* (compute_route) por tick desde el periodic batch.
-# Cada A* en un grafo real puede costar 5-50 ms; sin cap, una activación de
-# ZBE que afecte a 100+ vehículos genera spikes catastróficos (tick >> 200 ms,
-# tirones obvios). El cap permite que el batch ESCANEE muchos vehículos baratos
-# (route-intersection check) pero ABORTE más A* cuando el presupuesto se agota.
-# Coverage degrada elegantemente: vehículos no servidos en este tick pasan al
-# siguiente vía el cursor rotatorio.
-PERIODIC_REROUTE_ASTAR_CAP_PER_TICK: int = 20
+# Bajado de 20 a 10 tras medir `phys.reroute_periodic_batch_ms` p99 = 58 ms a
+# 2k veh: con 10 A* el pico cae a ~30 ms, suficiente headroom dentro del
+# presupuesto de 250 ms del tick. Cobertura tarda más en ciclar, pero el
+# cursor rotatorio garantiza que TODOS los veh acaban revisándose.
+PERIODIC_REROUTE_ASTAR_CAP_PER_TICK: int = 10
 
 # Cache settings
 GRAPH_CACHE_TTL_SECONDS = 300  # 5 minutes
@@ -469,23 +467,48 @@ MAX_EMERGENCY_DECEL_MS2: float = 8.0    # physical braking cap (m/s²)
 DEFAULT_VEHICLE_SPEED_KMH: float = 50.0 # default desired speed in km/h
 MIN_EDGE_LENGTH_M: float = 0.1          # prevent division by zero
 VEHICLE_PHYSICS_PARALLEL_THRESHOLD: int = 500
+# Resolución de la cuadrícula espacial para el bucketing de vehículos por
+# zona en `update_vehicles_parallel`. 8×8 = 64 celdas sobre el bbox del grafo;
+# con ~os.cpu_count() hilos esto da work-stealing efectivo (LPT scheduling)
+# incluso si una zona urbana concentra el 60 % de la flota.
+ZONE_GRID_CELLS_PER_AXIS: int = 8
+# Tamaño máximo de un bucket espacial antes de partirlo en sub-buckets. Sin
+# este corte, una celda céntrica con 600+ vehículos consume un único worker
+# durante todo el tick mientras los demás hilos esperan en `asyncio.gather`.
+# Los sub-buckets se forman ordenando por (edge_key, progress_on_edge), de
+# modo que vehículos del mismo edge contiguos quedan en el mismo sub-bucket;
+# el líder cross-sub-bucket sigue siendo visible vía `edge_index` global.
+# Con `os.cpu_count()` típicamente ~20, MAX_BUCKET_SIZE=80 da hasta 75
+# sub-buckets a 6000 veh — 3-4 por worker — y minimiza la varianza de
+# wallclock entre workers post-gather.
+MAX_BUCKET_SIZE: int = 80
 # Distancia (m) sobre la que se mezcla la tangente final de la arista saliente
 # con la inicial de la entrante al cambiar de arista. Elimina el snap visible
 # de heading en cruces sin curvar el movimiento más de lo necesario.
 EDGE_HEADING_BLEND_DIST_M: float = 3.0
-# Cada cuántos ticks se evalúa MOBIL por vehículo. Con tick=200 ms (5 Hz), un
-# valor de 20 corresponde a 4 s: suficiente para que un cambio de carril sea
-# reactivo sin saturar CPU. MOBIL corre en el main thread (workers no tienen
-# edge_index completo), así que bajar su frecuencia es el mayor win CPU-side
-# con miles de vehículos. 4 s es coherente con el tiempo de decisión humano
-# para un cambio de carril discrecional en tráfico medio.
-MOBIL_EVAL_INTERVAL_TICKS: int = 20
+# Cada cuántos ticks se evalúa MOBIL por vehículo. Con tick=250 ms (4 Hz), un
+# valor de 60 corresponde a 15 s entre decisiones discrecionales — alineado
+# con el horizonte de planificación de un conductor humano (no cambia de
+# carril por capricho cada 5 segundos). Subido de 40→60 tras medir
+# `phys.mobil_ms` p99 acumulado >9 s a 4000 vehículos.
+MOBIL_EVAL_INTERVAL_TICKS: int = 60
+# Cooldown SECUNDARIO cuando el vehículo está atrapado en un carril cerrado.
+# Antes el `trapped_p` bypasseaba el cooldown completamente → MOBIL corría
+# cada tick (250 ms) para todos los veh atrapados, lo que explota a escala
+# 4000+ veh con colisiones acumuladas. Con valor 15 un veh atrapado intenta
+# salir cada 15 ticks (3.75 s a 4 Hz) — sigue siendo reactivo en términos
+# de evacuación (humano tarda 2-4 s en decidir cambio forzado) y baja MOBIL
+# por debajo del cuello dominante. Subido de 5→15 tras medir 4k_v3 con
+# `phys.mobil_ms` p99 acum 9515 ms.
+MOBIL_TRAPPED_EVAL_INTERVAL_TICKS: int = 15
 # Velocidad mínima por debajo de la cual saltamos la evaluación de MOBIL. Un
 # vehículo casi parado no tiene incentivo IDM para cambiar de carril (la
 # ganancia de aceleración es despreciable), así que el coste de construir el
 # contexto y llamar al modelo es puro waste. Con 4000-6000 vehículos en ciudad
-# gran parte está parada o rodando a <10 km/h en cada tick.
-MOBIL_MIN_VELOCITY_MS: float = 3.0
+# gran parte está parada o rodando a <10 km/h en cada tick. Subido de 3→5 m/s
+# (18 km/h) tras medir que la mayoría del coste de MOBIL viene de veh en
+# colas/atascos donde el cambio de carril no tiene ganancia.
+MOBIL_MIN_VELOCITY_MS: float = 5.0
 # No re-evaluar MOBIL en los últimos metros de una arista: la transición ya
 # reasigna el carril (min(lane, new_lanes-1)) y un cambio aquí sería inútil.
 MOBIL_MIN_DIST_TO_EDGE_END_M: float = 15.0

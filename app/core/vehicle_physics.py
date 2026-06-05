@@ -27,11 +27,12 @@ Fórmula de heading (bearing de brújula):
 from __future__ import annotations
 
 import asyncio
+import bisect
 import concurrent.futures
 import logging
 import math
-import multiprocessing
 import os
+import threading
 import time
 from app.core.constants import (
     ATTR_CURVE_VMAX,
@@ -71,6 +72,7 @@ from app.core.constants import (
     MIN_EDGE_LENGTH_M,
     MIN_ROUNDABOUT_RADIUS_M,
     MOBIL_EVAL_INTERVAL_TICKS,
+    MOBIL_TRAPPED_EVAL_INTERVAL_TICKS,
     MOBIL_MIN_VELOCITY_MS,
     MOBIL_MIN_DIST_TO_EDGE_END_M,
     TL_PHASE_GREEN,
@@ -102,14 +104,14 @@ logger = logging.getLogger(__name__)
 _EARTH_RADIUS_M: float = 6_371_000.0
 
 # Un IDMModel por tipo de vehículo. Stateless tras construcción → seguro para
-# multiprocessing. Se indexa por VehicleType para evitar la construcción
-# repetida en el hot-path del tick.
+# acceso concurrente desde múltiples hilos. Se indexa por VehicleType para
+# evitar la construcción repetida en el hot-path del tick.
 _IDM_BY_TYPE: dict[VehicleType, IDMModel] = {
     vtype: IDMModel(profile.idm) for vtype, profile in PROFILES.items()
 }
 
 # MOBILModel por tipo de vehículo (usa los mismos IDMParameters que el IDM).
-# Stateless tras construcción → seguro para multiprocessing.
+# Stateless tras construcción → seguro para acceso concurrente desde hilos.
 _MOBIL_BY_TYPE: dict[VehicleType, MOBILModel] = {
     vtype: MOBILModel(idm_params=profile.idm) for vtype, profile in PROFILES.items()
 }
@@ -125,7 +127,34 @@ def _idm_for(vehicle: SimVehicle) -> IDMModel:
     return _IDM_BY_TYPE[vehicle.vtype]
 
 # Caché de longitudes de segmentos por arista (start_node, end_node).
+# Pre-poblada en `prewarm_segment_cache` al cargar el grafo: durante el tick
+# los workers solo leen este dict, evitando races bajo free-threading en el
+# resize que provocaría una escritura concurrente.
 _SEG_CACHE: dict[tuple[int, int], tuple[list[float], float]] = {}
+
+
+def prewarm_segment_cache(graph: RoadNetworkGraph) -> int:
+    """
+    Pre-popula ``_SEG_CACHE`` con los lengths por segmento de cada arista
+    con waypoints. Idempotente: re-llamarlo sobre el mismo grafo no escribe.
+
+    Devuelve el número de entradas añadidas.
+
+    Llamado desde ``RoadNetworkGraph.build_from_database`` tras cargar las
+    aristas. Sin este pre-warm, dos workers podrían escribir simultáneamente
+    en ``_SEG_CACHE`` durante el primer tick post-load — bajo free-threading
+    eso puede corromper la estructura interna del dict en un resize.
+    """
+    added = 0
+    for u, v, attrs in graph.graph.edges(data=True):
+        waypoints = attrs.get(ATTR_WAYPOINTS)
+        if not waypoints or len(waypoints) < 2:
+            continue
+        key = (u, v)
+        if key not in _SEG_CACHE:
+            _SEG_CACHE[key] = _waypoint_segments(waypoints)
+            added += 1
+    return added
 
 
 # ---------------------------------------------------------------------------
@@ -304,12 +333,16 @@ def _build_edge_index(
     vehicles: dict[str, SimVehicle],
 ) -> "dict[tuple[int, int], dict[int, list[SimVehicle]]]":
     """
-    Construye un índice {(start_node, end_node): {lane: [veh DESC por progress]}}.
+    Índice {(start_node, end_node): {lane: [veh ASC por progress]}}.
 
-    Permite encontrar el líder en el mismo carril en O(k_lane), donde
-    k_lane es el número de vehículos del MISMO carril en la arista (típicamente
-    1-3). Antes la lista era plana por edge, así que el peor caso (50 veh en
-    lane=1, ego en lane=0 sin líder) recorría las 50 antes de devolver None.
+    Listas ordenadas ASC permiten dos optimizaciones en `_find_leader`:
+      - Same-lane: `bisect_right(lane_list, ego.progress, key=progress)` da el
+        primer veh con progress > ego en O(log k); ese es el líder real (el
+        más cercano por delante).
+      - Lookahead next-edge sin ring: el primer elemento de cada lane es el
+        de menor progress (más cerca del inicio del edge → el que más molesta
+        al ego que llega). Iterar `lane_list[0]` para cada lane es O(n_lanes)
+        en vez de O(N_next_edge).
 
     Solo incluye vehículos activos (no FINISHED).
     """
@@ -323,11 +356,32 @@ def _build_edge_index(
             key = (node_path[ei], node_path[ei + 1])
             lane = getattr(v, "lane", 0)
             index.setdefault(key, {}).setdefault(lane, []).append(v)
-    # Ordenar cada lista de carril por progreso descendente
     for lanes_dict in index.values():
         for lane_list in lanes_dict.values():
-            lane_list.sort(key=lambda v: v.progress_on_edge, reverse=True)
+            lane_list.sort(key=_vehicle_progress)
     return index
+
+
+def _vehicle_progress(v: SimVehicle) -> float:
+    """Key estable para sort/bisect por progress_on_edge."""
+    return v.progress_on_edge
+
+
+def _build_converging_edges_index(
+    edge_index: "dict[tuple[int, int], dict[int, list[SimVehicle]]]",
+) -> dict[int, list[tuple[int, int]]]:
+    """
+    {end_node: [(u, end_node) con vehículos activos]}.
+
+    `_check_stop_yield_sign` YIELD necesita iterar las aristas que convergen
+    al mismo nodo. Sin este índice, cada veh con YIELD escanea TODO el
+    `edge_index` — O(E×N) cross-veh. Con el índice, O(deg_in(end_node)),
+    típicamente 2-4 aristas en un cruce urbano.
+    """
+    out: dict[int, list[tuple[int, int]]] = {}
+    for (u, w) in edge_index.keys():
+        out.setdefault(w, []).append((u, w))
+    return out
 
 
 def _find_leader(
@@ -353,14 +407,20 @@ def _find_leader(
 
     ego_lane = getattr(vehicle, "lane", 0)
     same_lane_list = edge_index.get(key, {}).get(ego_lane, [])
-    for candidate in same_lane_list:
-        if candidate.id == vehicle.id:
-            continue
-        if candidate.progress_on_edge > vehicle.progress_on_edge:
+    if same_lane_list:
+        # Lista ASC: el primer índice con progress > ego.progress es el líder
+        # más cercano por delante. Si coincide con ego, mirar al siguiente
+        # (el ego está incluido en la lista).
+        idx = bisect.bisect_right(
+            same_lane_list, vehicle.progress_on_edge, key=_vehicle_progress
+        )
+        if idx < len(same_lane_list) and same_lane_list[idx].id == vehicle.id:
+            idx += 1
+        if idx < len(same_lane_list):
+            candidate = same_lane_list[idx]
             cand_len = getattr(candidate, "length_m", VEHICLE_LENGTH_M)
             raw_gap = (candidate.progress_on_edge - vehicle.progress_on_edge) * edge_len - cand_len
             if raw_gap <= 0.0:
-                # Overlap geométrico: parada de emergencia — forzar velocidad cero
                 return NeighborInfo(gap_m=0.01, velocity_ms=0.0, leader_id=candidate.id)
             return NeighborInfo(gap_m=raw_gap, velocity_ms=candidate.velocity, leader_id=candidate.id)
 
@@ -416,22 +476,27 @@ def _find_leader(
                 and edge_attrs.get(ATTR_ROUNDABOUT_ID) == next_attrs.get(ATTR_ROUNDABOUT_ID)
                 and edge_attrs.get(ATTR_ROUNDABOUT_ID) is not None
             )
+            first_on_next: "SimVehicle | None" = None
             if same_ring:
-                candidates_next = next_lanes_dict.get(ego_lane, [])
+                lst = next_lanes_dict.get(ego_lane)
+                if lst:
+                    first_on_next = lst[0]
             elif is_entry:
                 # El ego entrará en un carril determinista según su ruta; los
                 # circulantes del anillo en otro carril no le afectan.
                 ego_target_lane = _target_roundabout_lane(vehicle, graph)
-                candidates_next = next_lanes_dict.get(ego_target_lane, [])
+                lst = next_lanes_dict.get(ego_target_lane)
+                if lst:
+                    first_on_next = lst[0]
             else:
-                # Sin anillo: cualquier carril del siguiente edge puede afectar
-                # (el lane se reasigna al cruzar). Aplanar las listas por carril.
-                candidates_next = [
-                    v for lst in next_lanes_dict.values() for v in lst
-                ]
-            if candidates_next:
-                # El que tiene menor progress está más cerca del inicio → el que más molesta.
-                first_on_next = min(candidates_next, key=lambda v: v.progress_on_edge)
+                # Sin anillo: el primer veh de cada lane (ASC) es el de menor
+                # progress; el mínimo entre esos es el que más molesta. O(n_lanes).
+                best_progress = float("inf")
+                for lst in next_lanes_dict.values():
+                    if lst and lst[0].progress_on_edge < best_progress:
+                        best_progress = lst[0].progress_on_edge
+                        first_on_next = lst[0]
+            if first_on_next is not None:
                 if first_on_next.id != vehicle.id:
                     dist_on_next = first_on_next.progress_on_edge * next_edge_len
                     leader_len = getattr(first_on_next, "length_m", VEHICLE_LENGTH_M)
@@ -463,9 +528,12 @@ def _build_ring_occupancy(
     """
     Índice {rotunda_id → vehículos que circulan actualmente en ese anillo}.
 
-    Se precomputa una vez por tick y lo reutiliza `_find_roundabout_yield_leader`
-    para evitar recorrer todas las aristas de la rotonda en cada candidato a
-    entrar.
+    Además, durante el mismo paso pre-computa para cada vehículo del ring un
+    cache `v._ring_arc_to_entry: dict[node_id, arc_m]` que mapea cada nodo
+    futuro de su ruta dentro del ring a la distancia arc que tiene que
+    recorrer para alcanzarlo. Esto elimina `_arc_distance_on_ring`
+    (O(L) por par ego×other) — `_find_roundabout_yield_leader` lo lee como
+    dict lookup O(1) sin volver a iterar rutas.
     """
     occ: dict[int, list[SimVehicle]] = {}
     for v in vehicles.values():
@@ -482,6 +550,18 @@ def _build_ring_occupancy(
         if rid is None:
             continue
         occ.setdefault(int(rid), []).append(v)
+        # Pre-cómputo del cache de arc-distances a nodos posteriores del ring.
+        edge_len = max(float(attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)
+        arc_cache: dict[int, float] = {}
+        arc = (1.0 - v.progress_on_edge) * edge_len
+        arc_cache[np_[ei + 1]] = arc
+        for j in range(ei + 1, len(np_) - 1):
+            a2 = graph.get_edge_attributes(np_[j], np_[j + 1])
+            if not a2.get(ATTR_IS_ROUNDABOUT):
+                break
+            arc += float(a2.get(ATTR_LENGTH, 0.0))
+            arc_cache[np_[j + 1]] = arc
+        v._ring_arc_to_entry = arc_cache  # type: ignore[attr-defined]
     return occ
 
 
@@ -498,11 +578,16 @@ def _target_roundabout_lane(
       - Si la ruta recorre ≥ 2 arcos → carril INTERIOR (lane n_lanes-1).
       - Si la primera arista del anillo es de 1 carril → 0.
 
-    Función pura (sin RNG) — puede llamarse varias veces por tick y cachearse.
+    Cacheada per-vehículo en `v._target_ring_lane_cache = (edge_idx, lane)`:
+    el resultado depende solo de la ruta y de `current_edge_index`, ambos
+    estables dentro del mismo tick. Al avanzar de edge se invalida solo.
     Devuelve 0 si el vehículo no tiene arista de anillo en su ruta.
     """
     np_ = v.route.node_path
     ei = v.current_edge_index
+    cached: tuple[int, int] | None = getattr(v, "_target_ring_lane_cache", None)
+    if cached is not None and cached[0] == ei:
+        return cached[1]
     # Localizar el primer arco de anillo a partir de la posición actual del vehículo.
     first_ring_k: int | None = None
     first_rid: int | None = None
@@ -515,6 +600,7 @@ def _target_roundabout_lane(
             first_n_lanes = max(int(attrs.get(ATTR_LANES, 1)), 1)
             break
     if first_ring_k is None or first_rid is None or first_n_lanes <= 1:
+        v._target_ring_lane_cache = (ei, 0)  # type: ignore[attr-defined]
         return 0
     # Contar arcos consecutivos con el mismo rid hasta la primera arista no-anillo.
     ring_arc_count = 0
@@ -527,9 +613,9 @@ def _target_roundabout_lane(
             ring_arc_count += 1
         else:
             break
-    if ring_arc_count <= 1:
-        return 0  # carril exterior: saldrá en la próxima
-    return first_n_lanes - 1  # carril interior: dará (al menos) un arco más
+    result = 0 if ring_arc_count <= 1 else first_n_lanes - 1
+    v._target_ring_lane_cache = (ei, result)  # type: ignore[attr-defined]
+    return result
 
 
 def _build_entry_arm_index(
@@ -669,10 +755,13 @@ def _find_roundabout_yield_leader(
         # Otro carril del anillo: trayectorias paralelas, no conflictan.
         if getattr(other, "lane", 0) != ego_target_lane:
             continue
-        # `_arc_distance_on_ring` respeta la direccionalidad del anillo y
-        # devuelve inf si la ruta del otro no pasa por nuestro entry_node.
-        arc = _arc_distance_on_ring(other, entry_node, graph)
-        if math.isinf(arc):
+        # Lookup O(1) en el cache pre-computado durante `_build_ring_occupancy`.
+        # Si entry_node no está en el cache, `other` no pasa por él en su ruta.
+        arc_cache: dict[int, float] | None = getattr(other, "_ring_arc_to_entry", None)
+        if arc_cache is None:
+            continue
+        arc = arc_cache.get(entry_node)
+        if arc is None:
             continue
         # Con `other.velocity` muy baja el TTC crece — tope inferior 1 m/s evita
         # generar leaders perpetuos cuando alguien circula a paso de humano.
@@ -1448,6 +1537,7 @@ def update_vehicles(
 
     with time_block("phys.build_edge_index_ms"):
         edge_index = _build_edge_index(vehicles)
+        converging_edges = _build_converging_edges_index(edge_index)
     with time_block("phys.build_ring_occupancy_ms"):
         ring_occupancy = _build_ring_occupancy(vehicles, graph)
     with time_block("phys.build_entry_arm_index_ms"):
@@ -1499,7 +1589,9 @@ def update_vehicles(
         if yield_leader is not None and (leader is None or yield_leader.gap_m < leader.gap_m):
             leader = yield_leader
         st.split("round_yield_ms")
-        sign_leader = _check_stop_yield_sign(vehicle, graph, edge_index, dt)
+        sign_leader = _check_stop_yield_sign(
+            vehicle, graph, edge_index, dt, converging_edges=converging_edges
+        )
         if sign_leader is not None and (leader is None or sign_leader.gap_m < leader.gap_m):
             leader = sign_leader
         st.split("sign_check_ms")
@@ -1539,13 +1631,18 @@ def update_vehicles(
             trapped_in_closed = vehicle.lane in closed_lanes.get(
                 (np_[ei], np_[ei + 1]), set()
             )
-        if vehicle.mobil_cooldown_ticks <= 0 or trapped_in_closed:
+        if vehicle.mobil_cooldown_ticks <= 0:
             _evaluate_lane_change(
                 vehicle, edge_index, graph, leader,
                 closed_lanes=closed_lanes, tick_count=tick_count,
             )
             vehicle.mobil_cooldown_ticks = MOBIL_EVAL_INTERVAL_TICKS
         else:
+            # Trapped en carril cerrado: acelerar la próxima eval al cooldown
+            # secundario en vez de bypassear el cooldown (que dispararía MOBIL
+            # cada tick para todos los trapped — cuello dominante a 4k+ veh).
+            if trapped_in_closed and vehicle.mobil_cooldown_ticks > MOBIL_TRAPPED_EVAL_INTERVAL_TICKS:
+                vehicle.mobil_cooldown_ticks = MOBIL_TRAPPED_EVAL_INTERVAL_TICKS
             vehicle.mobil_cooldown_ticks -= 1
         st.split("mobil_ms")
 
@@ -1650,227 +1747,212 @@ def update_vehicles(
 
 
 # ---------------------------------------------------------------------------
-# Lightweight TL proxy for parallel workers
+# Multi-thread parallel physics (ThreadPoolExecutor + zone bucketing)
 # ---------------------------------------------------------------------------
+#
+# Cada celda de la cuadrícula espacial (ver `app.core.spatial_partition`) se
+# procesa en un hilo del pool. Los workers comparten memoria con el main:
+# leen los índices globales (edge_index, ring_occupancy, entry_arms,
+# intersection_arms) construidos pre-dispatch y mutan in-place los
+# `SimVehicle` de su bucket. Sin serialización, sin IPC.
+#
+# Sincronización: un único `_COLLISION_LOCK` protege las mutaciones cross-
+# thread (trigger de colisión, append a `pending_collisions`, mutación de
+# `blocked_edges`). Las escrituras a campos del propio vehículo son owner-
+# thread: cada `SimVehicle` está en exactamente un bucket por tick.
+#
+# Free-threading (Python 3.14t): sin GIL los workers escalan linealmente con
+# cores. Bajo GIL clásico, la ganancia viene de eliminar el coste de IPC del
+# antiguo ProcessPoolExecutor (serialización + deserialización de cada
+# vehículo) — los workers se serializan en CPU pero las lecturas/escrituras
+# en memoria compartida son gratis.
 
-class _FrozenTL:
-    """
-    Snapshot inmutable de fases por arista para uso en procesos worker.
-
-    Estructura: `{node_id: {"u_v": phase, ...}}` — misma que
-    `TrafficLightController.get_snapshot()`. Los workers no tienen acceso al
-    controlador vivo; se les pasa este snapshot serializable.
-    """
-    __slots__ = ("_phases",)
-
-    def __init__(self, phases: dict[int, dict[str, str]]) -> None:
-        self._phases = phases
-
-    def get_phase_for_edge(self, node_id: int, incoming_edge: tuple[int, int]) -> str:
-        edges = self._phases.get(node_id)
-        if not edges:
-            return TL_PHASE_GREEN
-        key = f"{incoming_edge[0]}_{incoming_edge[1]}"
-        if key in edges:
-            return edges[key]
-        # Fallback: TL sin aristas entrantes registradas (mid-street OSM) → "*"
-        if "*" in edges:
-            return edges["*"]
-        return next(iter(edges.values()), TL_PHASE_GREEN)
-
-    def get_phase(self, node_id: int) -> str:
-        """Fase representativa del nodo (primera arista del diccionario)."""
-        edges = self._phases.get(node_id)
-        if not edges:
-            return TL_PHASE_GREEN
-        return next(iter(edges.values()))
+_COLLISION_LOCK = threading.Lock()
+_EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
 
 
-# ---------------------------------------------------------------------------
-# Multi-core parallel physics (ProcessPoolExecutor)
-# ---------------------------------------------------------------------------
-
-_worker_graph: "RoadNetworkGraph | None" = None  # type: ignore[name-defined]
-_EXECUTOR: concurrent.futures.ProcessPoolExecutor | None = None
-_EXECUTOR_GRAPH_ID: int = 0
-
-
-def _worker_init(graph: "RoadNetworkGraph") -> None:  # type: ignore[name-defined]
-    global _worker_graph
-    _worker_graph = graph
-
-
-def _ensure_executor(
-    graph: "RoadNetworkGraph",  # type: ignore[name-defined]
-) -> concurrent.futures.ProcessPoolExecutor:
-    global _EXECUTOR, _EXECUTOR_GRAPH_ID
-    gid = id(graph)
-    if _EXECUTOR is None or _EXECUTOR_GRAPH_ID != gid:
-        if _EXECUTOR is not None:
-            _EXECUTOR.shutdown(wait=False, cancel_futures=True)
-        _EXECUTOR = concurrent.futures.ProcessPoolExecutor(
-            max_workers=os.cpu_count(),
-            initializer=_worker_init,
-            initargs=(graph,),
-            mp_context=multiprocessing.get_context("spawn"),
+def _ensure_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Singleton lazy del pool de hilos. No requiere re-creación por grafo
+    (los workers no capturan estado del grafo; lo reciben por argumento)."""
+    global _EXECUTOR
+    if _EXECUTOR is None:
+        _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+            max_workers=os.cpu_count() or 1,
+            thread_name_prefix="phys",
         )
-        _EXECUTOR_GRAPH_ID = gid
     return _EXECUTOR
 
 
-def _vehicle_to_dict(
-    v: "SimVehicle",  # type: ignore[name-defined]
-    leader: "NeighborInfo | None" = None,
-    tl_phases: "dict[int, dict[str, str]] | None" = None,
-    blocked_edges_set: "set[tuple[int, int]] | None" = None,
-    closed_lanes: "dict[tuple[int, int], set[int]] | None" = None,
-) -> dict:
-    """Serializa los campos mutables de un SimVehicle para IPC entre procesos."""
-    return {
-        "id": v.id,
-        "status": v.status.value,
-        "node_path": v.route.node_path,
-        "edge_ids": v.route.edge_ids,
-        "current_edge_index": v.current_edge_index,
-        "progress_on_edge": v.progress_on_edge,
-        "velocity": v.velocity,
-        "acceleration": v.acceleration,
-        "longitude": v.longitude,
-        "latitude": v.latitude,
-        "heading": v.heading,
-        "desired_speed_ms": getattr(v, "desired_speed_ms", 13.89),
-        "yellow_runs_light": getattr(v, "yellow_runs_light", False),
-        "vtype": v.vtype.value,
-        "lane": getattr(v, "lane", 0),
-        "length_m": getattr(v, "length_m", VEHICLE_LENGTH_M),
-        "prev_edge_end_heading": getattr(v, "prev_edge_end_heading", -1.0),
-        # Líder pre-computado en el proceso principal para evitar
-        # la necesidad de reconstruir el edge_index en cada worker.
-        "leader_gap_m": leader.gap_m if leader is not None else None,
-        "leader_vel_ms": leader.velocity_ms if leader is not None else None,
-        # Snapshot completo de fases de semáforos para _FrozenTL en workers.
-        "tl_phases": tl_phases,
-        # Snapshot de bloqueos/carriles cerrados para hard-stop en workers.
-        # Solo el primer dict de cada chunk los lleva; el resto guarda None.
-        "blocked_edges": blocked_edges_set,
-        "closed_lanes": closed_lanes,
-    }
-
-
-def _process_chunk(
-    vehicle_dicts: list[dict], dt: float
-) -> tuple[list[dict], list[str], float]:
+def _process_bucket(
+    bucket: list[SimVehicle],
+    vehicles: dict[str, SimVehicle],
+    graph: RoadNetworkGraph,
+    dt: float,
+    edge_index: dict,
+    ring_occupancy: dict,
+    entry_arms: dict,
+    intersection_arms: dict,
+    tl_controller: object | None,
+    blocked_snapshot: frozenset[tuple[int, int]] | None,
+    blocked_edges: dict[tuple[int, int], object | None],
+    closed_lanes: dict[tuple[int, int], set[int]],
+    restricted_by_vtype: dict[str, set[tuple[int, int]]] | None,
+    pending_collisions: list[tuple[str, str, tuple[int, int]]],
+    tick_count: int,
+    converging_edges: dict[int, list[tuple[int, int]]] | None = None,
+) -> tuple[list[str], dict[str, int], list[tuple[str, str]]]:
     """
-    Worker-process entry point.
+    Worker thread: pipeline completo (líder + yields + MOBIL + colisión +
+    IDM) para un bucket de vehículos de una zona espacial.
 
-    Reconstruye SimVehicle ligeros desde dicts, avanza cada uno con IDM
-    usando el líder pre-computado, y devuelve los campos actualizados
-    más la lista de IDs terminados.
-
-    El hard-stop de semáforo se activa a través de _FrozenTL, reconstruido
-    desde la lista de nodos bloqueados serializada en el dict del vehículo.
-    Todos los vehículos del mismo chunk comparten el mismo snapshot, por lo
-    que se crea una sola instancia de _FrozenTL por chunk.
+    Mutaciones:
+      - Owner-thread sobre cada `SimVehicle` del bucket (velocity, lane,
+        position, status, timers). Safe sin lock — cada vehículo está en
+        exactamente un bucket.
+      - **No** dispara `_trigger_collision` (no toma lock global). Cuando
+        detecta una colisión sostenida, registra el par `(ego_id, other_id)`
+        en una lista local y devuelve la lista al main thread. Este aplica
+        los trigger en serie post-`asyncio.gather` (dedup natural por par).
 
     Returns:
-        Tuple de (updates, finished_ids, cpu_ms). El tercer elemento es el
-        tiempo CPU consumido por este chunk en el worker (para agregar
-        timings cross-process en el master).
+        (finished_ids_local, split_acc_ns, collision_candidates) —
+        - IDs terminados en este bucket.
+        - Acumuladores del SplitTimer (ns) para mergear en el main thread.
+        - Pares (ego_id, other_id) candidatos a colisión.
     """
-    import time as _time
-    _t0_ns = _time.perf_counter_ns()
-    from app.core.route import RouteInfo
-    from app.models.enums import VehicleStatus
-    from app.services.vehicle_spawner import SimVehicle
+    local_finished: list[str] = []
+    collision_candidates: list[tuple[str, str]] = []
+    st = SplitTimer()
 
-    finished_ids: list[str] = []
-    updates: list[dict] = []
+    for v in bucket:
+        # Defensa: otro hilo pudo marcar este veh. como COLLISION mid-tick
+        # si fue detectado como líder en una colisión cross-zone. En ese
+        # caso v.velocity ya está a 0 y debe saltarse el resto del pipeline.
+        if v.status != VehicleStatus.MOVING:
+            continue
 
-    # Reconstruir _FrozenTL desde el primer vehículo del chunk (todos comparten el mismo snapshot)
-    frozen_tl: _FrozenTL | None = None
-    blocked_lookup: set[tuple[int, int]] | None = None
-    closed_lanes_chunk: dict[tuple[int, int], set[int]] | None = None
-    if vehicle_dicts:
-        raw_phases = vehicle_dicts[0].get("tl_phases")
-        if raw_phases is not None:
-            # node_id keys llegan como int/str según IPC — normalizar a int
-            frozen_tl = _FrozenTL({int(k): v for k, v in raw_phases.items()})
-        raw_blocked = vehicle_dicts[0].get("blocked_edges")
-        if raw_blocked:
-            blocked_lookup = {(int(a), int(b)) for (a, b) in raw_blocked}
-        raw_closed = vehicle_dicts[0].get("closed_lanes")
-        if raw_closed:
-            closed_lanes_chunk = {
-                (int(a), int(b)): set(lanes) for (a, b), lanes in raw_closed.items()
-            }
+        st.mark()
 
-    for vd in vehicle_dicts:
-        node_path = vd["node_path"]
-        route = RouteInfo(
-            start_node_id=node_path[0] if node_path else 0,
-            end_node_id=node_path[-1] if node_path else 0,
-            node_path=node_path,
-            edge_ids=vd["edge_ids"],
-            length_m=0.0,
+        leader = _find_leader(v, edge_index, graph)
+        if tl_controller is not None:
+            tl_ldr = _check_traffic_light(v, graph, tl_controller)
+            if tl_ldr is not None and (leader is None or tl_ldr.gap_m < leader.gap_m):
+                leader = tl_ldr
+        st.split("leader_find_ms")
+
+        yield_ldr = _find_roundabout_yield_leader(v, graph, ring_occupancy, entry_arms)
+        if yield_ldr is not None and (leader is None or yield_ldr.gap_m < leader.gap_m):
+            leader = yield_ldr
+        st.split("round_yield_ms")
+
+        sign_ldr = _check_stop_yield_sign(
+            v, graph, edge_index, dt, converging_edges=converging_edges
         )
-        vtype_str = vd.get("vtype")
-        vtype_val = VehicleType(vtype_str) if vtype_str else VehicleType.CAR
-        v = SimVehicle(
-            id=vd["id"],
-            start_node_id=0,
-            end_node_id=0,
-            route=route,
-            status=VehicleStatus(vd["status"]),
-            current_edge_index=vd["current_edge_index"],
-            longitude=vd["longitude"],
-            latitude=vd["latitude"],
-            velocity=vd["velocity"],
-            acceleration=vd["acceleration"],
-            heading=vd["heading"],
-            progress_on_edge=vd["progress_on_edge"],
-            desired_speed_ms=vd.get("desired_speed_ms", 13.89),
-            yellow_runs_light=vd.get("yellow_runs_light", False),
-            vtype=vtype_val,
-            lane=vd.get("lane", 0),
-            length_m=vd.get("length_m", VEHICLE_LENGTH_M),
-            prev_edge_end_heading=vd.get("prev_edge_end_heading", -1.0),
-        )
+        if sign_ldr is not None and (leader is None or sign_ldr.gap_m < leader.gap_m):
+            leader = sign_ldr
+        st.split("sign_check_ms")
 
-        # Reconstruir líder pre-computado
-        leader: NeighborInfo | None = None
-        if vd.get("leader_gap_m") is not None:
-            leader = NeighborInfo(
-                gap_m=vd["leader_gap_m"],
-                velocity_ms=vd["leader_vel_ms"],
+        intersection_ldr = _check_intersection_yield(v, graph, intersection_arms)
+        if intersection_ldr is not None and (
+            leader is None or intersection_ldr.gap_m < leader.gap_m
+        ):
+            leader = intersection_ldr
+        st.split("intersection_yield_ms")
+
+        # Plan D2 — dead-wall detection: reroute inmediato si el líder está
+        # en COLLISION (su arista ya está en blocked_edges, pero la ruta
+        # propia puede haberse calculado antes del bloqueo).
+        if leader is not None and leader.leader_id is not None:
+            ldr_v = vehicles.get(leader.leader_id)
+            if ldr_v is not None and ldr_v.status == VehicleStatus.COLLISION:
+                _maybe_reroute_around_blocks(
+                    v,
+                    graph,
+                    blocked_edges,
+                    restricted_edges_by_vtype=restricted_by_vtype,
+                )
+
+        # MOBIL: cambio de carril cada N ticks o forzado si está atrapado en
+        # carril cerrado. Lectura de edge_index — sin contention bajo lectores
+        # concurrentes (el dict no se muta durante el tick).
+        np_ = v.route.node_path
+        ei = v.current_edge_index
+        trapped_p = False
+        if ei < len(np_) - 1:
+            trapped_p = v.lane in closed_lanes.get((np_[ei], np_[ei + 1]), set())
+        if v.mobil_cooldown_ticks <= 0:
+            _evaluate_lane_change(
+                v, edge_index, graph, leader,
+                closed_lanes=closed_lanes, tick_count=tick_count,
             )
+            v.mobil_cooldown_ticks = MOBIL_EVAL_INTERVAL_TICKS
+        else:
+            # Trapped: acelerar la próxima eval al cooldown secundario en vez
+            # de bypass total (que dispararía MOBIL cada tick a 4k+ veh).
+            if trapped_p and v.mobil_cooldown_ticks > MOBIL_TRAPPED_EVAL_INTERVAL_TICKS:
+                v.mobil_cooldown_ticks = MOBIL_TRAPPED_EVAL_INTERVAL_TICKS
+            v.mobil_cooldown_ticks -= 1
+        st.split("mobil_ms")
 
-        finished = _advance_vehicle_idm(
+        # Detección de colisión: gap pequeño sostenido + velocidad relativa
+        # (o solapamiento geométrico si ambos están casi parados).
+        in_round = False
+        if ei < len(np_) - 1:
+            cur_attrs = graph.get_edge_attributes(np_[ei], np_[ei + 1])
+            in_round = bool(cur_attrs.get(ATTR_IS_ROUNDABOUT))
+        gap_threshold = (
+            COLLISION_GAP_THRESHOLD_ROUNDABOUT_M
+            if in_round
+            else COLLISION_GAP_THRESHOLD_STRAIGHT_M
+        )
+
+        rel_speed = 0.0
+        if leader is not None:
+            rel_speed = abs(v.velocity - leader.velocity_ms)
+        is_geometric_overlap = (
+            leader is not None
+            and leader.leader_id is not None
+            and leader.gap_m <= 0.05
+            and leader.velocity_ms == 0.0
+            and v.velocity <= 0.2
+        )
+        too_close = (
+            leader is not None
+            and leader.leader_id is not None
+            and leader.gap_m < gap_threshold
+            and (rel_speed >= COLLISION_RELATIVE_SPEED_MIN_MS or is_geometric_overlap)
+            and v.status == VehicleStatus.MOVING
+        )
+
+        if too_close:
+            v.proximity_timer = getattr(v, "proximity_timer", 0.0) + dt
+            if v.proximity_timer >= COLLISION_PROXIMITY_DURATION_S:
+                other = vehicles.get(leader.leader_id)  # type: ignore[union-attr]
+                if other is not None and other.status == VehicleStatus.MOVING:
+                    # Sin lock: registramos el par y el main thread aplica el
+                    # trigger post-gather (deduplicado natural por par).
+                    collision_candidates.append((v.id, other.id))
+                    v.proximity_timer = 0.0
+                    st.split("collision_check_ms")
+                    continue  # no avanzar IDM este tick (será marcado COLLISION en main)
+        else:
+            v.proximity_timer = 0.0
+        st.split("collision_check_ms")
+
+        # IDM advance — mutación owner-thread sobre v.
+        if _advance_vehicle_idm(
             v,
-            _worker_graph,  # type: ignore[arg-type]
+            graph,
             dt,
             leader,
-            tl_ref=frozen_tl,
-            blocked_edges_set=blocked_lookup,
-            closed_lanes=closed_lanes_chunk,
-        )
-        if finished:
-            finished_ids.append(v.id)
-        updates.append({
-            "id": v.id,
-            "status": v.status.value,
-            "current_edge_index": v.current_edge_index,
-            "progress_on_edge": v.progress_on_edge,
-            "velocity": v.velocity,
-            "acceleration": v.acceleration,
-            "longitude": v.longitude,
-            "latitude": v.latitude,
-            "heading": v.heading,
-            "lane": v.lane,
-            "prev_edge_end_heading": v.prev_edge_end_heading,
-        })
+            tl_ref=tl_controller,
+            blocked_edges_set=blocked_snapshot,
+            closed_lanes=closed_lanes,
+        ):
+            local_finished.append(v.id)
+        st.split("idm_ms")
 
-    cpu_ms = (_time.perf_counter_ns() - _t0_ns) / 1_000_000.0
-    return updates, finished_ids, cpu_ms
+    return local_finished, dict(st.acc), collision_candidates
 
 
 async def update_vehicles_parallel(
@@ -1885,25 +1967,39 @@ async def update_vehicles_parallel(
     zone_manager: object | None = None,
 ) -> list[str]:
     """
-    Avanza todos los vehículos usando todos los cores disponibles.
+    Avanza todos los vehículos en paralelo bucketeando por zonas espaciales.
 
-    La detección de líderes y semáforos se realiza siempre en el proceso
-    principal (requiere visibilidad global de todos los vehículos), y los
-    resultados se pasan como datos a los workers para el cálculo IDM.
+    Pipeline:
+      1. Categorizar vehículos (FINISHED → pre_finished; COLLISION/PAUSED
+         entran al edge_index como obstáculo pero no se despachan).
+      2. Construir índices globales en main thread (edge_index, ring_occupancy,
+         entry_arms, intersection_arms).
+      3. Bucketear los `MOVING` por celda espacial (`SpatialGrid`), ordenados
+         DESC por tamaño (LPT) para work-stealing efectivo.
+      4. Despachar una tarea por bucket al `ThreadPoolExecutor`. Cada worker
+         ejecuta el pipeline completo (líder + yields + MOBIL + colisión +
+         IDM) sobre su bucket. Sin serialización, sin IPC.
+      5. Agregar `finished_ids` y métricas; ejecutar reroute post-tick.
 
-    - Con < _PARALLEL_THRESHOLD vehículos: asyncio.to_thread (sin IPC overhead).
-    - Con ≥ _PARALLEL_THRESHOLD: ProcessPoolExecutor con un chunk por core.
-    - Fallback automático a asyncio.to_thread si el ProcessPool falla.
+    Modos:
+      - n < `VEHICLE_PHYSICS_PARALLEL_THRESHOLD`: `asyncio.to_thread(update_vehicles)`.
+      - n >= threshold: bucketing por zona + ThreadPoolExecutor.
+      - Fallback automático al path secuencial si el pool falla.
+
+    Determinismo: el bucketing cambia el orden de procesamiento entre celdas,
+    por lo que MOBIL puede producir resultados ligeramente distintos entre
+    runs en flotas densas. La física por vehículo aislado es idéntica al
+    path secuencial.
 
     Returns:
         Lista de vehicle_ids que terminaron su ruta en este tick.
     """
-    from app.models.enums import VehicleStatus
+    from app.core.spatial_partition import ensure_grid
 
     n = len(vehicles)
 
-    # Snapshot del dict de restricciones por vtype. Reasignado en bloque por
-    # el ZoneManager, así que la referencia es estable durante el tick.
+    # Snapshot del dict de restricciones por vtype. El ZoneManager lo reasigna
+    # en bloque (no muta in-place), así que la referencia es estable durante el tick.
     restricted_by_vtype: dict[str, set[tuple[int, int]]] | None = None
     if zone_manager is not None:
         try:
@@ -1928,9 +2024,6 @@ async def update_vehicles_parallel(
         )
 
     try:
-        # ── Pre-compute leaders in main process ────────────────────────────────
-        # La detección requiere el estado global de todos los vehículos,
-        # por lo que no puede delegarse a workers independientes.
         if blocked_edges is None:
             blocked_edges = {}
         if closed_lanes is None:
@@ -1938,30 +2031,28 @@ async def update_vehicles_parallel(
         if pending_collisions is None:
             pending_collisions = []
 
-        # Snapshot previo: cualquier arista añadida durante este tick activará
-        # el auto-reroute de los vehículos cuya ruta pendiente la atraviese.
+        # Snapshot previo: las aristas añadidas durante este tick (por
+        # colisiones detectadas en workers) activarán auto-reroute post-tick.
         blocked_before: set[tuple[int, int]] = set(blocked_edges.keys())
         _parallel_t0_ns = time.perf_counter_ns()
 
-        # Vehículos en COLLISION se quedan en place (retirada manual por API).
-        # PAUSED y FINISHED se excluyen del despacho a workers. IDLE → MOVING.
-        # IMPORTANTE: COLLISION y PAUSED ocupan calzada — DEBEN aparecer en el
-        # edge_index para que `_find_leader` los detecte como líder de los que
-        # vienen detrás. Sin esto, los seguidores no ven el obstáculo y el
-        # hard clamp no dispara → atraviesan al vehículo parado.
+        # Categorización:
+        #   - FINISHED → pre_finished (out)
+        #   - COLLISION / PAUSED → solo edge_index (visible como líder)
+        #   - IDLE → MOVING; MOVING → bucket
         pre_finished: list[str] = []
-        active_vehicles: dict[str, SimVehicle] = {}    # se despachan a workers
-        index_vehicles: dict[str, SimVehicle] = {}     # entran en edge_index/leader detection
+        active_vehicles: dict[str, SimVehicle] = {}
+        index_vehicles: dict[str, SimVehicle] = {}
         for v in vehicles.values():
             if v.status == VehicleStatus.FINISHED:
                 pre_finished.append(v.id)
                 continue
             if v.status == VehicleStatus.COLLISION:
                 v.velocity = 0.0
-                index_vehicles[v.id] = v  # visible como líder, no se mueve
+                index_vehicles[v.id] = v
                 continue
             if v.status == VehicleStatus.PAUSED:
-                index_vehicles[v.id] = v  # visible como líder, no se mueve
+                index_vehicles[v.id] = v
                 continue
             if v.status == VehicleStatus.IDLE:
                 v.status = VehicleStatus.MOVING
@@ -1970,178 +2061,104 @@ async def update_vehicles_parallel(
 
         with time_block("phys.build_edge_index_ms"):
             edge_index = _build_edge_index(index_vehicles)
+            converging_edges = _build_converging_edges_index(edge_index)
         with time_block("phys.build_ring_occupancy_ms"):
             ring_occupancy = _build_ring_occupancy(index_vehicles, graph)
         with time_block("phys.build_entry_arm_index_ms"):
             entry_arms = _build_entry_arm_index(index_vehicles, graph)
         with time_block("phys.build_intersection_arm_index_ms"):
             intersection_arms = _build_intersection_arm_index(index_vehicles, graph)
-        vehicle_list = list(active_vehicles.values())
 
-        leaders: dict[str, NeighborInfo | None] = {}
-        colliding_ids: set[str] = set()
-        st_par = SplitTimer()
-        for v in vehicle_list:
-            st_par.mark()
-            ldr = _find_leader(v, edge_index, graph)
-            if tl_controller is not None:
-                tl_ldr = _check_traffic_light(v, graph, tl_controller)
-                if tl_ldr is not None and (ldr is None or tl_ldr.gap_m < ldr.gap_m):
-                    ldr = tl_ldr
-            st_par.split("leader_find_ms")
-            yield_ldr = _find_roundabout_yield_leader(v, graph, ring_occupancy, entry_arms)
-            if yield_ldr is not None and (ldr is None or yield_ldr.gap_m < ldr.gap_m):
-                ldr = yield_ldr
-            st_par.split("round_yield_ms")
-            sign_ldr = _check_stop_yield_sign(v, graph, edge_index, dt)
-            if sign_ldr is not None and (ldr is None or sign_ldr.gap_m < ldr.gap_m):
-                ldr = sign_ldr
-            st_par.split("sign_check_ms")
-            intersection_ldr = _check_intersection_yield(v, graph, intersection_arms)
-            if intersection_ldr is not None and (
-                ldr is None or intersection_ldr.gap_m < ldr.gap_m
-            ):
-                ldr = intersection_ldr
-            st_par.split("intersection_yield_ms")
-
-            # Umbral contextual (rotonda vs recto) + velocidad relativa mínima.
-            np_ = v.route.node_path
-            ei = v.current_edge_index
-            in_round = False
-            if ei < len(np_) - 1:
-                cur_attrs = graph.get_edge_attributes(np_[ei], np_[ei + 1])
-                in_round = bool(cur_attrs.get(ATTR_IS_ROUNDABOUT))
-            gap_threshold = (
-                COLLISION_GAP_THRESHOLD_ROUNDABOUT_M
-                if in_round
-                else COLLISION_GAP_THRESHOLD_STRAIGHT_M
-            )
-            rel_speed = 0.0
-            if ldr is not None:
-                rel_speed = abs(v.velocity - ldr.velocity_ms)
-
-            too_close = (
-                ldr is not None
-                and ldr.leader_id is not None
-                and ldr.gap_m < gap_threshold
-                and rel_speed >= COLLISION_RELATIVE_SPEED_MIN_MS
-                and v.status == VehicleStatus.MOVING
-            )
-            if too_close:
-                v.proximity_timer = getattr(v, "proximity_timer", 0.0) + dt
-                if v.proximity_timer >= COLLISION_PROXIMITY_DURATION_S:
-                    other = vehicles.get(ldr.leader_id)  # type: ignore[union-attr]
-                    if other is not None and other.status == VehicleStatus.MOVING:
-                        _trigger_collision(
-                            v, other, blocked_edges, pending_collisions
-                        )
-                        registry.inc(
-                            f"phys.collision.{_classify_collision_segment(v, graph, tick_count)}"
-                        )
-                        v.proximity_timer = 0.0
-                        colliding_ids.add(v.id)
-                        colliding_ids.add(other.id)
-            else:
-                v.proximity_timer = 0.0
-            st_par.split("collision_check_ms")
-
-            # MOBIL en el proceso principal: los workers no tienen acceso al
-            # edge_index completo (sólo a su chunk), por lo que el cambio de
-            # carril se decide aquí y se propaga ya decidido. Si el vehículo
-            # está en un carril cerrado se fuerza la evaluación (bypass cooldown).
-            np_p = v.route.node_path
-            ei_p = v.current_edge_index
-            trapped_p = False
-            if ei_p < len(np_p) - 1:
-                trapped_p = v.lane in closed_lanes.get((np_p[ei_p], np_p[ei_p + 1]), set())
-            if v.mobil_cooldown_ticks <= 0 or trapped_p:
-                _evaluate_lane_change(
-                    v, edge_index, graph, ldr,
-                    closed_lanes=closed_lanes, tick_count=tick_count,
-                )
-                v.mobil_cooldown_ticks = MOBIL_EVAL_INTERVAL_TICKS
-            else:
-                v.mobil_cooldown_ticks -= 1
-            st_par.split("mobil_ms")
-
-            # Plan D2 — dead-wall detection en el path paralelo. Si el líder
-            # es un vehículo en COLLISION, reruta inmediato desde el siguiente
-            # nodo sin esperar al pase periódico. El IDM seguirá frenando en
-            # el worker con el líder ya calculado.
-            if ldr is not None and ldr.leader_id is not None:
-                ldr_v = vehicles.get(ldr.leader_id)
-                if ldr_v is not None and ldr_v.status == VehicleStatus.COLLISION:
-                    _maybe_reroute_around_blocks(
-                        v,
-                        graph,
-                        blocked_edges,
-                        restricted_edges_by_vtype=restricted_by_vtype,
-                    )
-
-            leaders[v.id] = ldr
-
-        st_par.emit("phys.")
-        registry.gauge("phys.n_active_in_loop", len(vehicle_list))
-
-        # Serializar snapshot completo de fases para _FrozenTL en workers
-        tl_phases_dict: dict[int, dict[str, str]] | None = None
-        if tl_controller is not None:
-            tl_phases_dict = tl_controller.get_snapshot()  # type: ignore[union-attr]
-
-        # Snapshot de bloqueos y carriles cerrados para hard-stop en workers.
-        # `blocked_edges` puede haber crecido por colisiones de este tick: usar
-        # snapshot actualizado para que los workers vean los nuevos bloqueos.
-        blocked_lookup_dispatch: set[tuple[int, int]] | None = (
-            set(blocked_edges) if blocked_edges else None
-        )
-        closed_lanes_dispatch: dict[tuple[int, int], set[int]] | None = (
-            closed_lanes if closed_lanes else None
+        # Snapshot inmutable de bloqueos pre-tick para hard-stop en IDM.
+        # Las entradas que añadan los workers por colisiones quedan fuera
+        # de este snapshot y se procesan por `_reroute_affected_by_new_blocks`
+        # post-tick.
+        blocked_snapshot: frozenset[tuple[int, int]] | None = (
+            frozenset(blocked_edges.keys()) if blocked_edges else None
         )
 
-        # Excluir colisionados de esta iteración: su status ya es COLLISION y
-        # el worker no debe reintegrarlos en el IDM ni mover su posición.
-        dispatch_list = [v for v in vehicle_list if v.id not in colliding_ids]
-        n_dispatch = len(dispatch_list)
-        if n_dispatch == 0:
-            results = []
-        else:
-            executor  = _ensure_executor(graph)
-            n_workers = min(os.cpu_count() or 1, n_dispatch)
-            chunk_size = max(1, math.ceil(n_dispatch / n_workers))
-            # Solo el primer dict de cada chunk lleva snapshots compartidos
-            # (tl_phases / blocked_edges / closed_lanes); el resto guarda None
-            # para reducir el tamaño del payload IPC.
-            chunks = [
-                [
-                    _vehicle_to_dict(
-                        v,
-                        leaders.get(v.id),
-                        tl_phases_dict if j == 0 else None,
-                        blocked_lookup_dispatch if j == 0 else None,
-                        closed_lanes_dispatch if j == 0 else None,
-                    )
-                    for j, v in enumerate(dispatch_list[i : i + chunk_size])
-                ]
-                for i in range(0, n_dispatch, chunk_size)
-            ]
+        # Bucketing por celda espacial con LPT scheduling.
+        grid = ensure_grid(graph)
+        buckets = grid.bucket_vehicles(list(active_vehicles.values()))
 
-            loop    = asyncio.get_running_loop()
+        results_finished: list[str] = []
+        agg_acc: dict[str, int] = {}
+
+        if buckets:
+            executor = _ensure_executor()
+            loop = asyncio.get_running_loop()
             _idm_t0_ns = time.perf_counter_ns()
             futures = [
-                loop.run_in_executor(executor, _process_chunk, chunk, dt)
-                for chunk in chunks
+                loop.run_in_executor(
+                    executor,
+                    _process_bucket,
+                    bucket,
+                    vehicles,
+                    graph,
+                    dt,
+                    edge_index,
+                    ring_occupancy,
+                    entry_arms,
+                    intersection_arms,
+                    tl_controller,
+                    blocked_snapshot,
+                    blocked_edges,
+                    closed_lanes,
+                    restricted_by_vtype,
+                    pending_collisions,
+                    tick_count,
+                    converging_edges,
+                )
+                for bucket in buckets
             ]
             results = await asyncio.gather(*futures)
             registry.record(
                 "phys.idm_workers_wallclock_ms",
                 (time.perf_counter_ns() - _idm_t0_ns) / 1_000_000.0,
             )
-            registry.gauge("phys.n_workers", n_workers)
-            registry.gauge("phys.n_chunks", len(chunks))
+            registry.gauge("phys.n_workers", min(os.cpu_count() or 1, len(buckets)))
+            registry.gauge("phys.n_buckets", len(buckets))
+            registry.gauge("phys.max_bucket_size", max((len(b) for b in buckets), default=0))
+
+            all_collision_candidates: list[tuple[str, str]] = []
+            for chunk_finished, chunk_acc, chunk_collisions in results:
+                results_finished.extend(chunk_finished)
+                for name, ns in chunk_acc.items():
+                    agg_acc[name] = agg_acc.get(name, 0) + ns
+                all_collision_candidates.extend(chunk_collisions)
+
+            # Flush serial post-gather: dedup por par y aplicar trigger sin lock
+            # (single-thread aquí). Elimina la contención de `_COLLISION_LOCK`
+            # bajo bursts de colisiones que serializaba a todos los workers.
+            seen_pairs: set[frozenset] = set()
+            for ego_id, other_id in all_collision_candidates:
+                pair = frozenset((ego_id, other_id))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                ego = vehicles.get(ego_id)
+                other = vehicles.get(other_id)
+                if ego is None or other is None:
+                    continue
+                if ego.status != VehicleStatus.MOVING or other.status != VehicleStatus.MOVING:
+                    continue
+                _trigger_collision(ego, other, blocked_edges, pending_collisions)
+                registry.inc(
+                    f"phys.collision.{_classify_collision_segment(ego, graph, tick_count)}"
+                )
+
+        # Emitir tiempos agregados de los SplitTimer per-worker (ms). El
+        # factor `_SPLIT_SAMPLE_EVERY` (1 por defecto) escala las muestras
+        # cuando el sampling per-vehículo está activo, para preservar la
+        # magnitud cross-veh estimada.
+        from app.core.instrumentation import _SPLIT_SAMPLE_EVERY as _sse
+        for name, ns in agg_acc.items():
+            registry.record(f"phys.{name}", (ns * _sse) / 1_000_000.0)
+        registry.gauge("phys.n_active_in_loop", len(active_vehicles))
 
     except Exception:
         logger.exception(
-            "ProcessPoolExecutor falló (n=%d vehículos); degradando a asyncio.to_thread", n
+            "ThreadPool de física falló (n=%d veh); degradando a asyncio.to_thread", n
         )
         global _EXECUTOR
         _EXECUTOR = None
@@ -2159,39 +2176,9 @@ async def update_vehicles_parallel(
         )
 
     finished_ids: list[str] = list(pre_finished)
-    cpu_sum_ms = 0.0
-    for chunk_result in results:
-        # Backward-compatible: el worker devuelve ahora 3-tuple incluyendo cpu_ms.
-        if len(chunk_result) == 3:
-            updates, chunk_finished, chunk_cpu_ms = chunk_result
-            cpu_sum_ms += chunk_cpu_ms
-        else:
-            updates, chunk_finished = chunk_result
-        for upd in updates:
-            vid = upd["id"]
-            if vid in vehicles:
-                v = vehicles[vid]
-                v.status             = VehicleStatus(upd["status"])
-                v.current_edge_index = upd["current_edge_index"]
-                v.progress_on_edge   = upd["progress_on_edge"]
-                v.velocity           = upd["velocity"]
-                v.acceleration       = upd["acceleration"]
-                v.longitude          = upd["longitude"]
-                v.latitude           = upd["latitude"]
-                v.heading            = upd["heading"]
-                v.lane               = upd.get("lane", v.lane)
-                v.prev_edge_end_heading = upd.get(
-                    "prev_edge_end_heading", v.prev_edge_end_heading
-                )
-        finished_ids.extend(chunk_finished)
-    if cpu_sum_ms > 0.0:
-        # CPU-time agregado entre todos los workers — útil para comparar con
-        # `phys.idm_workers_wallclock_ms` y estimar speedup paralelo.
-        registry.record("phys.idm_workers_cpu_sum_ms", cpu_sum_ms)
+    finished_ids.extend(results_finished)
 
     # Auto-reroute de vehículos afectados por bloqueos surgidos en este tick.
-    # Se ejecuta tras aplicar los updates de los workers para que el
-    # current_edge_index e índices asociados sean los más recientes.
     new_blocks = set(blocked_edges.keys()) - blocked_before
     if new_blocks:
         _mark_new_blocks_detected(tick_count)
@@ -2204,10 +2191,8 @@ async def update_vehicles_parallel(
                 restricted_edges_by_vtype=restricted_by_vtype,
             )
 
-    # Plan D1: pase proactivo amortizado por tick (ver _periodic_reroute_batch).
-    # Sustituye el pase all-in-one cada PERIODIC_REROUTE_TICK_INTERVAL ticks.
-    # Se ejecuta también con ZBE-only — el helper sale temprano si no hay
-    # ni bloqueos ni restricciones de zona.
+    # Plan D1: pase proactivo amortizado por tick. Helper sale temprano si
+    # no hay bloqueos ni restricciones de zona.
     with time_block("phys.reroute_periodic_batch_ms"):
         _periodic_reroute_batch(
             vehicles,

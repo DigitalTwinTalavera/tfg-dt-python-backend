@@ -91,6 +91,12 @@ _TICK_HEADER_STRUCT = struct.Struct("<BBIfHHI")
 _TICK_VEHICLE_STRUCT = struct.Struct("<fffffIfBBB")
 
 
+_HEADER_SIZE = _TICK_HEADER_STRUCT.size
+_VEHICLE_NUMERIC_SIZE = _TICK_VEHICLE_STRUCT.size
+_PACK_HEADER = _TICK_HEADER_STRUCT.pack_into
+_PACK_VEHICLE = _TICK_VEHICLE_STRUCT.pack_into
+
+
 def build_tick_binary(
     tick: int,
     sim_time: float,
@@ -99,20 +105,20 @@ def build_tick_binary(
     chunk_total: int = 1,
 ) -> bytes:
     """
-    Versión binaria de `build_tick_message`. Produce un buffer de bytes
+    Versión binaria de `build_tick_message`. Producir un buffer de bytes
     listo para `broadcast_bytes` (sin pasar por JSON).
 
-    Reduce ~4× los bytes en el wire (130 B/veh → 33 B/veh) y el coste de
-    serialización es ~5× menor que orjson para listas grandes. Indispensable
-    para 5000+ vehículos: con JSON el broadcast bloqueaba >10 ms cada tick.
+    Reduce ~4× los bytes en el wire (130 B/veh → 33 B/veh). El bucle escribe
+    en un `bytearray` pre-allocado con `struct.pack_into` (cero allocs por
+    veh — `struct.pack` devolvía un bytes nuevo cada llamada).
     """
     n = len(vehicles)
-    # Pre-allocar el buffer es difícil (id_len varía). Usar bytearray y
-    # extender con el header + per-vehicle. struct.pack devuelve bytes
-    # nuevos por llamada, pero el coste de N pequeños pack es despreciable
-    # frente al ahorro de NO pasar por JSON.
-    buf = bytearray()
-    buf.extend(_TICK_HEADER_STRUCT.pack(
+    # Estimación generosa: header + N × (1 id_len + max 32 id_bytes + 31 num).
+    # Para ids tipo "v_NNNN" el upper bound real es ~38 B/veh; reservamos 64
+    # para no recrecer nunca.
+    buf = bytearray(_HEADER_SIZE + n * 64)
+    _PACK_HEADER(
+        buf, 0,
         TICK_BINARY_MAGIC,
         TICK_BINARY_VERSION,
         tick & 0xFFFFFFFF,
@@ -120,24 +126,86 @@ def build_tick_binary(
         chunk_index,
         chunk_total,
         n,
-    ))
+    )
+    offset = _HEADER_SIZE
     for vs in vehicles:
         vid_bytes = vs["id"].encode("utf-8")
-        buf.append(len(vid_bytes) & 0xFF)
-        buf.extend(vid_bytes)
-        buf.extend(_TICK_VEHICLE_STRUCT.pack(
-            vs["lon"],
-            vs["lat"],
-            vs["h"],
-            vs["v"],
-            vs["a"],
+        id_len = len(vid_bytes)
+        if offset + 1 + id_len + _VEHICLE_NUMERIC_SIZE > len(buf):
+            # Caso patológico: id muy largo. Extender el buffer una vez.
+            buf.extend(b"\x00" * (256 + id_len))
+        buf[offset] = id_len & 0xFF
+        offset += 1
+        buf[offset : offset + id_len] = vid_bytes
+        offset += id_len
+        _PACK_VEHICLE(
+            buf, offset,
+            vs["lon"], vs["lat"], vs["h"], vs["v"], vs["a"],
             int(vs["edge_idx"]) & 0xFFFFFFFF,
             vs["progress"],
             _STATUS_TO_INT.get(vs["status"], 0),
             int(vs["lane"]) & 0xFF,
             _VTYPE_TO_INT.get(vs["vtype"], 0),
-        ))
-    return bytes(buf)
+        )
+        offset += _VEHICLE_NUMERIC_SIZE
+    return bytes(buf[:offset])
+
+
+def build_tick_binary_from_vehicles(
+    tick: int,
+    sim_time: float,
+    vehicles: list,  # list[SimVehicle] — evita el tipo para no importar
+    chunk_index: int = 0,
+    chunk_total: int = 1,
+) -> bytes:
+    """
+    Versión optimizada que serializa directamente desde `SimVehicle` sin
+    pasar por un dict intermedio. Elimina las ~5000 allocs/tick que hacía
+    `build_vehicle_state` antes de cada `build_tick_binary`.
+
+    Lee atributos via `getattr` con default cuando faltan (estado parcial en
+    vehículos recién spawneados o terminados).
+    """
+    n = len(vehicles)
+    buf = bytearray(_HEADER_SIZE + n * 64)
+    _PACK_HEADER(
+        buf, 0,
+        TICK_BINARY_MAGIC,
+        TICK_BINARY_VERSION,
+        tick & 0xFFFFFFFF,
+        sim_time,
+        chunk_index,
+        chunk_total,
+        n,
+    )
+    offset = _HEADER_SIZE
+    status_int = _STATUS_TO_INT
+    vtype_int = _VTYPE_TO_INT
+    for v in vehicles:
+        vid_bytes = v.id.encode("utf-8")
+        id_len = len(vid_bytes)
+        if offset + 1 + id_len + _VEHICLE_NUMERIC_SIZE > len(buf):
+            buf.extend(b"\x00" * (256 + id_len))
+        buf[offset] = id_len & 0xFF
+        offset += 1
+        buf[offset : offset + id_len] = vid_bytes
+        offset += id_len
+        vtype_obj = getattr(v, "vtype", None)
+        vtype_name = vtype_obj.value if vtype_obj is not None else "car"
+        _PACK_VEHICLE(
+            buf, offset,
+            v.longitude, v.latitude,
+            getattr(v, "heading", 0.0),
+            getattr(v, "velocity", 0.0),
+            getattr(v, "acceleration", 0.0),
+            int(v.current_edge_index) & 0xFFFFFFFF,
+            getattr(v, "progress_on_edge", 0.0),
+            status_int.get(v.status.value, 0),
+            int(getattr(v, "lane", 0)) & 0xFF,
+            vtype_int.get(vtype_name, 0),
+        )
+        offset += _VEHICLE_NUMERIC_SIZE
+    return bytes(buf[:offset])
 
 
 def build_tick_message(

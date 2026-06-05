@@ -159,6 +159,7 @@ def _check_stop_yield_sign(
     graph: RoadNetworkGraph,
     edge_index: "dict[tuple[int, int], dict[int, list[SimVehicle]]]",
     dt: float,
+    converging_edges: dict[int, list[tuple[int, int]]] | None = None,
 ) -> NeighborInfo | None:
     """Genera un líder virtual ante STOP / YIELD en el end_node de la arista.
 
@@ -227,8 +228,18 @@ def _check_stop_yield_sign(
         return NeighborInfo(gap_m=gap, velocity_ms=0.0)
 
     # YIELD: ceder a tráfico que converge al mismo nodo por otra arista.
-    for (u, w), lanes_dict in edge_index.items():
-        if w != end_node or (u == start_node and w == end_node):
+    # Con `converging_edges` pre-construido, sólo iteramos las aristas que
+    # realmente convergen en `end_node` (deg_in ~ 2-4 en cruces) en vez de
+    # escanear las ~E aristas del grafo.
+    if converging_edges is not None:
+        candidate_edges: list[tuple[int, int]] = converging_edges.get(end_node, [])
+    else:
+        candidate_edges = [k for k in edge_index.keys() if k[1] == end_node]
+    for (u, w) in candidate_edges:
+        if u == start_node:
+            continue
+        lanes_dict = edge_index.get((u, w))
+        if not lanes_dict:
             continue
         other_attrs = graph.get_edge_attributes(u, w)
         other_len = max(float(other_attrs.get(ATTR_LENGTH, 1.0)), MIN_EDGE_LENGTH_M)

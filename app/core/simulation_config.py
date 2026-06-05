@@ -92,16 +92,17 @@ class SimulationConfig(BaseModel):
     """
 
     tick_rate: int = Field(
-        default=5,
+        default=3,
         ge=1,
         le=100,
         description=(
-            "Ticks por segundo (1–100). Default 5 Hz: 200 ms de presupuesto por "
-            "tick holgado para 6000 vehículos con IDM+MOBIL en Python. El cliente "
-            "Godot interpola entre snapshots con INTERPOLATION_DELAY=0.2, así que "
-            "visualmente 5 Hz se ve idéntico a 10 Hz. Físicamente también — el "
-            "tiempo de reacción humana es 200-300 ms, por encima del paso de "
-            "simulación. Subir a 10 Hz solo si el backend lo aguanta."
+            "Ticks por segundo (1–100). Default 3 Hz: 333 ms de presupuesto por "
+            "tick — necesario para 4000-6000 vehículos en Python (incluso free-"
+            "threaded) en hardware de ~20 cores reales. Cliente Godot interpola "
+            "con INTERPOLATION_DELAY=0.2: a 3 Hz se ve idéntico a 10 Hz. "
+            "Físicamente: tiempo de reacción humana 200-300 ms, sigue por encima "
+            "del paso. Subir si la flota es pequeña (<2k) y el backend tiene "
+            "head-room sin slow_tick_count significativo."
         ),
     )
     auto_spawn: bool = Field(
