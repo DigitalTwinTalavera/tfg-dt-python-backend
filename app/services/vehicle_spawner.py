@@ -96,6 +96,10 @@ class SimVehicle:
     # Tiempo acumulado (s) con velocidad < STOP_SIGN_DWELL_SPEED_MS frente al
     # STOP. Al superar STOP_SIGN_DWELL_TIME_S se marca como cumplido.
     stop_sign_dwell_timer: float = 0.0
+    # Instante de tiempo de simulación (s) en que se creó el vehículo. Se usa
+    # para calcular su tiempo de viaje al completar la ruta (analítica de
+    # tráfico, app/core/analytics.py).
+    spawn_sim_time: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -146,6 +150,10 @@ class VehicleSpawner:
         # para consultar enforcement `deny_spawn` y en routing para penalizar
         # aristas restringidas por tipo de vehículo.
         self.zone_manager: object | None = None
+        # Tiempo de simulación (s) vigente, actualizado por el motor en cada
+        # tick. Se sella en cada vehículo al crearlo para medir su tiempo de
+        # viaje al finalizar (analítica de tráfico).
+        self.current_sim_time: float = 0.0
 
     @property
     def graph(self) -> RoadNetworkGraph:
@@ -542,6 +550,7 @@ class VehicleSpawner:
                 vtype=profile.vtype,
                 lane=lane,
                 length_m=profile.length_m,
+                spawn_sim_time=self.current_sim_time,
             )
             # Velocidad deseada individual: perfil · varianza, acotada al límite del
             # primer tramo para que los camiones no intenten ir a 130 km/h en ciudad.

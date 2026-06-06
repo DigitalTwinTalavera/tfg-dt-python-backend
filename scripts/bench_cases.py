@@ -2,9 +2,9 @@
 """
 Casos de estudio what-if (datos agregados reales, sobre el A*/zonas del sistema).
 
-CASO 1 - ZBE: zona de bajas emisiones con el perímetro REAL del Casco Histórico
-de Talavera (polígono dibujado en el cliente, ~0.44 km²) que restringe `car` y
-`truck` con enforcement force_reroute; solo las motos pueden cruzar. Se generan M
+CASO 1 - ZBE: zona de bajas emisiones con el perímetro REAL de la ZBE de Talavera
+(zonas Trinidad + Casco Histórico; polígono dibujado en el cliente, ~0.44 km²) que
+restringe `car` y `truck` con enforcement force_reroute; solo las motos pueden cruzar. Se generan M
 pares O-D y se compara, para CADA par, la ruta sin restricción (red libre, lo que
 hace una moto) con la ruta del tráfico general (coche/camión) bajo la ZBE.
 Métricas: % de rutas que cruzan el casco, cuántas evita el tráfico restringido y
@@ -34,8 +34,8 @@ from sqlalchemy import text
 random.seed(20260605)
 M = 3000          # pares O-D de muestra
 
-# Perímetro REAL de la ZBE (Casco Histórico) dibujado en el cliente. WKT en
-# lon/lat (EPSG:4326), tal cual lo almacena PostGIS.
+# Perímetro REAL de la ZBE (Trinidad + Casco Histórico) dibujado en el cliente.
+# WKT en lon/lat (EPSG:4326), tal cual lo almacena PostGIS.
 ZBE_WKT = (
     "POLYGON(("
     "-4.832959 39.956703,-4.832446 39.956535,-4.827789 39.958225,"
@@ -97,7 +97,7 @@ async def main():
 
     # =================== CASO 1: ZBE (perímetro real) ===================
     zone = await zone_mgr.create(
-        name="ZBE Casco Histórico (Talavera)", zone_type=ZoneType.ZBE,
+        name="ZBE Talavera (Trinidad + Casco Histórico)", zone_type=ZoneType.ZBE,
         geometry_wkt=ZBE_WKT, restricted_vtypes=ZBE_RESTRICTED,
         enforcement=ZoneEnforcement.FORCE_REROUTE, active=True,
     )

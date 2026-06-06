@@ -10,7 +10,9 @@ import time
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from app.core.analytics import traffic_analytics
 from app.core.constants import (
+    ANALYTICS_INTERVAL_TICKS,
     ATTR_IS_ROUNDABOUT,
     ATTR_ROUNDABOUT_ID,
     DYNAMIC_WEIGHT_CHANGE_THRESHOLD,
@@ -182,6 +184,8 @@ class SimulationEngine:
         self._start_wall_time = time.monotonic()
         self._tl_controller = None  # se re-inicializa en el primer tick
         self._state = SimulationState.RUNNING
+
+        traffic_analytics.reset()
 
         if self._broadcaster is not None:
             self._broadcaster.reset()
@@ -359,6 +363,11 @@ class SimulationEngine:
 
         st = SplitTimer()
 
+        # Tiempo de simulación vigente para que los vehículos creados en este
+        # tick (auto-spawn) queden sellados con su instante de nacimiento.
+        if self._spawner is not None:
+            self._spawner.current_sim_time = self._simulation_time
+
         # 1. Lazy-init del controlador de semáforos (primera vez que el grafo está listo)
         if (
             self._tl_controller is None
@@ -456,8 +465,31 @@ class SimulationEngine:
             self._recompute_dynamic_weights()
         st.split("dynamic_weights_ms")
 
-        # 5. Broadcast vehicle_finished + eliminar vehículos completados
+        # 4e. Analítica de tráfico: recalcular congestión e impacto de
+        #     incidentes cada ANALYTICS_INTERVAL_TICKS (una pasada O(N) fuera
+        #     del cómputo de física). El tiempo de viaje se registra aparte,
+        #     por evento, al finalizar cada vehículo (paso 5).
+        if (
+            self._spawner is not None
+            and self._tick_count % ANALYTICS_INTERVAL_TICKS == 0
+        ):
+            traffic_analytics.sample(
+                self._spawner.vehicles,
+                self._spawner.graph,
+                self._spawner.blocked_edges,
+            )
+        st.split("analytics_ms")
+
+        # 5. Broadcast vehicle_finished + eliminar vehículos completados.
+        #    Antes de retirarlo, registrar su tiempo de viaje en la analítica.
         for vid in finished_ids:
+            if self._spawner is not None:
+                finished_v = self._spawner.get_vehicle(vid)
+                if finished_v is not None:
+                    traffic_analytics.record_trip(
+                        travel_time_s=self._simulation_time - finished_v.spawn_sim_time,
+                        route_length_m=finished_v.route.length_m,
+                    )
             if self._broadcaster is not None:
                 await self._broadcaster.broadcast_vehicle_finished(vid)
             if self._spawner is not None:

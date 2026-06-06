@@ -677,6 +677,24 @@ DYNAMIC_WEIGHT_MAX_MULT: float = 5.0       # multiplicador máximo por saturaci�
 DYNAMIC_WEIGHT_CHANGE_THRESHOLD: float = 0.2  # invalidar cache si un peso cambia >20 %
 
 # =============================================================================
+# Traffic Analytics (motor de analíticas de dominio)
+# =============================================================================
+
+# Cada cuántos ticks se recalculan las métricas de tráfico agregadas
+# (congestión e impacto de incidentes). El tiempo de viaje se registra por
+# evento, al finalizar cada vehículo, y no depende de este intervalo.
+ANALYTICS_INTERVAL_TICKS: int = 10
+# Espacio medio que ocupa un vehículo en cola (longitud + gap mínimo), en
+# metros. Se usa para estimar la capacidad de una arista al calcular su nivel
+# de congestión: capacidad ≈ longitud · carriles / este valor.
+CONGESTION_VEHICLE_SLOT_M: float = 7.0
+# Ratio ocupación/capacidad a partir del cual una arista se considera
+# congestionada en el recuento `traffic.congested_edges`.
+CONGESTION_RATIO_THRESHOLD: float = 0.6
+# Tamaño del ring buffer de muestras de tiempo de viaje (vehículos finalizados).
+ANALYTICS_TRIP_BUFFER_SIZE: int = 2048
+
+# =============================================================================
 # STOP/YIELD Sign Runtime (Fase 7.1)
 # =============================================================================
 

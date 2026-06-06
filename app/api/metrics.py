@@ -2,8 +2,9 @@
 Endpoints de exposición de métricas de rendimiento.
 
   - GET /metrics  → Prometheus exposition format (texto plano).
-  - GET /api/simulation/metrics  → JSON estructurado con percentiles y
-    derivadas legibles a ojo (bytes/s, ratios) para curl/jq.
+  - GET /api/simulation/metrics  → JSON estructurado con percentiles, derivadas
+    legibles a ojo (bytes/s, ratios) y el bloque `traffic` del motor de
+    analíticas (tiempos de viaje, congestión, impacto de incidentes).
 
 El backend escribe en `app.core.instrumentation.registry` desde el tick
 loop, la física de vehículos y el broadcaster. Estos endpoints son
@@ -17,6 +18,7 @@ import logging
 from fastapi import APIRouter, Depends, Response
 
 from app.api.deps import get_simulation_engine
+from app.core.analytics import traffic_analytics
 from app.core.instrumentation import registry
 from app.core.simulation_engine import SimulationEngine
 
@@ -71,6 +73,9 @@ async def simulation_metrics(
     return {
         "schema": "v1",
         "derived": derived,
+        # Métricas clave de tráfico (dominio): tiempos de viaje, congestión e
+        # impacto de incidentes. Distintas de los histogramas de rendimiento.
+        "traffic": traffic_analytics.snapshot(),
         "histograms_ms": snap["histograms_ms"],
         "counters": snap["counters"],
         "gauges": snap["gauges"],

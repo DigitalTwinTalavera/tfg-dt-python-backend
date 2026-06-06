@@ -380,6 +380,11 @@ class TestAutoSpawn:
         # decidir si lazy-init del controller de semáforos. Con grafo vacío
         # se salta esa rama y nos centramos en la lógica de auto-spawn.
         s.graph.node_count = 0
+        # El motor consulta además estos atributos en la pasada de analítica de
+        # tráfico (congestión / impacto de incidentes). Vacíos: la analítica se
+        # ejecuta sin efecto y no interfiere con la lógica de auto-spawn.
+        s.vehicles = {}
+        s.blocked_edges = {}
         return s
 
     @pytest.mark.unit
