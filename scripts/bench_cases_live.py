@@ -218,6 +218,11 @@ def _reset_world(engine, spawner, incident_mgr) -> None:
     spawner.blocked_edges.clear()
     spawner.closed_lanes.clear()
     spawner.clear_route_cache()
+    # Sin esto, el spawn inicial de cada fase (anterior al primer tick, que es
+    # quien sincroniza este reloj) hereda el sim-time de la fase previa: sus
+    # vehículos terminan con travel_time <= 0 y record_trip() los descarta,
+    # vaciando trips_completed/travel_time en toda fase que no sea la primera.
+    spawner.current_sim_time = 0.0
     # Accidentes en memoria del caso anterior (IDs sintéticos, sin flush a BD).
     incident_mgr._active.clear()
     engine._tick_count = 0

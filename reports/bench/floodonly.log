@@ -1,0 +1,28 @@
+[12:08:34] GIL enabled: False  python 3.14.5
+[12:08:34] case=flood N=1000 dt=0.3333s warmup=60.0s accident_ttl=120.0s measure=150.0s seed=42
+[12:08:34] grafo: 5879 nodos, 3388 aristas, build=0.2s
+[12:08:34] === CASO FLOOD (N=1000, seed=42, mundos gemelos) ===
+[12:08:35]   corte: Marqués de Mirasol           -> 10 aristas
+[12:08:35]   corte: Portiña de San Miguel        -> 16 aristas
+[12:08:35]   corte: Portiña del Salvador         -> 6 aristas
+[12:08:35]   corte: Calle Mula                   -> 3 aristas
+[12:08:35]   corte: Cristo de la Salud           -> 28 aristas
+[12:08:35]   corte: Calle Entretorres            -> 7 aristas
+[12:08:35]   corte: Las Hilanderas               -> 2 aristas
+[12:08:35]   corte: Calle Grisetas               -> 5 aristas
+[12:08:35]   corte: Calle San Martín             -> 8 aristas
+[12:08:35]   corte: Calle Bancaleros             -> 9 aristas
+[12:08:35]   corte: Santa Lucía                  -> 2 aristas
+[12:08:35]   corte: Callejón Ideal               -> 5 aristas
+[12:08:35]   corte: Av. Real Fábrica de Sedas    -> 9 aristas
+[12:08:35]   TOTAL: 104 edge IDs / 136 aristas dirigidas (D=20 m)
+[12:08:36]   flood/base: spawn inicial 1000 veh en 0.9s
+[12:09:36]   flood/base: warm-up done (60s), active=1000, reroutes_transitorio=1115
+[12:12:06]   flood/base: DONE active~1000 trips=50 tt_mean=115.7s v_flota=2.25m/s reroutes=846 saturadas_pico=34
+[12:12:06]   -> escrito reports/bench/cases_live_floodonly.json
+[12:12:07]   flood/escenario: spawn inicial 1000 veh en 1.2s
+[12:13:07]   flood/escenario: warm-up done (60s), active=1000, reroutes_transitorio=869
+[12:15:37]   flood/escenario: DONE active~1000 trips=2 tt_mean=115.3s v_flota=2.07m/s reroutes=779 saturadas_pico=36
+[12:15:37]   delta flood: travel_time_mean_s=-0.38, fleet_speed_ms_mean=-0.173, vehicles_rerouted=-67, saturated_edges_peak=+2
+[12:15:37]   -> escrito reports/bench/cases_live_floodonly.json
+[12:15:37] FIN

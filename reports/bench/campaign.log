@@ -1,0 +1,200 @@
+=== SEED 42 ===
+[10:56:07] GIL enabled: False  python 3.14.5
+[10:56:07] case=both N=1000 dt=0.3333s warmup=60.0s accident_ttl=120.0s measure=150.0s seed=42
+[10:56:07] grafo: 5879 nodos, 3388 aristas, build=0.2s
+[10:56:07] === CASO ZBE (N=1000, seed=42, mundos gemelos) ===
+[10:56:08]   zbe/base: spawn inicial 1000 veh en 0.9s
+[10:57:08]   zbe/base: warm-up done (60s), active=1000, reroutes_transitorio=1280
+[10:59:38]   zbe/base: DONE active~1000 trips=49 tt_mean=118.5s v_flota=2.14m/s reroutes=861 saturadas_pico=33
+[10:59:38]   -> escrito reports/bench/cases_live_seed42.json
+[10:59:38]   ZBE activa: ~0.448 km², 304 aristas (u,v) restringidas para car+truck
+[10:59:39]   zbe/escenario: spawn inicial 1000 veh en 1.2s
+[11:00:39]   zbe/escenario: warm-up done (60s), active=1000, reroutes_transitorio=2229
+[11:03:09]   zbe/escenario: DONE active~1000 trips=3 tt_mean=88.6s v_flota=1.97m/s reroutes=807 saturadas_pico=27
+[11:03:09]   delta zbe: travel_time_mean_s=-29.91, fleet_speed_ms_mean=-0.175, vehicles_rerouted=-54, saturated_edges_peak=-6
+[11:03:09]   -> escrito reports/bench/cases_live_seed42.json
+[11:03:09] === CASO FLOOD (N=1000, seed=42, mundos gemelos) ===
+[11:03:09]   corte: Marqués de Mirasol           -> 10 aristas
+[11:03:09]   corte: Portiña de San Miguel        -> 16 aristas
+[11:03:09]   corte: Portiña del Salvador         -> 6 aristas
+[11:03:09]   corte: Calle Mula                   -> 3 aristas
+[11:03:09]   corte: Cristo de la Salud           -> 28 aristas
+[11:03:09]   corte: Calle Entretorres            -> 7 aristas
+[11:03:09]   corte: Las Hilanderas               -> 2 aristas
+[11:03:09]   corte: Calle Grisetas               -> 5 aristas
+[11:03:09]   corte: Calle San Martín             -> 8 aristas
+[11:03:09]   corte: Calle Bancaleros             -> 9 aristas
+[11:03:09]   corte: Santa Lucía                  -> 2 aristas
+[11:03:09]   corte: Callejón Ideal               -> 5 aristas
+[11:03:09]   corte: Av. Real Fábrica de Sedas    -> 9 aristas
+[11:03:09]   TOTAL: 104 edge IDs / 136 aristas dirigidas (D=20 m)
+[11:03:10]   flood/base: spawn inicial 1000 veh en 1.1s
+[11:04:10]   flood/base: warm-up done (60s), active=1000, reroutes_transitorio=1337
+[11:06:40]   flood/base: DONE active~1000 trips=1 tt_mean=146.3s v_flota=2.20m/s reroutes=854 saturadas_pico=29
+[11:06:40]   -> escrito reports/bench/cases_live_seed42.json
+[11:06:42]   flood/escenario: spawn inicial 1000 veh en 1.3s
+[11:07:42]   flood/escenario: warm-up done (60s), active=1000, reroutes_transitorio=974
+[11:10:12]   flood/escenario: DONE active~1000 trips=1 tt_mean=30.3s v_flota=2.08m/s reroutes=693 saturadas_pico=38
+[11:10:12]   delta flood: travel_time_mean_s=-116, fleet_speed_ms_mean=-0.122, vehicles_rerouted=-161, saturated_edges_peak=+9
+[11:10:12]   -> escrito reports/bench/cases_live_seed42.json
+[11:10:12] FIN
+=== SEED 43 ===
+[11:10:12] GIL enabled: False  python 3.14.5
+[11:10:12] case=both N=1000 dt=0.3333s warmup=60.0s accident_ttl=120.0s measure=150.0s seed=43
+[11:10:12] grafo: 5879 nodos, 3388 aristas, build=0.1s
+[11:10:12] === CASO ZBE (N=1000, seed=43, mundos gemelos) ===
+[11:10:13]   zbe/base: spawn inicial 1000 veh en 1.0s
+[11:11:13]   zbe/base: warm-up done (60s), active=1000, reroutes_transitorio=1467
+[11:13:43]   zbe/base: DONE active~1000 trips=63 tt_mean=123.1s v_flota=2.18m/s reroutes=850 saturadas_pico=37
+[11:13:43]   -> escrito reports/bench/cases_live_seed43.json
+[11:13:43]   ZBE activa: ~0.448 km², 304 aristas (u,v) restringidas para car+truck
+[11:13:45]   zbe/escenario: spawn inicial 1000 veh en 1.2s
+[11:14:45]   zbe/escenario: warm-up done (60s), active=1000, reroutes_transitorio=2056
+[11:17:15]   zbe/escenario: DONE active~1000 trips=1 tt_mean=68.0s v_flota=1.80m/s reroutes=839 saturadas_pico=40
+[11:17:15]   delta zbe: travel_time_mean_s=-55.14, fleet_speed_ms_mean=-0.379, vehicles_rerouted=-11, saturated_edges_peak=+3
+[11:17:15]   -> escrito reports/bench/cases_live_seed43.json
+[11:17:15] === CASO FLOOD (N=1000, seed=43, mundos gemelos) ===
+[11:17:15]   corte: Marqués de Mirasol           -> 10 aristas
+[11:17:15]   corte: Portiña de San Miguel        -> 16 aristas
+[11:17:15]   corte: Portiña del Salvador         -> 6 aristas
+[11:17:15]   corte: Calle Mula                   -> 3 aristas
+[11:17:15]   corte: Cristo de la Salud           -> 28 aristas
+[11:17:15]   corte: Calle Entretorres            -> 7 aristas
+[11:17:15]   corte: Las Hilanderas               -> 2 aristas
+[11:17:15]   corte: Calle Grisetas               -> 5 aristas
+[11:17:15]   corte: Calle San Martín             -> 8 aristas
+[11:17:15]   corte: Calle Bancaleros             -> 9 aristas
+[11:17:15]   corte: Santa Lucía                  -> 2 aristas
+[11:17:15]   corte: Callejón Ideal               -> 5 aristas
+[11:17:15]   corte: Av. Real Fábrica de Sedas    -> 9 aristas
+[11:17:15]   TOTAL: 104 edge IDs / 136 aristas dirigidas (D=20 m)
+[11:17:16]   flood/base: spawn inicial 1000 veh en 1.1s
+[11:18:16]   flood/base: warm-up done (60s), active=999, reroutes_transitorio=1378
+[11:20:46]   flood/base: DONE active~1000 trips=1 tt_mean=70.7s v_flota=2.31m/s reroutes=862 saturadas_pico=34
+[11:20:46]   -> escrito reports/bench/cases_live_seed43.json
+[11:20:47]   flood/escenario: spawn inicial 1000 veh en 1.2s
+[11:21:47]   flood/escenario: warm-up done (60s), active=1000, reroutes_transitorio=982
+[11:24:17]   flood/escenario: DONE active~1000 trips=3 tt_mean=104.0s v_flota=1.86m/s reroutes=778 saturadas_pico=36
+[11:24:17]   delta flood: travel_time_mean_s=+33.33, fleet_speed_ms_mean=-0.444, vehicles_rerouted=-84, saturated_edges_peak=+2
+[11:24:17]   -> escrito reports/bench/cases_live_seed43.json
+[11:24:17] FIN
+=== SEED 44 ===
+[11:24:18] GIL enabled: False  python 3.14.5
+[11:24:18] case=both N=1000 dt=0.3333s warmup=60.0s accident_ttl=120.0s measure=150.0s seed=44
+[11:24:18] grafo: 5879 nodos, 3388 aristas, build=0.1s
+[11:24:18] === CASO ZBE (N=1000, seed=44, mundos gemelos) ===
+[11:24:19]   zbe/base: spawn inicial 1000 veh en 0.9s
+[11:25:19]   zbe/base: warm-up done (60s), active=999, reroutes_transitorio=1368
+[11:27:49]   zbe/base: DONE active~1000 trips=63 tt_mean=127.3s v_flota=2.77m/s reroutes=885 saturadas_pico=28
+[11:27:49]   -> escrito reports/bench/cases_live_seed44.json
+[11:27:49]   ZBE activa: ~0.448 km², 304 aristas (u,v) restringidas para car+truck
+[11:27:50]   zbe/escenario: spawn inicial 1000 veh en 1.2s
+[11:28:50]   zbe/escenario: warm-up done (60s), active=1000, reroutes_transitorio=2375
+[11:31:20]   zbe/escenario: DONE active~1000 trips=2 tt_mean=54.0s v_flota=2.04m/s reroutes=824 saturadas_pico=36
+[11:31:20]   delta zbe: travel_time_mean_s=-73.31, fleet_speed_ms_mean=-0.736, vehicles_rerouted=-61, saturated_edges_peak=+8
+[11:31:20]   -> escrito reports/bench/cases_live_seed44.json
+[11:31:20] === CASO FLOOD (N=1000, seed=44, mundos gemelos) ===
+[11:31:20]   corte: Marqués de Mirasol           -> 10 aristas
+[11:31:20]   corte: Portiña de San Miguel        -> 16 aristas
+[11:31:20]   corte: Portiña del Salvador         -> 6 aristas
+[11:31:20]   corte: Calle Mula                   -> 3 aristas
+[11:31:20]   corte: Cristo de la Salud           -> 28 aristas
+[11:31:20]   corte: Calle Entretorres            -> 7 aristas
+[11:31:20]   corte: Las Hilanderas               -> 2 aristas
+[11:31:20]   corte: Calle Grisetas               -> 5 aristas
+[11:31:20]   corte: Calle San Martín             -> 8 aristas
+[11:31:20]   corte: Calle Bancaleros             -> 9 aristas
+[11:31:20]   corte: Santa Lucía                  -> 2 aristas
+[11:31:20]   corte: Callejón Ideal               -> 5 aristas
+[11:31:20]   corte: Av. Real Fábrica de Sedas    -> 9 aristas
+[11:31:20]   TOTAL: 104 edge IDs / 136 aristas dirigidas (D=20 m)
+[11:31:21]   flood/base: spawn inicial 1000 veh en 1.1s
+[11:32:21]   flood/base: warm-up done (60s), active=999, reroutes_transitorio=1449
+[11:34:51]   flood/base: DONE active~1000 trips=3 tt_mean=124.7s v_flota=2.45m/s reroutes=852 saturadas_pico=31
+[11:34:51]   -> escrito reports/bench/cases_live_seed44.json
+[11:34:53]   flood/escenario: spawn inicial 1000 veh en 1.2s
+[11:35:53]   flood/escenario: warm-up done (60s), active=1000, reroutes_transitorio=821
+[11:38:23]   flood/escenario: DONE active~1000 trips=2 tt_mean=93.8s v_flota=1.98m/s reroutes=736 saturadas_pico=41
+[11:38:23]   delta flood: travel_time_mean_s=-30.84, fleet_speed_ms_mean=-0.474, vehicles_rerouted=-116, saturated_edges_peak=+10
+[11:38:23]   -> escrito reports/bench/cases_live_seed44.json
+[11:38:23] FIN
+=== SEED 45 ===
+[11:38:23] GIL enabled: False  python 3.14.5
+[11:38:23] case=both N=1000 dt=0.3333s warmup=60.0s accident_ttl=120.0s measure=150.0s seed=45
+[11:38:23] grafo: 5879 nodos, 3388 aristas, build=0.1s
+[11:38:23] === CASO ZBE (N=1000, seed=45, mundos gemelos) ===
+[11:38:24]   zbe/base: spawn inicial 1000 veh en 0.9s
+[11:39:24]   zbe/base: warm-up done (60s), active=999, reroutes_transitorio=1372
+[11:41:54]   zbe/base: DONE active~1000 trips=49 tt_mean=124.0s v_flota=2.34m/s reroutes=879 saturadas_pico=33
+[11:41:54]   -> escrito reports/bench/cases_live_seed45.json
+[11:41:54]   ZBE activa: ~0.448 km², 304 aristas (u,v) restringidas para car+truck
+[11:41:56]   zbe/escenario: spawn inicial 1000 veh en 1.2s
+[11:42:56]   zbe/escenario: warm-up done (60s), active=1000, reroutes_transitorio=2103
+[11:45:26]   zbe/escenario: DONE active~1000 trips=2 tt_mean=101.5s v_flota=2.31m/s reroutes=814 saturadas_pico=37
+[11:45:26]   delta zbe: travel_time_mean_s=-22.47, fleet_speed_ms_mean=-0.031, vehicles_rerouted=-65, saturated_edges_peak=+4
+[11:45:26]   -> escrito reports/bench/cases_live_seed45.json
+[11:45:26] === CASO FLOOD (N=1000, seed=45, mundos gemelos) ===
+[11:45:26]   corte: Marqués de Mirasol           -> 10 aristas
+[11:45:26]   corte: Portiña de San Miguel        -> 16 aristas
+[11:45:26]   corte: Portiña del Salvador         -> 6 aristas
+[11:45:26]   corte: Calle Mula                   -> 3 aristas
+[11:45:26]   corte: Cristo de la Salud           -> 28 aristas
+[11:45:26]   corte: Calle Entretorres            -> 7 aristas
+[11:45:26]   corte: Las Hilanderas               -> 2 aristas
+[11:45:26]   corte: Calle Grisetas               -> 5 aristas
+[11:45:26]   corte: Calle San Martín             -> 8 aristas
+[11:45:26]   corte: Calle Bancaleros             -> 9 aristas
+[11:45:26]   corte: Santa Lucía                  -> 2 aristas
+[11:45:26]   corte: Callejón Ideal               -> 5 aristas
+[11:45:26]   corte: Av. Real Fábrica de Sedas    -> 9 aristas
+[11:45:26]   TOTAL: 104 edge IDs / 136 aristas dirigidas (D=20 m)
+[11:45:27]   flood/base: spawn inicial 1000 veh en 1.1s
+[11:46:27]   flood/base: warm-up done (60s), active=1000, reroutes_transitorio=1379
+[11:48:57]   flood/base: DONE active~1000 trips=4 tt_mean=69.3s v_flota=2.53m/s reroutes=875 saturadas_pico=28
+[11:48:57]   -> escrito reports/bench/cases_live_seed45.json
+[11:48:58]   flood/escenario: spawn inicial 1000 veh en 1.2s
+[11:49:58]   flood/escenario: warm-up done (60s), active=1000, reroutes_transitorio=980
+[11:52:28]   flood/escenario: DONE active~1000 trips=0 tt_mean=0.0s v_flota=2.24m/s reroutes=774 saturadas_pico=29
+[11:52:28]   delta flood: travel_time_mean_s=-69.33, fleet_speed_ms_mean=-0.286, vehicles_rerouted=-101, saturated_edges_peak=+1
+[11:52:28]   -> escrito reports/bench/cases_live_seed45.json
+[11:52:28] FIN
+=== SEED 46 ===
+[11:52:29] GIL enabled: False  python 3.14.5
+[11:52:29] case=both N=1000 dt=0.3333s warmup=60.0s accident_ttl=120.0s measure=150.0s seed=46
+[11:52:29] grafo: 5879 nodos, 3388 aristas, build=0.1s
+[11:52:29] === CASO ZBE (N=1000, seed=46, mundos gemelos) ===
+[11:52:30]   zbe/base: spawn inicial 1000 veh en 0.9s
+[11:53:30]   zbe/base: warm-up done (60s), active=999, reroutes_transitorio=1589
+[11:56:00]   zbe/base: DONE active~1000 trips=47 tt_mean=130.1s v_flota=2.34m/s reroutes=840 saturadas_pico=39
+[11:56:00]   -> escrito reports/bench/cases_live_seed46.json
+[11:56:00]   ZBE activa: ~0.448 km², 304 aristas (u,v) restringidas para car+truck
+[11:56:01]   zbe/escenario: spawn inicial 1000 veh en 1.2s
+[11:57:01]   zbe/escenario: warm-up done (60s), active=998, reroutes_transitorio=2058
+[11:59:31]   zbe/escenario: DONE active~1000 trips=0 tt_mean=0.0s v_flota=2.15m/s reroutes=783 saturadas_pico=31
+[11:59:31]   delta zbe: travel_time_mean_s=-130.11, fleet_speed_ms_mean=-0.19, vehicles_rerouted=-57, saturated_edges_peak=-8
+[11:59:31]   -> escrito reports/bench/cases_live_seed46.json
+[11:59:31] === CASO FLOOD (N=1000, seed=46, mundos gemelos) ===
+[11:59:31]   corte: Marqués de Mirasol           -> 10 aristas
+[11:59:31]   corte: Portiña de San Miguel        -> 16 aristas
+[11:59:31]   corte: Portiña del Salvador         -> 6 aristas
+[11:59:31]   corte: Calle Mula                   -> 3 aristas
+[11:59:31]   corte: Cristo de la Salud           -> 28 aristas
+[11:59:31]   corte: Calle Entretorres            -> 7 aristas
+[11:59:31]   corte: Las Hilanderas               -> 2 aristas
+[11:59:31]   corte: Calle Grisetas               -> 5 aristas
+[11:59:31]   corte: Calle San Martín             -> 8 aristas
+[11:59:31]   corte: Calle Bancaleros             -> 9 aristas
+[11:59:31]   corte: Santa Lucía                  -> 2 aristas
+[11:59:31]   corte: Callejón Ideal               -> 5 aristas
+[11:59:31]   corte: Av. Real Fábrica de Sedas    -> 9 aristas
+[11:59:31]   TOTAL: 104 edge IDs / 136 aristas dirigidas (D=20 m)
+[11:59:32]   flood/base: spawn inicial 1000 veh en 1.1s
+[12:00:32]   flood/base: warm-up done (60s), active=998, reroutes_transitorio=1170
+[12:03:02]   flood/base: DONE active~1000 trips=3 tt_mean=65.8s v_flota=2.42m/s reroutes=816 saturadas_pico=33
+[12:03:02]   -> escrito reports/bench/cases_live_seed46.json
+[12:03:04]   flood/escenario: spawn inicial 1000 veh en 1.3s
+[12:04:04]   flood/escenario: warm-up done (60s), active=999, reroutes_transitorio=1138
+[12:06:34]   flood/escenario: DONE active~1000 trips=2 tt_mean=44.3s v_flota=2.09m/s reroutes=723 saturadas_pico=33
+[12:06:34]   delta flood: travel_time_mean_s=-21.45, fleet_speed_ms_mean=-0.331, vehicles_rerouted=-93, saturated_edges_peak=+0
+[12:06:34]   -> escrito reports/bench/cases_live_seed46.json
+[12:06:34] FIN

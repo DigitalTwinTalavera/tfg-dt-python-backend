@@ -1,0 +1,308 @@
+{
+  "meta": {
+    "script": "bench_cases_live",
+    "timestamp": "2026-06-10T12:16:51",
+    "python": "3.14.5",
+    "gil_enabled": false,
+    "cpu_count": 20,
+    "case": "both",
+    "vehicles": 1000,
+    "warmup_s": 60.0,
+    "twin_worlds": true,
+    "measure_s": 150.0,
+    "seed": 42,
+    "tick_hz": 3.0,
+    "dt_s": 0.3333333333333333,
+    "topup_every_s": 2.0,
+    "accident_ttl_s": 120.0,
+    "trip_buffer": 10000,
+    "graph_nodes": 5879,
+    "graph_edges": 3388,
+    "analytics_interval_ticks": 10,
+    "congestion_vehicle_slot_m": 7.0,
+    "congestion_ratio_threshold": 0.6,
+    "saturated_ratio_threshold": 1.0
+  },
+  "cases": {
+    "zbe": {
+      "setup": {
+        "tipo": "zbe",
+        "zone_id": 14,
+        "area_km2": 0.448,
+        "aristas_restringidas_uv": 304,
+        "restringidos": [
+          "car",
+          "truck"
+        ],
+        "enforcement": "force_reroute"
+      },
+      "base": {
+        "ticks": 450,
+        "wall_s": 150.0,
+        "sim_s": 150.0,
+        "effective_tick_rate_hz": 3.0,
+        "active_mean": 999.6,
+        "active_median": 1000.0,
+        "fleet_speed_ms_mean": 2.276,
+        "trips_completed": 47,
+        "travel_time_mean_s": 116.45,
+        "travel_time_p50_s": 107.67,
+        "travel_time_p95_s": 184.4,
+        "trip_speed_kmh_mean": 24.07,
+        "reroute_events": 2981,
+        "vehicles_rerouted": 852,
+        "saturated_edges_peak": 32,
+        "congested_edges_peak": 133,
+        "congestion_max_peak": 2.9771,
+        "vehicles_affected_peak": 541,
+        "blocked_edges_active": 38,
+        "analytics": {
+          "travel_time_s": {
+            "trips_completed": 47,
+            "mean": 116.45,
+            "p50": 107.67,
+            "p95": 184.4,
+            "max": 205.33
+          },
+          "trip_speed_kmh": {
+            "mean": 24.07,
+            "p50": 24.78
+          },
+          "congestion": {
+            "occupied_edges": 409,
+            "congestion_mean": 0.4678,
+            "congestion_max": 2.9771,
+            "congested_edges": 126
+          },
+          "incidents": {
+            "blocked_edges": 38,
+            "vehicles_affected": 222
+          }
+        }
+      },
+      "scenario": {
+        "ticks": 450,
+        "wall_s": 150.0,
+        "sim_s": 150.0,
+        "effective_tick_rate_hz": 3.0,
+        "active_mean": 999.6,
+        "active_median": 1000.0,
+        "fleet_speed_ms_mean": 2.077,
+        "trips_completed": 40,
+        "travel_time_mean_s": 115.12,
+        "travel_time_p50_s": 113.83,
+        "travel_time_p95_s": 196.0,
+        "trip_speed_kmh_mean": 24.65,
+        "reroute_events": 5577,
+        "vehicles_rerouted": 802,
+        "saturated_edges_peak": 26,
+        "congested_edges_peak": 128,
+        "congestion_max_peak": 9.0,
+        "vehicles_affected_peak": 704,
+        "blocked_edges_active": 32,
+        "analytics": {
+          "travel_time_s": {
+            "trips_completed": 40,
+            "mean": 115.12,
+            "p50": 113.83,
+            "p95": 196.0,
+            "max": 206.33
+          },
+          "trip_speed_kmh": {
+            "mean": 24.65,
+            "p50": 25.38
+          },
+          "congestion": {
+            "occupied_edges": 393,
+            "congestion_mean": 0.49,
+            "congestion_max": 9.0,
+            "congested_edges": 121
+          },
+          "incidents": {
+            "blocked_edges": 34,
+            "vehicles_affected": 359
+          }
+        }
+      },
+      "delta": {
+        "travel_time_mean_s": -1.33,
+        "travel_time_p50_s": 6.16,
+        "travel_time_p95_s": 11.6,
+        "trip_speed_kmh_mean": 0.58,
+        "fleet_speed_ms_mean": -0.199,
+        "trips_completed": -7,
+        "reroute_events": 2596,
+        "vehicles_rerouted": -50,
+        "saturated_edges_peak": -6,
+        "congested_edges_peak": -5,
+        "congestion_max_peak": 6.023,
+        "vehicles_affected_peak": 163
+      }
+    },
+    "flood": {
+      "setup": {
+        "tipo": "flood",
+        "calles_cortadas": 13,
+        "aristas_cortadas_ids": 104,
+        "aristas_cortadas_uv": 136,
+        "dwithin_m": 20,
+        "calles": [
+          [
+            "Marqués de Mirasol",
+            10
+          ],
+          [
+            "Portiña de San Miguel",
+            16
+          ],
+          [
+            "Portiña del Salvador",
+            6
+          ],
+          [
+            "Calle Mula",
+            3
+          ],
+          [
+            "Cristo de la Salud",
+            28
+          ],
+          [
+            "Calle Entretorres",
+            7
+          ],
+          [
+            "Las Hilanderas",
+            2
+          ],
+          [
+            "Calle Grisetas",
+            5
+          ],
+          [
+            "Calle San Martín",
+            8
+          ],
+          [
+            "Calle Bancaleros",
+            9
+          ],
+          [
+            "Santa Lucía",
+            2
+          ],
+          [
+            "Callejón Ideal",
+            5
+          ],
+          [
+            "Av. Real Fábrica de Sedas",
+            9
+          ]
+        ]
+      },
+      "base": {
+        "ticks": 450,
+        "wall_s": 150.0,
+        "sim_s": 150.0,
+        "effective_tick_rate_hz": 3.0,
+        "active_mean": 999.6,
+        "active_median": 1000.0,
+        "fleet_speed_ms_mean": 2.088,
+        "trips_completed": 51,
+        "travel_time_mean_s": 112.81,
+        "travel_time_p50_s": 106.67,
+        "travel_time_p95_s": 197.67,
+        "trip_speed_kmh_mean": 24.96,
+        "reroute_events": 2816,
+        "vehicles_rerouted": 836,
+        "saturated_edges_peak": 35,
+        "congested_edges_peak": 138,
+        "congestion_max_peak": 5.0,
+        "vehicles_affected_peak": 501,
+        "blocked_edges_active": 35,
+        "analytics": {
+          "travel_time_s": {
+            "trips_completed": 51,
+            "mean": 112.81,
+            "p50": 106.67,
+            "p95": 197.67,
+            "max": 208.0
+          },
+          "trip_speed_kmh": {
+            "mean": 24.96,
+            "p50": 24.9
+          },
+          "congestion": {
+            "occupied_edges": 390,
+            "congestion_mean": 0.4937,
+            "congestion_max": 5.0,
+            "congested_edges": 133
+          },
+          "incidents": {
+            "blocked_edges": 36,
+            "vehicles_affected": 251
+          }
+        }
+      },
+      "scenario": {
+        "ticks": 450,
+        "wall_s": 150.0,
+        "sim_s": 150.0,
+        "effective_tick_rate_hz": 3.0,
+        "active_mean": 999.6,
+        "active_median": 1000.0,
+        "fleet_speed_ms_mean": 1.701,
+        "trips_completed": 42,
+        "travel_time_mean_s": 123.41,
+        "travel_time_p50_s": 115.5,
+        "travel_time_p95_s": 194.28,
+        "trip_speed_kmh_mean": 21.71,
+        "reroute_events": 2288,
+        "vehicles_rerouted": 762,
+        "saturated_edges_peak": 41,
+        "congested_edges_peak": 133,
+        "congestion_max_peak": 2.3923,
+        "vehicles_affected_peak": 689,
+        "blocked_edges_active": 154,
+        "analytics": {
+          "travel_time_s": {
+            "trips_completed": 42,
+            "mean": 123.41,
+            "p50": 115.5,
+            "p95": 194.28,
+            "max": 202.33
+          },
+          "trip_speed_kmh": {
+            "mean": 21.71,
+            "p50": 20.66
+          },
+          "congestion": {
+            "occupied_edges": 354,
+            "congestion_mean": 0.5091,
+            "congestion_max": 2.3923,
+            "congested_edges": 133
+          },
+          "incidents": {
+            "blocked_edges": 158,
+            "vehicles_affected": 228
+          }
+        }
+      },
+      "delta": {
+        "travel_time_mean_s": 10.6,
+        "travel_time_p50_s": 8.83,
+        "travel_time_p95_s": -3.39,
+        "trip_speed_kmh_mean": -3.25,
+        "fleet_speed_ms_mean": -0.387,
+        "trips_completed": -9,
+        "reroute_events": -528,
+        "vehicles_rerouted": -74,
+        "saturated_edges_peak": 6,
+        "congested_edges_peak": -5,
+        "congestion_max_peak": -2.608,
+        "vehicles_affected_peak": 188
+      }
+    }
+  }
+}
