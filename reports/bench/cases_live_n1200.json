@@ -1,0 +1,77 @@
+{
+  "meta": {
+    "script": "bench_cases_live",
+    "timestamp": "2026-06-10T03:08:31",
+    "python": "3.14.5",
+    "gil_enabled": false,
+    "cpu_count": 20,
+    "case": "both",
+    "vehicles": 1200,
+    "warmup_s": 150.0,
+    "scenario_warmup_s": 60.0,
+    "measure_s": 450.0,
+    "seed": 42,
+    "tick_hz": 3.0,
+    "dt_s": 0.3333333333333333,
+    "topup_every_s": 2.0,
+    "accident_ttl_s": 120.0,
+    "trip_buffer": 12000,
+    "graph_nodes": 5879,
+    "graph_edges": 3388,
+    "analytics_interval_ticks": 10,
+    "congestion_vehicle_slot_m": 7.0,
+    "congestion_ratio_threshold": 0.6,
+    "saturated_ratio_threshold": 1.0
+  },
+  "cases": {
+    "zbe": {
+      "setup": {},
+      "base": {
+        "ticks": 1350,
+        "wall_s": 450.0,
+        "sim_s": 450.0,
+        "effective_tick_rate_hz": 3.0,
+        "active_mean": 1199.9,
+        "active_median": 1200.0,
+        "fleet_speed_ms_mean": 0.4,
+        "trips_completed": 33,
+        "travel_time_mean_s": 270.0,
+        "travel_time_p50_s": 250.67,
+        "travel_time_p95_s": 453.53,
+        "trip_speed_kmh_mean": 21.48,
+        "reroute_events": 3672,
+        "vehicles_rerouted": 1048,
+        "saturated_edges_peak": 54,
+        "congested_edges_peak": 160,
+        "congestion_max_peak": 7.0,
+        "vehicles_affected_peak": 532,
+        "blocked_edges_active": 13,
+        "analytics": {
+          "travel_time_s": {
+            "trips_completed": 33,
+            "mean": 270.0,
+            "p50": 250.67,
+            "p95": 453.53,
+            "max": 538.0
+          },
+          "trip_speed_kmh": {
+            "mean": 21.48,
+            "p50": 22.0
+          },
+          "congestion": {
+            "occupied_edges": 357,
+            "congestion_mean": 0.6196,
+            "congestion_max": 7.0,
+            "congested_edges": 159
+          },
+          "incidents": {
+            "blocked_edges": 13,
+            "vehicles_affected": 96
+          }
+        }
+      },
+      "scenario": null,
+      "delta": null
+    }
+  }
+}

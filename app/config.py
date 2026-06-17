@@ -60,9 +60,9 @@ class Settings(BaseSettings):
 
     # Simulación
     SIMULATION_TICK_RATE: float = Field(
-        default=0.1,
+        default=3.0,
         gt=0,
-        description="Segundos entre updates de simulación",
+        description="Frecuencia de tick de la simulación (Hz); el default efectivo del motor",
     )
     MAX_VEHICLES: int = Field(
         default=1_000_000_000,

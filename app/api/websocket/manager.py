@@ -4,6 +4,7 @@ Handles incoming connections, disconnections, and message broadcasting
 for real-time communication with Godot clients.
 """
 
+import asyncio
 import logging
 from typing import Any
 
@@ -89,19 +90,22 @@ class ConnectionManager:
             send_func_name: Name of the WebSocket send method ('send_json' or 'send_text')
             message: The message to broadcast (dict for JSON, str for text)
         """
-        disconnected: list[WebSocket] = []
+        if not self._active_connections:
+            return
 
-        for connection in self._active_connections:
-            try:
-                send_func = getattr(connection, send_func_name)
-                await send_func(message)
-            except Exception as e:
-                logger.warning("Failed to send message to client: %s", e)
-                disconnected.append(connection)
+        # Envío concurrente a todos los clientes: un cliente lento no retrasa la
+        # entrega al resto. return_exceptions=True para que un fallo aislado no
+        # cancele el gather y podamos limpiar solo las conexiones caídas.
+        connections = list(self._active_connections)
+        results = await asyncio.gather(
+            *(getattr(c, send_func_name)(message) for c in connections),
+            return_exceptions=True,
+        )
 
-        # Clean up disconnected clients
-        for connection in disconnected:
-            self.disconnect(connection)
+        for connection, result in zip(connections, results):
+            if isinstance(result, Exception):
+                logger.warning("Failed to send message to client: %s", result)
+                self.disconnect(connection)
 
     async def broadcast(self, message: dict[str, Any]) -> None:
         """

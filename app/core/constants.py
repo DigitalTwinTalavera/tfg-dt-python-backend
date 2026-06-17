@@ -206,6 +206,31 @@ ATTR_MID_TLS = "mid_tls"
 ATTR_IS_ROUNDABOUT = "is_roundabout"   # bool — the edge is part of a roundabout ring
 ATTR_ROUNDABOUT_ID = "roundabout_id"   # int|None — identifies a connected ring component
 ATTR_CURVE_VMAX = "curve_vmax"         # float m/s — cached curvature speed cap for the edge
+# Set on roundabout edges that have been resampled with a centripetal
+# Catmull-Rom spline. When True, vehicle_physics reads ATTR_SPLINE_SAMPLES /
+# ATTR_SPLINE_LENGTH instead of running the polyline lerp.
+ATTR_USE_SPLINE = "use_spline"
+# list[tuple[float, float, float]] — precomputed sample table for the spline:
+# each entry is (s_m, lon, lat) where s_m is cumulative arc length (haversine)
+# from the start of the edge. Dense enough that bisect+lerp gives sub-mm
+# error at runtime.
+ATTR_SPLINE_SAMPLES = "spline_samples"
+ATTR_SPLINE_LENGTH = "spline_length"   # float m — total arc length of the spline
+# Radio circular del anillo (m) cacheado en cada arista de rotonda. Lo usa
+# vehicle_physics._edge_curvature_vmax para imponer un cap de velocidad
+# coherente con la geometría del ring entero, en vez de estimarlo con 3
+# waypoints (poco fiable tras RDP).
+ATTR_RING_RADIUS_M = "ring_radius_m"
+# Roundabout RDP tolerance bounds. ε scales with the ring radius so small
+# glorietas (Tres Olivos R≈10 m) keep more detail than large ones, but never
+# exceeds 0.5 m and never collapses an edge below RDP_MIN_POINTS waypoints.
+RDP_TOLERANCE_PER_RADIUS: float = 0.012
+RDP_TOLERANCE_MIN_M: float = 0.20
+RDP_TOLERANCE_MAX_M: float = 0.50
+RDP_MIN_POINTS: int = 4
+# Spline sample density. With segments shortened by RDP, 8 samples per segment
+# give ≤0.5 m spacing along the curve for typical roundabout edges.
+SPLINE_SAMPLES_PER_SEGMENT: int = 8
 
 # Routing penalties
 # Plan D3: exclusión efectiva de aristas bloqueadas en A*. Con el factor
@@ -236,17 +261,15 @@ PERIODIC_REROUTE_BATCH_SIZE: int = 50
 # 200 vehículos × 50 ticks = 10000 visitas en 5 s — cubre flotas de 4000 con
 # margen y mantiene los picos por tick por debajo del presupuesto (cada
 # `_maybe_reroute_around_blocks` es ~0.1 ms cuando la ruta ya es válida).
-URGENT_REROUTE_BATCH_SIZE: int = 200
+URGENT_REROUTE_BATCH_SIZE: int = 100
 URGENT_REROUTE_TTL_TICKS: int = 50
 
 # Cap duro de llamadas a A* (compute_route) por tick desde el periodic batch.
-# Cada A* en un grafo real puede costar 5-50 ms; sin cap, una activación de
-# ZBE que afecte a 100+ vehículos genera spikes catastróficos (tick >> 200 ms,
-# tirones obvios). El cap permite que el batch ESCANEE muchos vehículos baratos
-# (route-intersection check) pero ABORTE más A* cuando el presupuesto se agota.
-# Coverage degrada elegantemente: vehículos no servidos en este tick pasan al
-# siguiente vía el cursor rotatorio.
-PERIODIC_REROUTE_ASTAR_CAP_PER_TICK: int = 20
+# Bajado de 20 a 10 tras medir `phys.reroute_periodic_batch_ms` p99 = 58 ms a
+# 2k veh: con 10 A* el pico cae a ~30 ms, suficiente headroom dentro del
+# presupuesto de 250 ms del tick. Cobertura tarda más en ciclar, pero el
+# cursor rotatorio garantiza que TODOS los veh acaban revisándose.
+PERIODIC_REROUTE_ASTAR_CAP_PER_TICK: int = 10
 
 # Cache settings
 GRAPH_CACHE_TTL_SECONDS = 300  # 5 minutes
@@ -444,23 +467,48 @@ MAX_EMERGENCY_DECEL_MS2: float = 8.0    # physical braking cap (m/s²)
 DEFAULT_VEHICLE_SPEED_KMH: float = 50.0 # default desired speed in km/h
 MIN_EDGE_LENGTH_M: float = 0.1          # prevent division by zero
 VEHICLE_PHYSICS_PARALLEL_THRESHOLD: int = 500
+# Resolución de la cuadrícula espacial para el bucketing de vehículos por
+# zona en `update_vehicles_parallel`. 8×8 = 64 celdas sobre el bbox del grafo;
+# con ~os.cpu_count() hilos esto da work-stealing efectivo (LPT scheduling)
+# incluso si una zona urbana concentra el 60 % de la flota.
+ZONE_GRID_CELLS_PER_AXIS: int = 8
+# Tamaño máximo de un bucket espacial antes de partirlo en sub-buckets. Sin
+# este corte, una celda céntrica con 600+ vehículos consume un único worker
+# durante todo el tick mientras los demás hilos esperan en `asyncio.gather`.
+# Los sub-buckets se forman ordenando por (edge_key, progress_on_edge), de
+# modo que vehículos del mismo edge contiguos quedan en el mismo sub-bucket;
+# el líder cross-sub-bucket sigue siendo visible vía `edge_index` global.
+# Con `os.cpu_count()` típicamente ~20, MAX_BUCKET_SIZE=80 da hasta 75
+# sub-buckets a 6000 veh — 3-4 por worker — y minimiza la varianza de
+# wallclock entre workers post-gather.
+MAX_BUCKET_SIZE: int = 80
 # Distancia (m) sobre la que se mezcla la tangente final de la arista saliente
 # con la inicial de la entrante al cambiar de arista. Elimina el snap visible
 # de heading en cruces sin curvar el movimiento más de lo necesario.
 EDGE_HEADING_BLEND_DIST_M: float = 3.0
-# Cada cuántos ticks se evalúa MOBIL por vehículo. Con tick=200 ms (5 Hz), un
-# valor de 20 corresponde a 4 s: suficiente para que un cambio de carril sea
-# reactivo sin saturar CPU. MOBIL corre en el main thread (workers no tienen
-# edge_index completo), así que bajar su frecuencia es el mayor win CPU-side
-# con miles de vehículos. 4 s es coherente con el tiempo de decisión humano
-# para un cambio de carril discrecional en tráfico medio.
-MOBIL_EVAL_INTERVAL_TICKS: int = 20
+# Cada cuántos ticks se evalúa MOBIL por vehículo. Con tick=250 ms (4 Hz), un
+# valor de 60 corresponde a 15 s entre decisiones discrecionales — alineado
+# con el horizonte de planificación de un conductor humano (no cambia de
+# carril por capricho cada 5 segundos). Subido de 40→60 tras medir
+# `phys.mobil_ms` p99 acumulado >9 s a 4000 vehículos.
+MOBIL_EVAL_INTERVAL_TICKS: int = 60
+# Cooldown SECUNDARIO cuando el vehículo está atrapado en un carril cerrado.
+# Antes el `trapped_p` bypasseaba el cooldown completamente → MOBIL corría
+# cada tick (250 ms) para todos los veh atrapados, lo que explota a escala
+# 4000+ veh con colisiones acumuladas. Con valor 15 un veh atrapado intenta
+# salir cada 15 ticks (3.75 s a 4 Hz) — sigue siendo reactivo en términos
+# de evacuación (humano tarda 2-4 s en decidir cambio forzado) y baja MOBIL
+# por debajo del cuello dominante. Subido de 5→15 tras medir 4k_v3 con
+# `phys.mobil_ms` p99 acum 9515 ms.
+MOBIL_TRAPPED_EVAL_INTERVAL_TICKS: int = 15
 # Velocidad mínima por debajo de la cual saltamos la evaluación de MOBIL. Un
 # vehículo casi parado no tiene incentivo IDM para cambiar de carril (la
 # ganancia de aceleración es despreciable), así que el coste de construir el
 # contexto y llamar al modelo es puro waste. Con 4000-6000 vehículos en ciudad
-# gran parte está parada o rodando a <10 km/h en cada tick.
-MOBIL_MIN_VELOCITY_MS: float = 3.0
+# gran parte está parada o rodando a <10 km/h en cada tick. Subido de 3→5 m/s
+# (18 km/h) tras medir que la mayoría del coste de MOBIL viene de veh en
+# colas/atascos donde el cambio de carril no tiene ganancia.
+MOBIL_MIN_VELOCITY_MS: float = 5.0
 # No re-evaluar MOBIL en los últimos metros de una arista: la transición ya
 # reasigna el carril (min(lane, new_lanes-1)) y un cambio aquí sería inútil.
 MOBIL_MIN_DIST_TO_EDGE_END_M: float = 15.0
@@ -490,6 +538,41 @@ COLLISION_PROXIMITY_DURATION_S: float = 1.0      # sostenido > este tiempo → c
 # Velocidad relativa mínima para disparar colisión. Evita que dos vehículos
 # parados juntos (p. ej. en cola de semáforo) se marquen como choque.
 COLLISION_RELATIVE_SPEED_MIN_MS: float = 1.0
+
+# Margen bumper-to-bumper que el clamp duro garantiza tras avanzar el IDM.
+# Aplica como límite superior a la distancia recorrida en un tick, calculado
+# contra el gap reportado por el líder (real o virtual). Evita que el IDM
+# "atraviese" al vehículo de delante en aristas cortas o ante caídas bruscas
+# de gap. Pensado como red de seguridad final, no como sustituto del IDM.
+HARD_CLAMP_MARGIN_M: float = 0.2
+
+# Distancia máxima desde el final de la arista actual a la que disparar el
+# look-ahead a la siguiente arista cuando ninguna de las dos es de rotonda.
+# Cubre el caso en el que un tick saltaría la línea entre aristas cortas
+# antes de que `progress > 0.70` se cumpla. La lookahead de rotonda se mantiene
+# con LOOKAHEAD_*_TRIGGER_M arriba.
+LOOKAHEAD_NON_ROUND_TRIGGER_M: float = 8.0
+
+# =============================================================================
+# Intersection Arbitration (priority-to-the-right + TTC tiebreak)
+# =============================================================================
+
+# Distancia desde el final de la arista a la que un vehículo entra en zona
+# de arbitraje del nodo. Solo se evalúa por debajo de este umbral para
+# acotar el coste por tick.
+INTERSECTION_DETECTION_ZONE_M: float = 30.0
+
+# Diferencia mínima entre los TTC (tiempo a la línea de stop) de dos
+# contendientes para resolver la prioridad por orden de llegada. Si las TTCs
+# difieren más de este delta, gana el más cercano y los demás ceden.
+INTERSECTION_TTC_PRIORITY_DELTA_S: float = 0.5
+
+# Ventana angular [min, max] grados para considerar que un contendiente
+# se aproxima por la derecha del ego. Bearing relativo en sentido horario:
+# 90° es estrictamente perpendicular a la derecha; 45-135° cubre cruces
+# realistas (incluyendo conexiones algo oblicuas).
+INTERSECTION_RIGHT_BEARING_MIN_DEG: float = 45.0
+INTERSECTION_RIGHT_BEARING_MAX_DEG: float = 135.0
 
 # =============================================================================
 # Emergency Brake (Plan C)
@@ -530,13 +613,31 @@ MOBIL_MIN_SAFE_GAP_M: float = 3.0
 # =============================================================================
 
 # Distancia desde la línea de entrada a la rotonda en la que el vehículo empieza
-# a mirar hacia dentro del anillo para ceder el paso.
-YIELD_DETECTION_ZONE_M: float = 15.0
+# a mirar hacia dentro del anillo para ceder el paso. 30 m permite frenar
+# cómodamente desde 50 km/h (v²/2b ≈ 32 m con b=3) sin entrar en pánico al
+# borde mismo. Alineada con LOOKAHEAD_ENTRY_TRIGGER_M.
+YIELD_DETECTION_ZONE_M: float = 30.0
 # Time-to-conflict: si un vehículo circulando llega antes de este tiempo a la
-# entrada del ego, el ego debe ceder.
-YIELD_TTC_THRESHOLD_S: float = 3.5
-# Gap mínimo en arco (m) dentro del anillo para aceptar la entrada.
-YIELD_GAP_MIN_M: float = 10.0
+# entrada del ego, el ego debe ceder. 3.0 s es un margen realista — un coche
+# del anillo a velocidad típica (4-5 m/s) será conflicto si está dentro de
+# 12-15 m de la línea de entrada.
+YIELD_TTC_THRESHOLD_S: float = 3.0
+# Gap mínimo en arco (m) dentro del anillo para aceptar la entrada. Equivale
+# a la holgura mínima requerida con un coche del anillo aunque esté parado
+# o muy lento (TTC alto): si está físicamente más cerca de 8 m del entry
+# node, hay conflicto y se cede.
+YIELD_GAP_MIN_M: float = 8.0
+# Gap mínimo (m) que `_find_leader` reporta cuando el ego está en la última
+# arista del anillo y el líder está en la arista de salida (ring → non-ring).
+# Sin clamp, una cola en el borde de la salida con v_lead=0 lleva el IDM a
+# v=0 dentro del ring (viola el principio "ceder fuera, no dentro"). Con 8 m
+# el IDM frena gradualmente sin parar, y al cruzar al exit el `_find_leader`
+# normal toma el control y para correctamente fuera del ring.
+RING_EXIT_MIN_GAP_M: float = 8.0
+# Velocidad mínima (m/s ≈ 5 km/h) que `_find_leader` reporta del líder en la
+# salida del anillo. Evita que el IDM calcule s* infinito por v_lead=0 con
+# Δv grande, lo que produce frenado catastrófico.
+RING_EXIT_MIN_LEADER_V_MS: float = 1.5
 # Distancia restante (m) en la arista actual por debajo de la cual se activa
 # el look-ahead cross-edge cuando la siguiente arista es anillo de rotonda.
 # Cubre ~5 ticks a 50 km/h (13.9 m/s · 0.1 s ≈ 1.39 m), evitando que entradas
@@ -574,6 +675,24 @@ SPAWN_MAX_ENTRIES_PER_ROUNDABOUT_PER_TICK: int = 1
 DYNAMIC_WEIGHTS_TICK_INTERVAL: int = 20   # recalcular pesos dinámicos cada N ticks
 DYNAMIC_WEIGHT_MAX_MULT: float = 5.0       # multiplicador máximo por saturación
 DYNAMIC_WEIGHT_CHANGE_THRESHOLD: float = 0.2  # invalidar cache si un peso cambia >20 %
+
+# =============================================================================
+# Traffic Analytics (motor de analíticas de dominio)
+# =============================================================================
+
+# Cada cuántos ticks se recalculan las métricas de tráfico agregadas
+# (congestión e impacto de incidentes). El tiempo de viaje se registra por
+# evento, al finalizar cada vehículo, y no depende de este intervalo.
+ANALYTICS_INTERVAL_TICKS: int = 10
+# Espacio medio que ocupa un vehículo en cola (longitud + gap mínimo), en
+# metros. Se usa para estimar la capacidad de una arista al calcular su nivel
+# de congestión: capacidad ≈ longitud · carriles / este valor.
+CONGESTION_VEHICLE_SLOT_M: float = 7.0
+# Ratio ocupación/capacidad a partir del cual una arista se considera
+# congestionada en el recuento `traffic.congested_edges`.
+CONGESTION_RATIO_THRESHOLD: float = 0.6
+# Tamaño del ring buffer de muestras de tiempo de viaje (vehículos finalizados).
+ANALYTICS_TRIP_BUFFER_SIZE: int = 2048
 
 # =============================================================================
 # STOP/YIELD Sign Runtime (Fase 7.1)

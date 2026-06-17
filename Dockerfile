@@ -1,21 +1,25 @@
-# Imagen base oficial de Python 3.14
-FROM python:3.14-slim
+# Python 3.14 free-threaded (PEP 703 / no-GIL) via uv + python-build-standalone.
+# No existe imagen oficial library/python con tag '3.14t', así que partimos de
+# la imagen de uv y dejamos que uv gestione el intérprete free-threaded.
+# El sufijo 't' en 'uv python install 3.14t' selecciona el build sin GIL.
+FROM ghcr.io/astral-sh/uv:bookworm-slim
 
-# Metadata
 LABEL maintainer="ismael.lopez6@alu.uclm.es" \
       description="Backend de simulación para Digital Twin de tráfico urbano" \
       version="0.1.0"
 
-# Variables de entorno para optimización de Python
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    UV_PYTHON_INSTALL_DIR=/opt/python \
+    UV_PYTHON_PREFERENCE=only-managed \
+    UV_LINK_MODE=copy \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
 
-# Directorio de trabajo
 WORKDIR /app
 
-# Instalar dependencias del sistema (incluyendo libpq para PostgreSQL)
+# Toolchain mínima: algunas wheels (shapely sin binarios para 3.14t, etc.)
+# pueden compilarse desde fuente; libpq-dev por si asyncpg necesita fallback.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
@@ -24,17 +28,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copiar e instalar dependencias de Python
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Instalar CPython 3.14 free-threaded gestionado por uv
+RUN uv python install 3.14t
 
-# Copiar el código de la aplicación
+# Crear venv FT e instalar dependencias
+COPY requirements.txt .
+RUN uv venv --python 3.14t "$VIRTUAL_ENV" \
+    && uv pip install --python "$VIRTUAL_ENV/bin/python" -r requirements.txt
+
+# Código de la aplicación
 COPY ./app ./app
 COPY ./alembic ./alembic
 COPY ./alembic.ini .
 
-# Exponer el puerto (se puede sobrescribir con variable de entorno)
 EXPOSE ${PORT:-8000}
 
-# Comando para ejecutar la aplicación (aplica migraciones primero)
 CMD alembic upgrade head && uvicorn app.main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8000} --ws-max-size 4194304

@@ -183,7 +183,7 @@ class TestMOBILConfig:
 class TestSimulationConfigDefaults:
     @pytest.mark.unit
     def test_default_values(self, default_config):
-        assert default_config.tick_rate == 5
+        assert default_config.tick_rate == 3
         assert default_config.auto_spawn is True
         assert default_config.spawn_rate == 10
         # Default es ilimitado (1e9): el cap real sale de settings.MAX_VEHICLES.
@@ -193,8 +193,8 @@ class TestSimulationConfigDefaults:
 
     @pytest.mark.unit
     def test_tick_interval_ms_property(self, default_config):
-        # Default tick_rate=5 → 1000/5 = 200 ms por tick.
-        assert default_config.tick_interval_ms == 200.0
+        # Default tick_rate=3 → 1000/3 ≈ 333.33 ms por tick.
+        assert default_config.tick_interval_ms == pytest.approx(1000.0 / 3.0)
 
     @pytest.mark.unit
     def test_tick_interval_ms_custom(self):
@@ -239,8 +239,8 @@ class TestSimulationConfigDefaults:
 class TestTicksBetweenSpawns:
     @pytest.mark.unit
     def test_default_config(self, default_config):
-        # tick_rate=5, spawn_rate=10 => ceil(5*60/10) = 30
-        assert default_config.ticks_between_spawns == 30
+        # tick_rate=3, spawn_rate=10 => ceil(3*60/10) = 18
+        assert default_config.ticks_between_spawns == 18
 
     @pytest.mark.unit
     def test_high_spawn_rate(self):
@@ -308,8 +308,8 @@ class TestConfigConversion:
     @pytest.mark.unit
     def test_to_dict_computed_values(self, default_config):
         d = default_config.to_dict()
-        assert d["tick_interval_ms"] == 200.0
-        assert d["ticks_between_spawns"] == 30
+        assert d["tick_interval_ms"] == 333.333  # round(1000/3, 3)
+        assert d["ticks_between_spawns"] == 18
 
     @pytest.mark.unit
     def test_idm_params_are_frozen(self, default_config):
@@ -380,6 +380,11 @@ class TestAutoSpawn:
         # decidir si lazy-init del controller de semáforos. Con grafo vacío
         # se salta esa rama y nos centramos en la lógica de auto-spawn.
         s.graph.node_count = 0
+        # El motor consulta además estos atributos en la pasada de analítica de
+        # tráfico (congestión / impacto de incidentes). Vacíos: la analítica se
+        # ejecuta sin efecto y no interfiere con la lógica de auto-spawn.
+        s.vehicles = {}
+        s.blocked_edges = {}
         return s
 
     @pytest.mark.unit
@@ -490,7 +495,7 @@ class TestGetConfigEndpoint:
     @pytest.mark.unit
     def test_get_config_default_tick_rate(self, client):
         data = client.get("/api/simulation/config").json()
-        assert data["tick_rate"] == 5
+        assert data["tick_rate"] == 3
 
     @pytest.mark.unit
     def test_get_config_idm_sub_fields(self, client):

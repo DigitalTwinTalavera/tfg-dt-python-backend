@@ -1,0 +1,21 @@
+[17:12:48] GIL enabled: False  python 3.14.5
+[17:12:48] cpu_count=20  parallel_threshold=500
+[17:12:48] sizes=[50, 100, 250, 500] dt=0.3333s warmup=20.0s measure=70.0s
+[17:12:48] grafo: 5879 nodos, 3388 aristas, connected=False, build=0.2s
+[17:12:48]   N=50: spawn inicial 50 veh en 0.1s
+[17:13:08]   N=50: warm-up done, active=50, ticks=60, phys_path=serial
+[17:14:18]   N=50: DONE active~50 ticks=210 tick p50=1.1/p95=1.8ms phys p50=1.0ms eff_rate=3.00Hz bytes/tick=1809
+[17:14:18]   -> escrito reports/bench/perf_a.json (1 stages)
+[17:14:18]   N=100: spawn inicial 100 veh en 0.1s
+[17:14:38]   N=100: warm-up done, active=100, ticks=60, phys_path=serial
+[17:15:48]   N=100: DONE active~100 ticks=210 tick p50=2.0/p95=2.5ms phys p50=1.9ms eff_rate=3.00Hz bytes/tick=3672
+[17:15:48]   -> escrito reports/bench/perf_a.json (2 stages)
+[17:15:48]   N=250: spawn inicial 250 veh en 0.3s
+[17:16:08]   N=250: warm-up done, active=250, ticks=60, phys_path=serial
+[17:17:18]   N=250: DONE active~250 ticks=210 tick p50=4.4/p95=11.3ms phys p50=4.3ms eff_rate=3.00Hz bytes/tick=9268
+[17:17:18]   -> escrito reports/bench/perf_a.json (3 stages)
+[17:17:19]   N=500: spawn inicial 500 veh en 0.5s
+[17:17:39]   N=500: warm-up done, active=500, ticks=60, phys_path=parallel
+[17:18:49]   N=500: DONE active~500 ticks=210 tick p50=19.3/p95=39.3ms phys p50=19.0ms eff_rate=3.00Hz bytes/tick=18518
+[17:18:49]   -> escrito reports/bench/perf_a.json (4 stages)
+[17:18:49] FIN

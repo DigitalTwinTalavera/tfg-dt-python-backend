@@ -1,0 +1,93 @@
+{
+  "zbe": {
+    "M": 3000,
+    "rutas_validas": 2999,
+    "area_km2": 0.448,
+    "aristas_zona": 304,
+    "restringidos": [
+      "car",
+      "truck"
+    ],
+    "pct_base_cruzan_casco": 38.9,
+    "pct_restringidos_cruzan_casco": 19.7,
+    "reencaminados": 577,
+    "sin_alternativa": 590,
+    "pct_evitan_de_los_que_cruzaban": 49.4,
+    "rodeo_medio_m": 699.5,
+    "rodeo_mediana_m": 741.0,
+    "long_media_base_m": 2173.9,
+    "rodeo_pct": 32.2
+  },
+  "flood": {
+    "M": 3000,
+    "calles_cortadas": 13,
+    "aristas_cortadas": 104,
+    "dwithin_m": 20,
+    "rutas_afectadas": 1803,
+    "pct_afectadas": 60.1,
+    "reencaminadas_ok": 1803,
+    "sin_ruta_alternativa": 0,
+    "siguen_usando_corte_penalizado": 225,
+    "rodeo_medio_m": 681.3,
+    "rodeo_mediana_m": 503.2,
+    "rodeo_pct": 31.3
+  },
+  "calles": [
+    [
+      "Marqués de Mirasol",
+      10
+    ],
+    [
+      "Portiña de San Miguel",
+      16
+    ],
+    [
+      "Portiña del Salvador",
+      6
+    ],
+    [
+      "Calle Mula",
+      3
+    ],
+    [
+      "Cristo de la Salud",
+      28
+    ],
+    [
+      "Calle Entretorres",
+      7
+    ],
+    [
+      "Las Hilanderas",
+      2
+    ],
+    [
+      "Calle Grisetas",
+      5
+    ],
+    [
+      "Calle San Martín",
+      8
+    ],
+    [
+      "Calle Bancaleros",
+      9
+    ],
+    [
+      "Santa Lucía",
+      2
+    ],
+    [
+      "Callejón Ideal",
+      5
+    ],
+    [
+      "Av. Real Fábrica de Sedas",
+      9
+    ]
+  ],
+  "graph": {
+    "nodes": 5879,
+    "edges": 3388
+  }
+}

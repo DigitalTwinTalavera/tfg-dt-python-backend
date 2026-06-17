@@ -83,6 +83,11 @@ class SimVehicle:
     # se resetea a MOBIL_EVAL_INTERVAL_TICKS. Inicializado vía hash(id) para
     # repartir la carga computacional entre ticks.
     mobil_cooldown_ticks: int = 0
+    # Tick en el que MOBIL ejecutó el último cambio de carril (lane ± 1). Usado
+    # por el clasificador de colisiones para atribuir choques a cambios de
+    # carril recientes (ventana ~3 ticks). Inicializado a un valor muy negativo
+    # para que el primer tick no se considere "post-cambio".
+    last_lane_change_tick: int = -10_000
     # Runtime STOP/YIELD sign tracking.
     # `stop_sign_cleared_node` guarda el ID del nodo STOP cuya parada obligatoria
     # ya se ha cumplido; mientras coincida con el end_node actual, el vehículo
@@ -91,6 +96,10 @@ class SimVehicle:
     # Tiempo acumulado (s) con velocidad < STOP_SIGN_DWELL_SPEED_MS frente al
     # STOP. Al superar STOP_SIGN_DWELL_TIME_S se marca como cumplido.
     stop_sign_dwell_timer: float = 0.0
+    # Instante de tiempo de simulación (s) en que se creó el vehículo. Se usa
+    # para calcular su tiempo de viaje al completar la ruta (analítica de
+    # tráfico, app/core/analytics.py).
+    spawn_sim_time: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -141,6 +150,10 @@ class VehicleSpawner:
         # para consultar enforcement `deny_spawn` y en routing para penalizar
         # aristas restringidas por tipo de vehículo.
         self.zone_manager: object | None = None
+        # Tiempo de simulación (s) vigente, actualizado por el motor en cada
+        # tick. Se sella en cada vehículo al crearlo para medir su tiempo de
+        # viaje al finalizar (analítica de tráfico).
+        self.current_sim_time: float = 0.0
 
     @property
     def graph(self) -> RoadNetworkGraph:
@@ -537,6 +550,7 @@ class VehicleSpawner:
                 vtype=profile.vtype,
                 lane=lane,
                 length_m=profile.length_m,
+                spawn_sim_time=self.current_sim_time,
             )
             # Velocidad deseada individual: perfil · varianza, acotada al límite del
             # primer tramo para que los camiones no intenten ir a 130 km/h en ciudad.

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.api.deps import get_incident_manager, get_simulation_engine
@@ -53,7 +53,7 @@ class IncidentExtendRequest(BaseModel):
 # =========================================================================
 
 
-@router.post("")
+@router.post("", status_code=status.HTTP_201_CREATED)
 async def create_incident(
     body: IncidentCreateRequest,
     mgr: IncidentManager = Depends(get_incident_manager),

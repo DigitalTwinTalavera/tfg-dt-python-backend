@@ -17,7 +17,7 @@ from app.api.websocket.manager import ConnectionManager
 from app.api.websocket.messages import (
     build_incident_message,
     build_sim_state_message,
-    build_tick_binary,
+    build_tick_binary_from_vehicles,
     build_traffic_lights_message,
     build_vehicle_collision_message,
     build_vehicle_finished_message,
@@ -27,6 +27,7 @@ from app.api.websocket.messages import (
     build_zone_message,
 )
 from app.core.constants import BROADCAST_CHUNK_SIZE
+from app.core.instrumentation import registry
 from app.services.vehicle_spawner import SimVehicle, VehicleSpawner
 
 logger = logging.getLogger(__name__)
@@ -96,45 +97,44 @@ class SimulationBroadcaster:
             tick: Número de tick actual.
             sim_time: Tiempo de simulación acumulado (s).
         """
+        registry.gauge("ws.clients", self._manager.connection_count)
         if self._manager.connection_count == 0:
             return
 
-        t0 = time.monotonic()
+        t0 = time.perf_counter_ns()
 
-        # Esperamos a que termine el envío del tick anterior antes de empezar
-        # a serializar el nuevo. En condiciones normales esto es ~cero (el
-        # send WS termina en ms y el tick dura 100 ms). Si hay un cliente
-        # lento, retrasa UN tick — mejor que bloquear todos.
+        # Drop-frame: no esperamos al pending_send anterior. Si todavía vuela,
+        # lo cancelamos y descartamos el frame (mejor que retrasar el tick
+        # actual). A 5 Hz, perder un frame puntual no daña la interpolación
+        # del cliente, pero retrasar el bucle de física sí causa "tirones".
         if self._pending_send is not None and not self._pending_send.done():
-            try:
-                await self._pending_send
-            except Exception:
-                logger.exception("Error en envío del tick anterior (ignorado)")
+            self._pending_send.cancel()
+            registry.inc("ws.frames_dropped")
         self._pending_send = None
 
         vehicles = self._spawner.get_all_vehicles()
-        vehicle_states = self._build_all_states(vehicles)
 
-        # Pre-serializamos todos los chunks como wire format binario
-        # (~4× menos bytes y ~5× más rápido que orjson). Snapshot consistente
-        # con el sim_time del tick. El envío se delega a una tarea
-        # fire-and-forget.
+        # Serializamos DIRECTAMENTE desde SimVehicle al wire binario sin pasar
+        # por dicts intermedios. Serial: probamos paralelizar con asyncio.to_thread
+        # pero el overhead de task creation × 8 chunks (~120 ms) supera la
+        # ganancia del paralelismo CPU (~80 ms secuencial). Revertido.
         chunk_size = self._TICK_CHUNK_SIZE
         payloads: list[bytes] = []
-        if vehicle_states or tick == 0:
-            if len(vehicle_states) <= chunk_size:
-                payloads.append(build_tick_binary(
+        if vehicles or tick == 0:
+            n = len(vehicles)
+            if n <= chunk_size:
+                payloads.append(build_tick_binary_from_vehicles(
                     tick=tick,
                     sim_time=sim_time,
-                    vehicles=vehicle_states,
+                    vehicles=vehicles,
                     chunk_index=0,
                     chunk_total=1,
                 ))
             else:
-                total = (len(vehicle_states) + chunk_size - 1) // chunk_size
-                for idx, i in enumerate(range(0, len(vehicle_states), chunk_size)):
-                    chunk = vehicle_states[i : i + chunk_size]
-                    payloads.append(build_tick_binary(
+                total = (n + chunk_size - 1) // chunk_size
+                for idx, i in enumerate(range(0, n, chunk_size)):
+                    chunk = vehicles[i : i + chunk_size]
+                    payloads.append(build_tick_binary_from_vehicles(
                         tick=tick,
                         sim_time=sim_time,
                         vehicles=chunk,
@@ -145,9 +145,18 @@ class SimulationBroadcaster:
         if payloads:
             self._pending_send = asyncio.create_task(self._send_payloads(payloads))
 
-        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        elapsed_ms = (time.perf_counter_ns() - t0) / 1_000_000.0
         self._broadcast_count += 1
         self._total_broadcast_time_ms += elapsed_ms
+
+        # Métricas WS: tamaño del payload por tick + bytes acumulados (counter
+        # monotónico, deriva bytes/s al dividir por uptime). Chunks/tick
+        # también histograma para detectar saltos al pasar de 1 a múltiples.
+        bytes_this_tick = sum(len(p) for p in payloads)
+        registry.record("ws.bytes_per_tick", bytes_this_tick)
+        registry.inc("ws.bytes", bytes_this_tick)
+        registry.record("ws.chunks_per_tick", len(payloads))
+        registry.record("ws.serialize_ms", elapsed_ms)
 
         if self._broadcast_count % 100 == 0:
             logger.debug(
@@ -163,8 +172,10 @@ class SimulationBroadcaster:
         tarea fire-and-forget para que el bucle de simulación pueda iniciar
         el siguiente tick sin esperar a que el WS complete el envío.
         """
+        t0 = time.perf_counter_ns()
         for payload in payloads:
             await self._manager.broadcast_bytes(payload)
+        registry.record("ws.send_ms", (time.perf_counter_ns() - t0) / 1_000_000.0)
 
     def _build_all_states(
         self, vehicles: list[SimVehicle]

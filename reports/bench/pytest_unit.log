@@ -1,0 +1,58 @@
+============================= test session starts ==============================
+collected 509 items / 205 deselected / 304 selected
+
+tests/test_collision.py .............                                    [  4%]
+tests/test_collision_clamp.py .......                                    [  6%]
+tests/test_curvature.py ........                                         [  9%]
+tests/test_health.py ....                                                [ 10%]
+tests/test_idm.py ........................                               [ 18%]
+tests/test_incident_manager.py ........                                  [ 21%]
+tests/test_intersection_yield.py ...............                         [ 25%]
+tests/test_mobil.py ....................                                 [ 32%]
+tests/test_mobil_closed_lanes.py .....                                   [ 34%]
+tests/test_road_network_models.py ...........................            [ 43%]
+tests/test_roundabout.py .........                                       [ 46%]
+tests/test_route.py ..........                                           [ 49%]
+tests/test_routing_blocked_edges.py .....                                [ 50%]
+tests/test_routing_zbe.py ......                                         [ 52%]
+tests/test_simulation_config.py ............FF......F........F.......... [ 66%]
+.......F..........                                                       [ 72%]
+tests/test_simulation_engine.py .......................................  [ 84%]
+tests/test_spawner_scaling.py .                                          [ 85%]
+tests/test_stop_yield_sign.py .......                                    [ 87%]
+tests/test_traffic_light_controller.py ...............                   [ 92%]
+tests/test_traffic_light_per_node_override.py .....                      [ 94%]
+tests/test_vehicle_spawner.py ...............                            [ 99%]
+tests/test_websocket.py ...                                              [100%]
+
+=================================== FAILURES ===================================
+_______________ TestSimulationConfigDefaults.test_default_values _______________
+tests/test_simulation_config.py:186: in test_default_values
+    assert default_config.tick_rate == 5
+E   assert 3 == 5
+E    +  where 3 = SimulationConfig(tick_rate=3, auto_spawn=True, spawn_rate=10, max_vehicles=1000000000, idm=IDMConfig(v0=13.89, s0=2.0, T=1.5, a=1.0, b=1.5, delta=4.0), mobil=MOBILConfig(politeness=0.5, b_safe=4.0, a_threshold=0.2)).tick_rate
+_________ TestSimulationConfigDefaults.test_tick_interval_ms_property __________
+tests/test_simulation_config.py:197: in test_tick_interval_ms_property
+    assert default_config.tick_interval_ms == 200.0
+E   assert 333.3333333333333 == 200.0
+E    +  where 333.3333333333333 = SimulationConfig(tick_rate=3, auto_spawn=True, spawn_rate=10, max_vehicles=1000000000, idm=IDMConfig(v0=13.89, s0=2.0, T=1.5, a=1.0, b=1.5, delta=4.0), mobil=MOBILConfig(politeness=0.5, b_safe=4.0, a_threshold=0.2)).tick_interval_ms
+__________________ TestTicksBetweenSpawns.test_default_config __________________
+tests/test_simulation_config.py:243: in test_default_config
+    assert default_config.ticks_between_spawns == 30
+E   assert 18 == 30
+E    +  where 18 = SimulationConfig(tick_rate=3, auto_spawn=True, spawn_rate=10, max_vehicles=1000000000, idm=IDMConfig(v0=13.89, s0=2.0, T=1.5, a=1.0, b=1.5, delta=4.0), mobil=MOBILConfig(politeness=0.5, b_safe=4.0, a_threshold=0.2)).ticks_between_spawns
+______________ TestConfigConversion.test_to_dict_computed_values _______________
+tests/test_simulation_config.py:311: in test_to_dict_computed_values
+    assert d["tick_interval_ms"] == 200.0
+E   assert 333.333 == 200.0
+___________ TestGetConfigEndpoint.test_get_config_default_tick_rate ____________
+tests/test_simulation_config.py:493: in test_get_config_default_tick_rate
+    assert data["tick_rate"] == 5
+E   assert 3 == 5
+=========================== short test summary info ============================
+FAILED tests/test_simulation_config.py::TestSimulationConfigDefaults::test_default_values
+FAILED tests/test_simulation_config.py::TestSimulationConfigDefaults::test_tick_interval_ms_property
+FAILED tests/test_simulation_config.py::TestTicksBetweenSpawns::test_default_config
+FAILED tests/test_simulation_config.py::TestConfigConversion::test_to_dict_computed_values
+FAILED tests/test_simulation_config.py::TestGetConfigEndpoint::test_get_config_default_tick_rate
+================ 5 failed, 299 passed, 205 deselected in 1.88s =================

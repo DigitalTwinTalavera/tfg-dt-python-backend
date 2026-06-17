@@ -1,0 +1,14 @@
+============================= test session starts ==============================
+collected 509 items
+
+tests/test_collision.py .............                                    [  2%]
+tests/test_collision_clamp.py ........                                   [  4%]
+tests/test_curvature.py ........                                         [  5%]
+tests/test_health.py ......                                              [  6%]
+tests/test_idm.py ........................                               [ 11%]
+tests/test_incident_manager.py ........                                  [ 13%]
+tests/test_intersection_yield.py ...............                         [ 16%]
+tests/test_mobil.py ....................                                 [ 20%]
+tests/test_mobil_closed_lanes.py .....                                   [ 21%]
+tests/test_network_graph.py ........................................     [ 28%]
+tests/test_network_graph_integration.py .timeout: la orden monitorizada ha volcado un 'core'

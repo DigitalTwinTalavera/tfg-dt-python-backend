@@ -12,14 +12,10 @@ python-dotenv==1.0.1
 # WebSocket Support
 websockets==14.1
 
-# Fast JSON serialization (3-5× stdlib json) para broadcast de ticks con 6000 vehículos.
-# 3.11+ soporta Python 3.14 (PyO3 0.24+).
-orjson==3.11.8
-
 # Database
+# asyncpg >=0.31 publica wheels para Python 3.14t (free-threaded).
 sqlalchemy[asyncio]==2.0.46
-asyncpg==0.30.0
-psycopg2-binary==2.9.10
+asyncpg>=0.31
 geoalchemy2==0.15.2
 
 # Migrations
@@ -39,3 +35,8 @@ httpx==0.28.1
 # Code Quality
 black==24.10.0
 flake8==7.1.1
+
+# Observability — Prometheus exposition (/metrics endpoint).
+# Si está ausente, el módulo `app/core/instrumentation.py` cae a un
+# formateador propio mínimo (sin labels), suficiente para inspección manual.
+prometheus-client==0.21.1
